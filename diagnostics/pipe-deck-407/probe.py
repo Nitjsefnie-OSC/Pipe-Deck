@@ -28,6 +28,11 @@ TRIM_FRAMES = 4_800
 MIN_ACTIVE_FRAMES = 57_600
 ACTIVE_THRESHOLD = 0.002
 OUTSIDE_THRESHOLD = 1e-3
+CAPTURE_FREQUENCY_HZ = 997.0
+CAPTURE_FREQUENCY_TOLERANCE_HZ = 10.0
+CAPTURE_FREQUENCY_SCORE_MIN = 0.80
+CAPTURE_MAX_SILENT_GAP_FRAMES = 4
+MIN_CAPTURE_RUN_FRAMES = MIN_ACTIVE_FRAMES + (2 * TRIM_FRAMES)
 MARKER_FREQUENCIES = {"target": 733.0, "monitor": 1237.0}
 MARKER_MIN_ACTIVE_FRAMES = SAMPLE_RATE // 10
 MARKER_MAX_SILENT_GAP_FRAMES = 4
@@ -37,6 +42,10 @@ MARKER_FREQUENCY_SCORE_MIN = 0.50
 
 class ProbeError(RuntimeError):
     """A failed diagnostic assertion or invalid input."""
+
+
+def _frequency_within_tolerance(measured: float, expected: float, tolerance: float) -> bool:
+    return abs(measured - expected) <= tolerance + 1e-6
 
 
 def _expect_probe_error(action: Callable[[], object], description: str) -> None:
@@ -120,28 +129,103 @@ def _frame_peaks(frames: list[tuple[float, float]]) -> list[float]:
     return [max(abs(left), abs(right)) for left, right in frames]
 
 
+def _active_runs(
+    peaks: list[float], threshold: float, max_silent_gap_frames: int
+) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    current_start: int | None = None
+    last_active: int | None = None
+    for index, peak in enumerate(peaks):
+        if peak > threshold:
+            if current_start is None:
+                current_start = index
+            last_active = index
+            continue
+        if current_start is not None and last_active is not None:
+            if index - last_active - 1 > max_silent_gap_frames:
+                runs.append((current_start, last_active + 1))
+                current_start = None
+                last_active = None
+    if current_start is not None and last_active is not None:
+        runs.append((current_start, last_active + 1))
+    return runs
+
+
+def _capture_run_frequency_metrics(
+    frames: list[tuple[float, float]], start: int, end: int
+) -> tuple[list[float], list[float]]:
+    trimmed_start = start + TRIM_FRAMES
+    trimmed_end = end - TRIM_FRAMES
+    if trimmed_end <= trimmed_start:
+        return [0.0] * STEREO, [0.0] * STEREO
+    frequencies = [
+        _estimate_frequency(frames, trimmed_start, trimmed_end, channel)
+        for channel in range(STEREO)
+    ]
+    scores = [
+        _frequency_identity_score(
+            frames,
+            trimmed_start,
+            trimmed_end,
+            frequency,
+            channel,
+        )
+        for channel, frequency in enumerate(frequencies)
+    ]
+    return frequencies, scores
+
+
 def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     frames = _read_f32_stereo(path)
     peaks = _frame_peaks(frames)
-    active_indices = [index for index, peak in enumerate(peaks) if peak > ACTIVE_THRESHOLD]
-    if not active_indices:
+    active_runs = _active_runs(peaks, ACTIVE_THRESHOLD, CAPTURE_MAX_SILENT_GAP_FRAMES)
+    if not active_runs:
         raise ProbeError(f"capture has no active frames above {ACTIVE_THRESHOLD}: {path}")
 
-    active_start = active_indices[0]
-    active_end_exclusive = active_indices[-1] + 1
+    eligible_runs = [
+        (start, end)
+        for start, end in active_runs
+        if end - start >= MIN_CAPTURE_RUN_FRAMES
+    ]
+    authenticated_runs: list[tuple[int, int, list[float], list[float]]] = []
+    for start, end in eligible_runs:
+        frequencies, scores = _capture_run_frequency_metrics(frames, start, end)
+        if all(
+            _frequency_within_tolerance(
+                frequency, CAPTURE_FREQUENCY_HZ, CAPTURE_FREQUENCY_TOLERANCE_HZ
+            )
+            and score >= CAPTURE_FREQUENCY_SCORE_MIN
+            for frequency, score in zip(frequencies, scores)
+        ):
+            authenticated_runs.append((start, end, frequencies, scores))
+
+    if len(authenticated_runs) == 1:
+        active_start, active_end_exclusive, channel_frequencies, channel_scores = authenticated_runs[0]
+    else:
+        active_start, active_end_exclusive = max(
+            eligible_runs or active_runs,
+            key=lambda run: run[1] - run[0],
+        )
+        channel_frequencies, channel_scores = _capture_run_frequency_metrics(
+            frames, active_start, active_end_exclusive
+        )
+
+    run_frames = active_end_exclusive - active_start
     trimmed_start = active_start + TRIM_FRAMES
     trimmed_end_exclusive = active_end_exclusive - TRIM_FRAMES
-    if trimmed_end_exclusive <= trimmed_start:
-        raise ProbeError(f"capture active window is shorter than the edge trim: {path}")
-
-    active_frames = trimmed_end_exclusive - trimmed_start
-    trimmed_samples = frames[trimmed_start:trimmed_end_exclusive]
+    if trimmed_end_exclusive > trimmed_start:
+        trimmed_samples = frames[trimmed_start:trimmed_end_exclusive]
+    else:
+        trimmed_samples = []
+    active_frames = max(0, trimmed_end_exclusive - trimmed_start)
     sum_squares = sum(sample * sample for pair in trimmed_samples for sample in pair)
-    rms = math.sqrt(sum_squares / (len(trimmed_samples) * STEREO))
-    peak = max(_frame_peaks(trimmed_samples))
+    rms = math.sqrt(sum_squares / (len(trimmed_samples) * STEREO)) if trimmed_samples else 0.0
+    peak = max(_frame_peaks(trimmed_samples), default=0.0)
     outside_values = peaks[:active_start] + peaks[active_end_exclusive:]
     outside_peak = max(outside_values, default=0.0)
     trailing_silence_peak = max(peaks[-FIXTURE_TRAILING_SILENCE_FRAMES:], default=0.0)
+    leading_silence_frames = active_start
+    trailing_silence_frames = len(frames) - active_end_exclusive
 
     minimum_rms = 0.02 if volume_percent == 100 else 0.002
     minimum_peak = 0.05 if volume_percent == 100 else 0.005
@@ -152,6 +236,35 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         violations.append(
             f"trailing_silence_peak {trailing_silence_peak:.9f} >= {OUTSIDE_THRESHOLD}"
         )
+    if len(authenticated_runs) != 1:
+        violations.append(
+            f"authenticated_fixture_runs {len(authenticated_runs)} != 1"
+        )
+    if run_frames < MIN_CAPTURE_RUN_FRAMES:
+        violations.append(
+            f"contiguous_fixture_run_frames {run_frames} < {MIN_CAPTURE_RUN_FRAMES}"
+        )
+    if leading_silence_frames < ACTIVE_START:
+        violations.append(
+            f"leading_silence_frames {leading_silence_frames} < {ACTIVE_START}"
+        )
+    if trailing_silence_frames < FIXTURE_TRAILING_SILENCE_FRAMES:
+        violations.append(
+            f"trailing_silence_frames {trailing_silence_frames} < {FIXTURE_TRAILING_SILENCE_FRAMES}"
+        )
+    for channel, (frequency, score) in enumerate(zip(channel_frequencies, channel_scores)):
+        if not _frequency_within_tolerance(
+            frequency, CAPTURE_FREQUENCY_HZ, CAPTURE_FREQUENCY_TOLERANCE_HZ
+        ):
+            violations.append(
+                f"channel_{channel}_frequency_hz {frequency:.3f} differs from "
+                f"{CAPTURE_FREQUENCY_HZ:.3f} by more than {CAPTURE_FREQUENCY_TOLERANCE_HZ:.3f} Hz"
+            )
+        if score < CAPTURE_FREQUENCY_SCORE_MIN:
+            violations.append(
+                f"channel_{channel}_frequency_identity_score {score:.6f} < "
+                f"{CAPTURE_FREQUENCY_SCORE_MIN:.6f}"
+            )
     if active_frames < MIN_ACTIVE_FRAMES:
         violations.append(f"active_frames {active_frames} < {MIN_ACTIVE_FRAMES}")
     if rms <= minimum_rms:
@@ -173,6 +286,14 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "active_frames": active_frames,
         "active_duration_seconds": active_frames / SAMPLE_RATE,
         "trim_frames_each_edge": TRIM_FRAMES,
+        "fixture_run_count": len(active_runs),
+        "authenticated_fixture_run_count": len(authenticated_runs),
+        "capture_frequency_hz": CAPTURE_FREQUENCY_HZ,
+        "capture_frequency_tolerance_hz": CAPTURE_FREQUENCY_TOLERANCE_HZ,
+        "channel_frequency_hz": channel_frequencies,
+        "channel_frequency_identity_score": channel_scores,
+        "leading_silence_frames": leading_silence_frames,
+        "trailing_silence_frames": trailing_silence_frames,
         "rms": rms,
         "peak": peak,
         "outside_peak": outside_peak,
@@ -198,6 +319,10 @@ def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_pe
                 f"frames: {result['frames']}",
                 f"active_frames: {result['active_frames']}",
                 f"active_duration_seconds: {result['active_duration_seconds']:.6f}",
+                f"fixture_run_count: {result['fixture_run_count']}",
+                f"authenticated_fixture_run_count: {result['authenticated_fixture_run_count']}",
+                f"channel_frequency_hz: {result['channel_frequency_hz']}",
+                f"channel_frequency_identity_score: {result['channel_frequency_identity_score']}",
                 f"rms: {result['rms']:.9f}",
                 f"peak: {result['peak']:.9f}",
                 f"outside_peak: {result['outside_peak']:.9f}",
@@ -234,6 +359,10 @@ def ratio_command(
     for destination, (full_path, reduced_path) in source_paths.items():
         full = _load_json(full_path)
         reduced = _load_json(reduced_path)
+        if full.get("valid") is not True or reduced.get("valid") is not True:
+            raise ProbeError(
+                f"{destination} metrics are not authenticated capture evidence"
+            )
         rms_ratio = float(reduced["rms"]) / float(full["rms"])
         peak_ratio = float(reduced["peak"]) / float(full["peak"])
         ratios = (rms_ratio, peak_ratio)
@@ -281,44 +410,47 @@ def ratio_command(
 
 
 def _longest_active_run(peaks: list[float], threshold: float) -> tuple[int, int]:
-    best_start = best_end = 0
-    current_start: int | None = None
-    last_active: int | None = None
-    for index, peak in enumerate(peaks):
-        if peak > threshold:
-            if current_start is None:
-                current_start = index
-            last_active = index
-            continue
-        if current_start is not None and last_active is not None and index - last_active - 1 > MARKER_MAX_SILENT_GAP_FRAMES:
-            if last_active + 1 - current_start > best_end - best_start:
-                best_start, best_end = current_start, last_active + 1
-            current_start = None
-            last_active = None
-    if current_start is not None and last_active is not None and last_active + 1 - current_start > best_end - best_start:
-        best_start, best_end = current_start, last_active + 1
-    return best_start, best_end
+    runs = _active_runs(peaks, threshold, MARKER_MAX_SILENT_GAP_FRAMES)
+    return max(runs, key=lambda run: run[1] - run[0], default=(0, 0))
 
 
-def _estimate_frequency(frames: list[tuple[float, float]], start: int, end: int) -> float:
+def _estimate_frequency(
+    frames: list[tuple[float, float]], start: int, end: int, channel: int
+) -> float:
     previous_sign: int | None = None
-    crossings = 0
-    for left, right in frames[start:end]:
-        sample = (left + right) / 2.0
+    previous_index: int | None = None
+    previous_sample: float | None = None
+    crossings: list[float] = []
+    for index, frame in enumerate(frames[start:end]):
+        sample = frame[channel]
         sign = 1 if sample > 0.0 else -1 if sample < 0.0 else 0
         if sign == 0:
             continue
         if previous_sign is not None and sign != previous_sign:
-            crossings += 1
+            assert previous_index is not None
+            assert previous_sample is not None
+            denominator = abs(previous_sample) + abs(sample)
+            fraction = abs(previous_sample) / denominator if denominator else 0.0
+            crossings.append(previous_index + fraction)
         previous_sign = sign
-    duration_seconds = (end - start) / SAMPLE_RATE
-    return crossings / (2.0 * duration_seconds) if duration_seconds > 0.0 else 0.0
+        previous_index = index
+        previous_sample = sample
+    if len(crossings) < 2:
+        return 0.0
+    mean_position = sum(crossings) / len(crossings)
+    mean_crossing = (len(crossings) - 1) / 2.0
+    numerator = sum(
+        (position - mean_position) * (crossing - mean_crossing)
+        for crossing, position in enumerate(crossings)
+    )
+    denominator = sum((position - mean_position) ** 2 for position in crossings)
+    return (numerator / denominator) * SAMPLE_RATE / 2.0 if denominator > 0.0 else 0.0
 
 
 def _frequency_identity_score(
-    frames: list[tuple[float, float]], start: int, end: int, frequency_hz: float
+    frames: list[tuple[float, float]], start: int, end: int, frequency_hz: float, channel: int
 ) -> float:
-    samples = [(left + right) / 2.0 for left, right in frames[start:end]]
+    samples = [frame[channel] for frame in frames[start:end]]
     if not samples:
         return 0.0
     mean = sum(samples) / len(samples)
@@ -336,9 +468,10 @@ def _frequency_identity_score(
         sine_projection += sample * sine
         cosine_projection += sample * cosine
         basis_energy += sine * sine + cosine * cosine
-    return math.sqrt(sine_projection**2 + cosine_projection**2) / math.sqrt(
-        sample_energy * basis_energy
+    score = math.sqrt(sine_projection**2 + cosine_projection**2) / math.sqrt(
+        sample_energy * (basis_energy / 2.0)
     )
+    return max(0.0, min(1.0, score))
 
 
 def marker_command(expected_path: Path, other_path: Path, json_path: Path, human_path: Path, expected_destination: str) -> None:
@@ -349,29 +482,78 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
     other_frames = _read_f32_stereo(other_path)
     expected_peaks = _frame_peaks(expected_frames)
     other_peaks = _frame_peaks(other_frames)
-    expected_peak = max(expected_peaks)
-    other_peak = max(other_peaks)
-    active_start, active_end_exclusive = _longest_active_run(expected_peaks, ACTIVE_THRESHOLD)
-    expected_active_frames = active_end_exclusive - active_start
-    measured_frequency = _estimate_frequency(expected_frames, active_start, active_end_exclusive)
-    frequency_score = _frequency_identity_score(
-        expected_frames, active_start, active_end_exclusive, expected_frequency
+    expected_peak = max(expected_peaks, default=0.0)
+    other_peak = max(other_peaks, default=0.0)
+    expected_runs = _active_runs(expected_peaks, ACTIVE_THRESHOLD, MARKER_MAX_SILENT_GAP_FRAMES)
+    active_start, active_end_exclusive = max(
+        expected_runs,
+        key=lambda run: run[1] - run[0],
+        default=(0, 0),
     )
+    expected_active_frames = active_end_exclusive - active_start
+    channel_frequencies = [
+        _estimate_frequency(expected_frames, active_start, active_end_exclusive, channel)
+        for channel in range(STEREO)
+    ]
+    channel_scores = [
+        _frequency_identity_score(
+            expected_frames,
+            active_start,
+            active_end_exclusive,
+            frequency,
+            channel,
+        )
+        for channel, frequency in enumerate(channel_frequencies)
+    ]
+    authenticated_runs = []
+    for start, end in expected_runs:
+        if end - start < MARKER_MIN_ACTIVE_FRAMES:
+            continue
+        frequencies = [
+            _estimate_frequency(expected_frames, start, end, channel)
+            for channel in range(STEREO)
+        ]
+        scores = [
+            _frequency_identity_score(expected_frames, start, end, frequency, channel)
+            for channel, frequency in enumerate(frequencies)
+        ]
+        if all(
+            _frequency_within_tolerance(
+                frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
+            )
+            and score >= MARKER_FREQUENCY_SCORE_MIN
+            for frequency, score in zip(frequencies, scores)
+        ):
+            authenticated_runs.append((start, end))
+    expected_outside_values = expected_peaks[:active_start] + expected_peaks[active_end_exclusive:]
+    expected_outside_peak = max(expected_outside_values, default=0.0)
+    measured_frequency = sum(channel_frequencies) / STEREO
+    frequency_score = min(channel_scores, default=0.0)
     violations: list[str] = []
+    if len(authenticated_runs) != 1:
+        violations.append(f"authenticated_marker_runs {len(authenticated_runs)} != 1")
     if expected_active_frames < MARKER_MIN_ACTIVE_FRAMES:
         violations.append(
             f"expected_active_frames {expected_active_frames} < {MARKER_MIN_ACTIVE_FRAMES}"
         )
     if expected_peak <= 0.05:
         violations.append(f"expected_peak {expected_peak:.9f} <= 0.05")
-    if abs(measured_frequency - expected_frequency) > MARKER_FREQUENCY_TOLERANCE_HZ:
+    for channel, (frequency, score) in enumerate(zip(channel_frequencies, channel_scores)):
+        if not _frequency_within_tolerance(
+            frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
+        ):
+            violations.append(
+                f"channel_{channel}_measured_frequency_hz {frequency:.3f} differs from "
+                f"expected {expected_frequency:.3f} by more than {MARKER_FREQUENCY_TOLERANCE_HZ:.3f} Hz"
+            )
+        if score < MARKER_FREQUENCY_SCORE_MIN:
+            violations.append(
+                f"channel_{channel}_frequency_identity_score {score:.6f} < "
+                f"{MARKER_FREQUENCY_SCORE_MIN:.6f}"
+            )
+    if expected_outside_peak >= OUTSIDE_THRESHOLD:
         violations.append(
-            f"measured_frequency {measured_frequency:.3f} differs from "
-            f"expected {expected_frequency:.3f} by more than {MARKER_FREQUENCY_TOLERANCE_HZ:.3f} Hz"
-        )
-    if frequency_score < MARKER_FREQUENCY_SCORE_MIN:
-        violations.append(
-            f"frequency_identity_score {frequency_score:.6f} < {MARKER_FREQUENCY_SCORE_MIN:.6f}"
+            f"expected_outside_peak {expected_outside_peak:.9f} >= {OUTSIDE_THRESHOLD}"
         )
     if other_peak >= OUTSIDE_THRESHOLD:
         violations.append(f"other_peak {other_peak:.9f} >= {OUTSIDE_THRESHOLD}")
@@ -384,9 +566,12 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         "expected_active_end_frame_exclusive": active_end_exclusive,
         "expected_peak": expected_peak,
         "other_peak": other_peak,
+        "expected_outside_peak": expected_outside_peak,
         "expected_frequency_hz": expected_frequency,
         "measured_frequency_hz": measured_frequency,
+        "channel_measured_frequency_hz": channel_frequencies,
         "frequency_identity_score": frequency_score,
+        "channel_frequency_identity_score": channel_scores,
         "marker_min_active_frames": MARKER_MIN_ACTIVE_FRAMES,
         "marker_frequency_tolerance_hz": MARKER_FREQUENCY_TOLERANCE_HZ,
         "expected_active_threshold": ACTIVE_THRESHOLD,
@@ -403,9 +588,12 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
                 f"expected_active_frames: {result['expected_active_frames']}",
                 f"expected_frequency_hz: {result['expected_frequency_hz']:.3f}",
                 f"measured_frequency_hz: {result['measured_frequency_hz']:.3f}",
+                f"channel_measured_frequency_hz: {result['channel_measured_frequency_hz']}",
                 f"frequency_identity_score: {result['frequency_identity_score']:.6f}",
+                f"channel_frequency_identity_score: {result['channel_frequency_identity_score']}",
                 f"expected_peak: {expected_peak:.9f}",
                 f"other_peak: {other_peak:.9f}",
+                f"expected_outside_peak: {expected_outside_peak:.9f}",
                 f"valid: {result['valid']}",
                 f"violations: {', '.join(result['violations']) or 'none'}",
             ]
@@ -754,6 +942,100 @@ def self_test() -> None:
         if tone_to_eof_result["valid"]:
             raise ProbeError("96,000-frame capture without trailing silence unexpectedly passed metrics")
 
+        late_733_captures: dict[tuple[str, int], Path] = {}
+        for destination in ("target", "monitor"):
+            for volume, amplitude in ((100, 0.25), (10, 0.025)):
+                raw = root / f"late-733-{destination}-{volume}.raw"
+                _write_f32_capture(
+                    raw,
+                    amplitude,
+                    frames=288_000,
+                    active_start=200_000,
+                    active_end=272_000,
+                    frequency_hz=733.0,
+                )
+                result = analyze_capture(raw, volume)
+                if result["valid"]:
+                    raise ProbeError(
+                        f"late 733 Hz {destination} {volume}% capture unexpectedly passed: {result}"
+                    )
+                late_733_captures[(destination, volume)] = raw
+        _expect_probe_error(
+            lambda: ratio_command(
+                _metric_file(root, late_733_captures[("target", 100)], 100),
+                _metric_file(root, late_733_captures[("target", 10)], 10),
+                _metric_file(root, late_733_captures[("monitor", 100)], 100),
+                _metric_file(root, late_733_captures[("monitor", 10)], 10),
+                root / "late-733-ratio.json",
+                root / "late-733-ratio.txt",
+            ),
+            "late 733 Hz capture ratio evidence",
+        )
+
+        def write_separated_bursts(path: Path, amplitude: float) -> None:
+            with path.open("wb") as output:
+                for frame in range(FIXTURE_FRAMES):
+                    if 12_000 <= frame < 22_000 or 74_000 <= frame < 84_000:
+                        sample = amplitude * math.sin(
+                            2.0 * math.pi * 997.0 * (frame % 10_000) / SAMPLE_RATE
+                        )
+                    else:
+                        sample = 0.0
+                    output.write(struct.pack("<ff", sample, sample))
+
+        for volume, amplitude in ((100, 0.25), (10, 0.025)):
+            separated = root / f"separated-997-{volume}.raw"
+            write_separated_bursts(separated, amplitude)
+            result = analyze_capture(separated, volume)
+            if result["valid"] or result["active_frames"] >= MIN_ACTIVE_FRAMES:
+                raise ProbeError(
+                    f"separated 997 Hz bursts unexpectedly passed the contiguous-duration gate: {result}"
+                )
+
+        ambiguous = root / "ambiguous-997.raw"
+        with ambiguous.open("wb") as output:
+            for frame in range(288_000):
+                if 12_000 <= frame < 84_000 or 120_000 <= frame < 192_000:
+                    sample = 0.25 * math.sin(
+                        2.0 * math.pi * 997.0 * (frame % 72_000) / SAMPLE_RATE
+                    )
+                else:
+                    sample = 0.0
+                output.write(struct.pack("<ff", sample, sample))
+        ambiguous_result = analyze_capture(ambiguous, 100)
+        if ambiguous_result["valid"]:
+            raise ProbeError(f"multiple authenticated fixture runs unexpectedly passed: {ambiguous_result}")
+
+        shifted = root / "shifted-997.raw"
+        _write_f32_capture(
+            shifted,
+            0.25,
+            frames=320_000,
+            active_start=30_000,
+            active_end=102_000,
+        )
+        shifted_result = analyze_capture(shifted, 100)
+        if not shifted_result["valid"]:
+            raise ProbeError(f"valid fixture with extra leading/trailing silence failed: {shifted_result}")
+
+        frequency_at_tolerance = root / "frequency-at-tolerance.raw"
+        _write_f32_capture(
+            frequency_at_tolerance,
+            0.25,
+            frequency_hz=997.0 + 10.0,
+        )
+        if not analyze_capture(frequency_at_tolerance, 100)["valid"]:
+            raise ProbeError("fixture frequency exactly at tolerance unexpectedly failed")
+
+        frequency_outside_tolerance = root / "frequency-outside-tolerance.raw"
+        _write_f32_capture(
+            frequency_outside_tolerance,
+            0.25,
+            frequency_hz=997.0 + 10.1,
+        )
+        if analyze_capture(frequency_outside_tolerance, 100)["valid"]:
+            raise ProbeError("fixture frequency outside tolerance unexpectedly passed")
+
         ratio = root / "ratio.json"
         ratio_human = root / "ratio.txt"
         ratio_command(
@@ -828,6 +1110,28 @@ def self_test() -> None:
                 "target",
             ),
             "one-frame marker impulse",
+        )
+
+        phase_cancelled_marker = root / "phase-cancelled-marker.raw"
+        with phase_cancelled_marker.open("wb") as output:
+            for frame in range(12_000):
+                if 600 <= frame < 11_400:
+                    elapsed = frame - 600
+                    common = 0.06 * math.sin(2.0 * math.pi * 733.0 * elapsed / SAMPLE_RATE)
+                    wrong = 0.25 * math.sin(2.0 * math.pi * 997.0 * elapsed / SAMPLE_RATE)
+                    left, right = common + wrong, common - wrong
+                else:
+                    left = right = 0.0
+                output.write(struct.pack("<ff", left, right))
+        _expect_probe_error(
+            lambda: marker_command(
+                phase_cancelled_marker,
+                silence,
+                root / "phase-cancelled-marker.json",
+                root / "phase-cancelled-marker.txt",
+                "target",
+            ),
+            "stereo phase-cancelled wrong-frequency marker",
         )
 
         links = root / "links.txt"
