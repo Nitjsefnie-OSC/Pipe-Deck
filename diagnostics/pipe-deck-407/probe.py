@@ -8,6 +8,7 @@ test and by the later runner workflow; it never changes Pipe Deck behaviour.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import math
 import re
@@ -22,14 +23,28 @@ STEREO = 2
 FIXTURE_FRAMES = 96_000
 ACTIVE_START = 12_000
 ACTIVE_END = 84_000
+FIXTURE_TRAILING_SILENCE_FRAMES = FIXTURE_FRAMES - ACTIVE_END
 TRIM_FRAMES = 4_800
 MIN_ACTIVE_FRAMES = 57_600
 ACTIVE_THRESHOLD = 0.002
 OUTSIDE_THRESHOLD = 1e-3
+MARKER_FREQUENCIES = {"target": 733.0, "monitor": 1237.0}
+MARKER_MIN_ACTIVE_FRAMES = SAMPLE_RATE // 10
+MARKER_MAX_SILENT_GAP_FRAMES = 4
+MARKER_FREQUENCY_TOLERANCE_HZ = 10.0
+MARKER_FREQUENCY_SCORE_MIN = 0.50
 
 
 class ProbeError(RuntimeError):
     """A failed diagnostic assertion or invalid input."""
+
+
+def _expect_probe_error(action: Callable[[], object], description: str) -> None:
+    try:
+        action()
+    except ProbeError:
+        return
+    raise ProbeError(f"{description} unexpectedly passed")
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -126,10 +141,17 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     peak = max(_frame_peaks(trimmed_samples))
     outside_values = peaks[:active_start] + peaks[active_end_exclusive:]
     outside_peak = max(outside_values, default=0.0)
+    trailing_silence_peak = max(peaks[-FIXTURE_TRAILING_SILENCE_FRAMES:], default=0.0)
 
     minimum_rms = 0.02 if volume_percent == 100 else 0.002
     minimum_peak = 0.05 if volume_percent == 100 else 0.005
     violations: list[str] = []
+    if len(frames) < FIXTURE_FRAMES:
+        violations.append(f"frames {len(frames)} < generated fixture extent {FIXTURE_FRAMES}")
+    if trailing_silence_peak >= OUTSIDE_THRESHOLD:
+        violations.append(
+            f"trailing_silence_peak {trailing_silence_peak:.9f} >= {OUTSIDE_THRESHOLD}"
+        )
     if active_frames < MIN_ACTIVE_FRAMES:
         violations.append(f"active_frames {active_frames} < {MIN_ACTIVE_FRAMES}")
     if rms <= minimum_rms:
@@ -154,6 +176,9 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "rms": rms,
         "peak": peak,
         "outside_peak": outside_peak,
+        "trailing_silence_peak": trailing_silence_peak,
+        "expected_frames": FIXTURE_FRAMES,
+        "required_trailing_silence_frames": FIXTURE_TRAILING_SILENCE_FRAMES,
         "minimum_rms": minimum_rms,
         "minimum_peak": minimum_peak,
         "valid": not violations,
@@ -176,6 +201,7 @@ def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_pe
                 f"rms: {result['rms']:.9f}",
                 f"peak: {result['peak']:.9f}",
                 f"outside_peak: {result['outside_peak']:.9f}",
+                f"trailing_silence_peak: {result['trailing_silence_peak']:.9f}",
                 f"valid: {result['valid']}",
                 f"violations: {', '.join(result['violations']) or 'none'}",
             ]
@@ -254,23 +280,119 @@ def ratio_command(
         raise ProbeError(f"volume ratio classification is {overall}; it never passes as scaled volume")
 
 
+def _longest_active_run(peaks: list[float], threshold: float) -> tuple[int, int]:
+    best_start = best_end = 0
+    current_start: int | None = None
+    last_active: int | None = None
+    for index, peak in enumerate(peaks):
+        if peak > threshold:
+            if current_start is None:
+                current_start = index
+            last_active = index
+            continue
+        if current_start is not None and last_active is not None and index - last_active - 1 > MARKER_MAX_SILENT_GAP_FRAMES:
+            if last_active + 1 - current_start > best_end - best_start:
+                best_start, best_end = current_start, last_active + 1
+            current_start = None
+            last_active = None
+    if current_start is not None and last_active is not None and last_active + 1 - current_start > best_end - best_start:
+        best_start, best_end = current_start, last_active + 1
+    return best_start, best_end
+
+
+def _estimate_frequency(frames: list[tuple[float, float]], start: int, end: int) -> float:
+    previous_sign: int | None = None
+    crossings = 0
+    for left, right in frames[start:end]:
+        sample = (left + right) / 2.0
+        sign = 1 if sample > 0.0 else -1 if sample < 0.0 else 0
+        if sign == 0:
+            continue
+        if previous_sign is not None and sign != previous_sign:
+            crossings += 1
+        previous_sign = sign
+    duration_seconds = (end - start) / SAMPLE_RATE
+    return crossings / (2.0 * duration_seconds) if duration_seconds > 0.0 else 0.0
+
+
+def _frequency_identity_score(
+    frames: list[tuple[float, float]], start: int, end: int, frequency_hz: float
+) -> float:
+    samples = [(left + right) / 2.0 for left, right in frames[start:end]]
+    if not samples:
+        return 0.0
+    mean = sum(samples) / len(samples)
+    centered = [sample - mean for sample in samples]
+    sample_energy = sum(sample * sample for sample in centered)
+    if sample_energy <= 0.0:
+        return 0.0
+    sine_projection = 0.0
+    cosine_projection = 0.0
+    basis_energy = 0.0
+    for index, sample in enumerate(centered):
+        phase = 2.0 * math.pi * frequency_hz * index / SAMPLE_RATE
+        sine = math.sin(phase)
+        cosine = math.cos(phase)
+        sine_projection += sample * sine
+        cosine_projection += sample * cosine
+        basis_energy += sine * sine + cosine * cosine
+    return math.sqrt(sine_projection**2 + cosine_projection**2) / math.sqrt(
+        sample_energy * basis_energy
+    )
+
+
 def marker_command(expected_path: Path, other_path: Path, json_path: Path, human_path: Path, expected_destination: str) -> None:
+    expected_frequency = MARKER_FREQUENCIES.get(expected_destination)
+    if expected_frequency is None:
+        raise ProbeError(f"unknown marker destination: {expected_destination}")
     expected_frames = _read_f32_stereo(expected_path)
     other_frames = _read_f32_stereo(other_path)
     expected_peaks = _frame_peaks(expected_frames)
     other_peaks = _frame_peaks(other_frames)
     expected_peak = max(expected_peaks)
     other_peak = max(other_peaks)
+    active_start, active_end_exclusive = _longest_active_run(expected_peaks, ACTIVE_THRESHOLD)
+    expected_active_frames = active_end_exclusive - active_start
+    measured_frequency = _estimate_frequency(expected_frames, active_start, active_end_exclusive)
+    frequency_score = _frequency_identity_score(
+        expected_frames, active_start, active_end_exclusive, expected_frequency
+    )
+    violations: list[str] = []
+    if expected_active_frames < MARKER_MIN_ACTIVE_FRAMES:
+        violations.append(
+            f"expected_active_frames {expected_active_frames} < {MARKER_MIN_ACTIVE_FRAMES}"
+        )
+    if expected_peak <= 0.05:
+        violations.append(f"expected_peak {expected_peak:.9f} <= 0.05")
+    if abs(measured_frequency - expected_frequency) > MARKER_FREQUENCY_TOLERANCE_HZ:
+        violations.append(
+            f"measured_frequency {measured_frequency:.3f} differs from "
+            f"expected {expected_frequency:.3f} by more than {MARKER_FREQUENCY_TOLERANCE_HZ:.3f} Hz"
+        )
+    if frequency_score < MARKER_FREQUENCY_SCORE_MIN:
+        violations.append(
+            f"frequency_identity_score {frequency_score:.6f} < {MARKER_FREQUENCY_SCORE_MIN:.6f}"
+        )
+    if other_peak >= OUTSIDE_THRESHOLD:
+        violations.append(f"other_peak {other_peak:.9f} >= {OUTSIDE_THRESHOLD}")
     result = {
         "expected_destination": expected_destination,
         "expected_capture": str(expected_path),
         "other_capture": str(other_path),
-        "expected_active_frames": sum(peak > ACTIVE_THRESHOLD for peak in expected_peaks),
+        "expected_active_frames": expected_active_frames,
+        "expected_active_start_frame": active_start,
+        "expected_active_end_frame_exclusive": active_end_exclusive,
         "expected_peak": expected_peak,
         "other_peak": other_peak,
-        "expected_active_threshold": 0.05,
+        "expected_frequency_hz": expected_frequency,
+        "measured_frequency_hz": measured_frequency,
+        "frequency_identity_score": frequency_score,
+        "marker_min_active_frames": MARKER_MIN_ACTIVE_FRAMES,
+        "marker_frequency_tolerance_hz": MARKER_FREQUENCY_TOLERANCE_HZ,
+        "expected_active_threshold": ACTIVE_THRESHOLD,
         "other_silence_threshold": OUTSIDE_THRESHOLD,
-        "valid": expected_peak > 0.05 and other_peak < OUTSIDE_THRESHOLD,
+        "valid": not violations,
+        "violations": violations,
     }
     _write_json(json_path, result)
     _write_text(
@@ -279,14 +401,20 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
             [
                 f"expected_destination: {expected_destination}",
                 f"expected_active_frames: {result['expected_active_frames']}",
+                f"expected_frequency_hz: {result['expected_frequency_hz']:.3f}",
+                f"measured_frequency_hz: {result['measured_frequency_hz']:.3f}",
+                f"frequency_identity_score: {result['frequency_identity_score']:.6f}",
                 f"expected_peak: {expected_peak:.9f}",
                 f"other_peak: {other_peak:.9f}",
                 f"valid: {result['valid']}",
+                f"violations: {', '.join(result['violations']) or 'none'}",
             ]
         ),
     )
     if not result["valid"]:
-        raise ProbeError(f"target-only/monitor-only marker routing failed for {expected_destination}")
+        raise ProbeError(
+            f"target-only/monitor-only marker routing failed for {expected_destination}: {violations}"
+        )
 
 
 def _parse_pw_link_list(text: str) -> list[tuple[str, str]]:
@@ -443,43 +571,107 @@ def wrapper_command(
     human_path: Path,
 ) -> None:
     text = log_path.read_text(encoding="utf-8")
-    argv_lines = [line[len("argv:") :].strip().split() for line in text.splitlines() if line.startswith("argv:")]
     expected = [
         (target_name, "1.00"),
         (monitor_name, "1.00"),
         (target_name, "0.10"),
         (monitor_name, "0.10"),
     ]
-    observed: list[dict[str, str]] = []
-    for argv in argv_lines:
-        if "--target" not in argv or "--volume" not in argv:
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith("argv:"):
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append(current)
+
+    violations: list[str] = []
+    invocations: list[dict[str, object]] = []
+    seen: dict[tuple[str, str], int] = {}
+    for block_number, block in enumerate(blocks, start=1):
+        argv = block[0][len("argv:") :].strip().split()
+        try:
+            target_index = argv.index("--target")
+            volume_index = argv.index("--volume")
+            target = argv[target_index + 1]
+            volume = argv[volume_index + 1]
+        except (ValueError, IndexError):
+            violations.append(f"invocation {block_number} has incomplete playback argv")
             continue
-        target = argv[argv.index("--target") + 1]
-        volume = argv[argv.index("--volume") + 1]
-        observed.append({"target": target, "volume": volume})
-    observed_pairs = [(item["target"], item["volume"]) for item in observed]
-    lower = text.lower()
-    streaming_count = lower.count("streaming")
+        pair = (target, volume)
+        seen[pair] = seen.get(pair, 0) + 1
+        lower_block = "\n".join(block).lower()
+        playback = "--playback" in argv
+        streaming = bool(re.search(r"\bstreaming\b", lower_block))
+        control_volume = "1.000" if volume == "1.00" else "0.100" if volume == "0.10" else None
+        matching_control = bool(
+            control_volume
+            and re.search(
+                rf"stream set volume to {re.escape(control_volume)} - success",
+                lower_block,
+            )
+        )
+        exits = re.findall(r"^exit=([0-9]+)$", "\n".join(block), flags=re.MULTILINE)
+        invocation_valid = playback and streaming and matching_control and exits == ["0"] and pair in expected
+        if not playback:
+            violations.append(f"invocation {block_number} is missing --playback")
+        if not streaming:
+            violations.append(f"invocation {block_number} is missing STREAMING evidence")
+        if not matching_control:
+            violations.append(f"invocation {block_number} is missing matching volume success evidence")
+        if exits != ["0"]:
+            violations.append(f"invocation {block_number} exit evidence is {exits}, expected ['0']")
+        if pair not in expected:
+            violations.append(f"invocation {block_number} has unexpected target/volume pair {pair}")
+        invocations.append(
+            {
+                "target": target,
+                "volume": volume,
+                "playback": playback,
+                "streaming": streaming,
+                "matching_control_success": matching_control,
+                "exit_statuses": exits,
+                "valid": invocation_valid,
+            }
+        )
+
+    observed = [
+        {"target": invocation["target"], "volume": invocation["volume"]}
+        for invocation in invocations
+    ]
+    for pair in expected:
+        if seen.get(pair, 0) != 1:
+            violations.append(f"expected playback {pair} has {seen.get(pair, 0)} invocation blocks, expected 1")
+    if len(blocks) != len(expected):
+        violations.append(f"wrapper log has {len(blocks)} invocation blocks, expected {len(expected)}")
+    streaming_count = sum(bool(invocation["streaming"]) for invocation in invocations)
     control_success = {
-        "1.000": len(re.findall(r"stream set volume to 1\.000 - success", lower)),
-        "0.100": len(re.findall(r"stream set volume to 0\.100 - success", lower)),
+        "1.000": sum(
+            bool(invocation["matching_control_success"])
+            for invocation in invocations
+            if invocation["volume"] == "1.00"
+        ),
+        "0.100": sum(
+            bool(invocation["matching_control_success"])
+            for invocation in invocations
+            if invocation["volume"] == "0.10"
+        ),
     }
-    exits = re.findall(r"^exit=([0-9]+)$", text, flags=re.MULTILINE)
-    valid = (
-        len(observed_pairs) == 4
-        and sorted(observed_pairs) == sorted(expected)
-        and streaming_count >= 4
-        and control_success["1.000"] >= 2
-        and control_success["0.100"] >= 2
-        and exits == ["0", "0", "0", "0"]
-    )
+    exits = [status for invocation in invocations for status in invocation["exit_statuses"]]
+    valid = not violations
     result = {
         "expected_plays": [{"target": target, "volume": volume} for target, volume in expected],
         "observed_plays": observed,
+        "invocations": invocations,
         "streaming_count": streaming_count,
         "control_success": control_success,
         "exit_statuses": exits,
         "valid": valid,
+        "violations": violations,
     }
     _write_json(json_path, result)
     _write_text(
@@ -491,11 +683,14 @@ def wrapper_command(
                 f"control_success: {control_success}",
                 f"exit_statuses: {exits}",
                 f"valid: {valid}",
+                f"violations: {', '.join(violations) or 'none'}",
             ]
         ),
     )
     if not valid:
-        raise ProbeError("pw-cat wrapper did not prove four successful streaming volume controls")
+        raise ProbeError(
+            f"pw-cat wrapper did not prove four successful streaming volume controls: {violations}"
+        )
 
 
 def _write_f32_capture(
@@ -504,12 +699,15 @@ def _write_f32_capture(
     frames: int = FIXTURE_FRAMES,
     active_start: int = ACTIVE_START,
     active_end: int = ACTIVE_END,
+    frequency_hz: float = 997.0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as output:
         for frame in range(frames):
             if active_start <= frame < active_end:
-                sample = amplitude * math.sin(2.0 * math.pi * 997.0 * (frame - active_start) / SAMPLE_RATE)
+                sample = amplitude * math.sin(
+                    2.0 * math.pi * frequency_hz * (frame - active_start) / SAMPLE_RATE
+                )
             else:
                 sample = 0.0
             output.write(struct.pack("<ff", sample, sample))
@@ -538,6 +736,24 @@ def self_test() -> None:
             if not result["valid"]:
                 raise ProbeError(f"metrics self-test failed for {raw}: {result['violations']}")
 
+        extended = root / "extended.raw"
+        _write_f32_capture(extended, 0.25, frames=288_000)
+        extended_result = analyze_capture(extended, 100)
+        if not extended_result["valid"]:
+            raise ProbeError(f"extended capture self-test failed: {extended_result['violations']}")
+
+        truncated = root / "truncated.raw"
+        _write_f32_capture(truncated, 0.25, frames=80_000, active_end=80_000)
+        truncated_result = analyze_capture(truncated, 100)
+        if truncated_result["valid"]:
+            raise ProbeError("truncated 80,000-frame capture unexpectedly passed metrics")
+
+        tone_to_eof = root / "tone-to-eof.raw"
+        _write_f32_capture(tone_to_eof, 0.25, active_end=FIXTURE_FRAMES)
+        tone_to_eof_result = analyze_capture(tone_to_eof, 100)
+        if tone_to_eof_result["valid"]:
+            raise ProbeError("96,000-frame capture without trailing silence unexpectedly passed metrics")
+
         ratio = root / "ratio.json"
         ratio_human = root / "ratio.txt"
         ratio_command(
@@ -551,9 +767,68 @@ def self_test() -> None:
 
         marker = root / "marker.raw"
         silence = root / "silence.raw"
-        _write_f32_capture(marker, 0.25, frames=12_000, active_start=600, active_end=11_400)
+        _write_f32_capture(
+            marker,
+            0.25,
+            frames=12_000,
+            active_start=600,
+            active_end=11_400,
+            frequency_hz=733.0,
+        )
         _write_f32_capture(silence, 0.0, frames=12_000, active_start=600, active_end=11_400)
         marker_command(marker, silence, root / "marker.json", root / "marker.txt", "target")
+
+        monitor_marker = root / "monitor-marker.raw"
+        _write_f32_capture(
+            monitor_marker,
+            0.25,
+            frames=12_000,
+            active_start=600,
+            active_end=11_400,
+            frequency_hz=1237.0,
+        )
+        marker_command(
+            monitor_marker,
+            silence,
+            root / "monitor-marker.json",
+            root / "monitor-marker.txt",
+            "monitor",
+        )
+
+        wrong_frequency_marker = root / "wrong-frequency-marker.raw"
+        _write_f32_capture(
+            wrong_frequency_marker,
+            0.25,
+            frames=12_000,
+            active_start=600,
+            active_end=11_400,
+        )
+        _expect_probe_error(
+            lambda: marker_command(
+                wrong_frequency_marker,
+                silence,
+                root / "wrong-frequency-marker.json",
+                root / "wrong-frequency-marker.txt",
+                "target",
+            ),
+            "wrong-frequency marker",
+        )
+
+        impulse = root / "impulse.raw"
+        with impulse.open("wb") as output:
+            for frame in range(12_000):
+                sample = 0.25 if frame == 6_000 else 0.0
+                output.write(struct.pack("<ff", sample, sample))
+        _expect_probe_error(
+            lambda: marker_command(
+                impulse,
+                silence,
+                root / "impulse-marker.json",
+                root / "impulse-marker.txt",
+                "target",
+            ),
+            "one-frame marker impulse",
+        )
 
         links = root / "links.txt"
         _write_text(
@@ -606,6 +881,41 @@ def self_test() -> None:
             ),
         )
         wrapper_command(wrapper, "target", "monitor", root / "wrapper.json", root / "wrapper.txt")
+
+        aggregate_wrapper = root / "aggregate-pw-cat.log"
+        _write_text(
+            aggregate_wrapper,
+            "\n".join(
+                [
+                    "argv: --playback --target target --volume 1.00 fixture.wav",
+                    "stream state: STREAMING",
+                    "stream state: STREAMING",
+                    "stream state: STREAMING",
+                    "stream state: STREAMING",
+                    "stream set volume to 1.000 - success",
+                    "stream set volume to 1.000 - success",
+                    "stream set volume to 0.100 - success",
+                    "stream set volume to 0.100 - success",
+                    "exit=0",
+                    "argv: --playback --target monitor --volume 1.00 fixture.wav",
+                    "exit=0",
+                    "argv: --playback --target target --volume 0.10 fixture.wav",
+                    "exit=0",
+                    "argv: --playback --target monitor --volume 0.10 fixture.wav",
+                    "exit=0",
+                ]
+            ),
+        )
+        _expect_probe_error(
+            lambda: wrapper_command(
+                aggregate_wrapper,
+                "target",
+                "monitor",
+                root / "aggregate-wrapper.json",
+                root / "aggregate-wrapper.txt",
+            ),
+            "aggregate wrapper evidence",
+        )
     print("self-test: ok")
 
 

@@ -154,6 +154,7 @@ mod live_tests {
 
     const PIPE_DECK_407_BASE: &str = "cedab6e2cf00175acf0a81cec76e42b878218351";
     const PROBE_RUN_DIR_ENV: &str = "PIPE_DECK_407_RUN_DIR";
+    const PROBE_EXPECTED_HEAD_ENV: &str = "PIPE_DECK_407_EXPECTED_HEAD";
     const PROBE_CONFIG_DIR_ENV: &str = "PIPE_DECK_CONFIG_DIR";
     const PROBE_WRAPPER_LOG_ENV: &str = "PIPE_DECK_PW_CAT_LOG";
     const PROBE_TARGET_BOARD: &str = "pipe-deck-407-volume-board";
@@ -272,6 +273,7 @@ mod live_tests {
             PROBE_CONFIG_DIR_ENV,
             "PIPE_DECK_USE_MOCK",
             PROBE_WRAPPER_LOG_ENV,
+            PROBE_EXPECTED_HEAD_ENV,
         ]);
         std::env::remove_var("PIPE_DECK_USE_MOCK");
 
@@ -291,10 +293,25 @@ mod live_tests {
         let sounds_dir = run_dir.join("soundboard-fixture");
         let bin_dir = run_dir.join("bin");
         let wrapper_path = bin_dir.join("pw-cat");
+        match fs::symlink_metadata(&config_dir) {
+            Ok(_) => {
+                return Err(probe_failure(format!(
+                    "refusing to use pre-existing config directory {}",
+                    config_dir.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(probe_failure(format!(
+                    "inspect config directory {}: {error}",
+                    config_dir.display()
+                )))
+            }
+        }
+        fs::create_dir(&config_dir)
+            .map_err(|error| probe_failure(format!("create config directory: {error}")))?;
         let mut setup_cleanup =
             ProbeSetupCleanup::new(config_dir.clone(), wrapper_path.clone(), bin_dir.clone());
-        fs::create_dir_all(&config_dir)
-            .map_err(|error| probe_failure(format!("create config directory: {error}")))?;
         fs::create_dir_all(&sounds_dir)
             .map_err(|error| probe_failure(format!("create fixture directory: {error}")))?;
         std::env::set_var(PROBE_CONFIG_DIR_ENV, &config_dir);
@@ -307,6 +324,8 @@ mod live_tests {
             .map_err(|error| probe_failure(format!("create wrapper bin directory: {error}")))?;
         install_wrapper(&wrapper_source, &wrapper_path)?;
         prepend_path(&bin_dir)?;
+
+        write_provenance(&run_dir, &helper)?;
 
         let fixture = sounds_dir.join(PROBE_CLIP);
         run_python(
@@ -356,7 +375,6 @@ mod live_tests {
             ],
         )?;
 
-        write_provenance(&run_dir, &helper)?;
         let mut engine = CoreEngine::new();
         engine
             .refresh_graph()
@@ -584,33 +602,51 @@ mod live_tests {
         )
     }
 
+    fn is_commit_sha(value: &str) -> bool {
+        value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
     fn write_provenance(run_dir: &Path, helper: &Path) -> Result<(), String> {
-        let revision = command_text(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-            "git",
-            &["rev-parse", "HEAD"],
-        )?;
-        let parent = command_text(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-            "git",
-            &["rev-parse", "HEAD^"],
-        )?;
-        if parent.trim() != PIPE_DECK_407_BASE {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let expected_head = std::env::var(PROBE_EXPECTED_HEAD_ENV).map_err(|_| {
+            probe_failure(format!(
+                "{PROBE_EXPECTED_HEAD_ENV} must be supplied by the runner"
+            ))
+        })?;
+        if !is_commit_sha(&expected_head) {
             return Err(probe_failure(format!(
-                "probe parent must be {PIPE_DECK_407_BASE}, got {} (HEAD {})",
-                parent.trim(),
-                revision.trim()
+                "{PROBE_EXPECTED_HEAD_ENV} must be a 40-character hexadecimal commit SHA, got {expected_head:?}"
+            )));
+        }
+        let revision = command_text(repo_root, "git", &["rev-parse", "HEAD"])?;
+        let revision = revision.trim();
+        if !is_commit_sha(revision) {
+            return Err(probe_failure(format!(
+                "git rev-parse HEAD did not return a 40-character hexadecimal commit SHA: {revision:?}"
+            )));
+        }
+        if revision != expected_head.as_str() {
+            return Err(probe_failure(format!(
+                "tested HEAD {revision} does not match runner-supplied {PROBE_EXPECTED_HEAD_ENV} {expected_head}"
+            )));
+        }
+        let ancestry = Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge-base", "--is-ancestor", PIPE_DECK_407_BASE, revision])
+            .status()
+            .map_err(|error| probe_failure(format!("check probe base ancestry: {error}")))?;
+        if !ancestry.success() {
+            return Err(probe_failure(format!(
+                "tested HEAD {revision} is not a descendant of probe base {PIPE_DECK_407_BASE}"
             )));
         }
         let pw_cli_version = command_text(Path::new("/"), "pw-cli", &["--version"])?;
         let pw_cat_version = command_text(Path::new("/"), "/usr/bin/pw-cat", &["--version"])?;
         let pw_record_version = command_text(Path::new("/"), "/usr/bin/pw-record", &["--version"])?;
         let provenance = format!(
-            "git_head={revision}\nbase_sha={PIPE_DECK_407_BASE}\nhelper={}\npipewire_remote={}\nxdg_runtime_dir={}\ndisable_rtkit={}\n/dev/snd_present={}\npw_cli_version={}pw_cat_version={}pw_record_version={}",
+            "git_head={revision}\nexpected_head={expected_head}\nbase_sha={PIPE_DECK_407_BASE}\nbase_is_ancestor=true\nhelper={}\npipewire_remote={}\nxdg_runtime_dir={}\ndisable_rtkit={}\n/dev/snd_present={}\npw_cli_version={}pw_cat_version={}pw_record_version={}",
             helper.display(),
             std::env::var("PIPEWIRE_REMOTE").unwrap_or_default(),
             std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
