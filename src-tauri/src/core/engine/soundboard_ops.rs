@@ -592,9 +592,17 @@ mod live_tests {
             "git",
             &["rev-parse", "HEAD"],
         )?;
-        if revision.trim() != PIPE_DECK_407_BASE {
+        let parent = command_text(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            "git",
+            &["rev-parse", "HEAD^"],
+        )?;
+        if parent.trim() != PIPE_DECK_407_BASE {
             return Err(probe_failure(format!(
-                "probe must run at {PIPE_DECK_407_BASE}, got {}",
+                "probe parent must be {PIPE_DECK_407_BASE}, got {} (HEAD {})",
+                parent.trim(),
                 revision.trim()
             )));
         }
