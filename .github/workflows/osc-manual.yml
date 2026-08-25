@@ -1,0 +1,143 @@
+name: Pipe Deck fork CI
+
+# Fork-only exact-ref validation. This file is intentionally not sent upstream.
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Git branch, tag, or 40-character commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipe-deck-osc-manual-${{ github.repository }}-${{ inputs.target_ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Core CI gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout candidate ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/Pipe-Deck
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Report checked-out SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [[ ! "$checked_out_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git rev-parse HEAD did not produce a 40-character commit SHA: $checked_out_sha"
+            exit 1
+          fi
+          printf 'checked-out SHA: %s\n' "$checked_out_sha"
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libpipewire-0.3-modules
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable channel, action commit resolved 2026-08-25
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: npm run format:check
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); process.stdout.write(package_json.scripts && typeof package_json.scripts["format:check"] === "string" ? "present" : "missing");')"
+          case "$script_state" in
+            present)
+              npm run format:check
+              ;;
+            missing)
+              message='SKIPPED npm run format:check: package.json on this target ref has no scripts.format:check; the upstream formatter gate is unavailable on this legacy fork ref.'
+              echo "::warning::$message"
+              printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Unexpected format script probe result: $script_state"
+              exit 1
+              ;;
+          esac
+
+      - name: npm run lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); process.stdout.write(package_json.scripts && typeof package_json.scripts.lint === "string" ? "present" : "missing");')"
+          case "$script_state" in
+            present)
+              npm run lint
+              ;;
+            missing)
+              message='SKIPPED npm run lint: package.json on this target ref has no scripts.lint; the upstream ESLint gate is unavailable on this legacy fork ref.'
+              echo "::warning::$message"
+              printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Unexpected lint script probe result: $script_state"
+              exit 1
+              ;;
+          esac
+
+      - name: make check
+        run: make check
+
+      - name: Rust lint parity for legacy fork refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_plan="$(make -n check)"
+          if grep -Fq 'cargo fmt --manifest-path' <<<"$check_plan" && \
+             grep -Fq 'cargo clippy --manifest-path' <<<"$check_plan"; then
+            echo 'make check already contains the upstream Rust fmt and clippy gate.'
+            exit 0
+          fi
+
+          message='make check on this target ref lacks the upstream Rust fmt/clippy prerequisites; running the explicit parity fallback.'
+          echo "::warning::$message"
+          printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+          cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: make test
+        run: make test
