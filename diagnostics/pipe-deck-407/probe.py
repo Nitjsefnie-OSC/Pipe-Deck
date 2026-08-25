@@ -48,7 +48,11 @@ MARKER_FREQUENCY_SCORE_MIN = 0.50
 MARKER_MINIMUM_PEAK = 0.05
 MARKER_MINIMUM_RMS = MARKER_MINIMUM_PEAK / math.sqrt(2.0)
 METRICS_EVIDENCE_SCHEMA = "pipe-deck-407-authenticated-capture-v1"
-CAPTURE_ORIGIN_SCHEMA = "pipe-deck-407-capture-origin-v1"
+CAPTURE_ORIGIN_SCHEMA = "pipe-deck-407-capture-origin-v2"
+RATIO_PUBLICATION_SCHEMA = "pipe-deck-407-ratio-publication-v1"
+RATIO_JSON_NAME = "volume-ratios.json"
+RATIO_HUMAN_NAME = "volume-ratios.txt"
+RATIO_COMMIT_NAME = "volume-ratios.commit.json"
 # The pilot occupies generated leading silence and is half the existing
 # outside-silence ceiling, so it does not enter the trimmed carrier window.
 CAPTURE_ORIGIN_PILOT_START_FRAME = 512
@@ -587,9 +591,11 @@ def _capture_origin_pilot_bytes(
     return bytes(pilot)
 
 
-def _capture_origin_volume(json_path: Path) -> int | None:
-    match = re.fullmatch(r"links-(10|100)\.json", json_path.name)
-    return int(match.group(1)) if match else None
+def _capture_origin_phase(json_path: Path) -> tuple[int, str] | None:
+    match = re.fullmatch(r"links-(10|100)(-post)?\.json", json_path.name)
+    if match is None:
+        return None
+    return int(match.group(1)), "post" if match.group(2) else "pre"
 
 
 def _capture_origin_manifest_path(directory: Path, volume_percent: int) -> Path:
@@ -661,6 +667,7 @@ def _establish_capture_origins(
                 "raw_capture_at_binding": str(raw_path.resolve(strict=True)),
                 "raw_device": raw_stat.st_dev,
                 "raw_inode": raw_stat.st_ino,
+                "raw_size_at_binding": raw_stat.st_size,
                 "pilot_start_frame": CAPTURE_ORIGIN_PILOT_START_FRAME,
                 "pilot_frames": CAPTURE_ORIGIN_PILOT_FRAMES,
                 "pilot_sha256": hashlib.sha256(pilot).hexdigest(),
@@ -678,6 +685,112 @@ def _establish_capture_origins(
     }
     _write_json(manifest_path, manifest)
     return manifest_path.resolve(strict=True)
+
+
+def _seal_capture_origins(
+    directory: Path,
+    volume_percent: int,
+    links_path: Path,
+    link_sha256: str,
+    target_sink: str,
+    monitor_sink: str,
+    target_capture: str,
+    monitor_capture: str,
+) -> Path:
+    # The runner takes this second graph snapshot after carrier playback exits
+    # but before stopping either recorder.  Requiring the same growing inodes at
+    # both snapshots prevents a stable relink from supplying the appended carrier.
+    manifest_candidate = _capture_origin_manifest_path(directory, volume_percent)
+    if manifest_candidate.is_symlink():
+        raise ProbeError(
+            f"capture origin manifest may not be a symlink: {manifest_candidate}"
+        )
+    try:
+        manifest_path = manifest_candidate.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ProbeError(
+            f"pre-carrier capture origin manifest is missing: {manifest_candidate}"
+        ) from error
+    manifest = _load_json(manifest_path)
+    if (
+        manifest.get("schema") != CAPTURE_ORIGIN_SCHEMA
+        or manifest.get("volume_percent") != volume_percent
+    ):
+        raise ProbeError(f"pre-carrier capture origin manifest is invalid: {manifest_path}")
+    if manifest.get("sealed") is True:
+        raise ProbeError(f"capture origin manifest was already sealed: {manifest_path}")
+
+    pre_link_value = manifest.get("link_evidence")
+    if not isinstance(pre_link_value, str) or not Path(pre_link_value).is_absolute():
+        raise ProbeError(f"capture origin manifest has no pre-carrier link evidence: {manifest_path}")
+    pre_link = Path(pre_link_value)
+    if pre_link.is_symlink() or pre_link.resolve(strict=True).parent != directory:
+        raise ProbeError(f"pre-carrier link evidence left its evidence directory: {pre_link}")
+    if manifest.get("link_evidence_sha256") != _sha256_file(pre_link.resolve(strict=True)):
+        raise ProbeError(f"pre-carrier link evidence changed before sealing: {pre_link}")
+
+    entries = manifest.get("captures")
+    if not isinstance(entries, list):
+        raise ProbeError(f"capture origin manifest has no capture bindings: {manifest_path}")
+    expected = {
+        "target": (target_sink, target_capture),
+        "monitor": (monitor_sink, monitor_capture),
+    }
+    sealed_entries: list[dict[str, object]] = []
+    for destination, (sink, capture_node) in expected.items():
+        matching = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("destination") == destination
+        ]
+        if len(matching) != 1:
+            raise ProbeError(
+                f"capture origin has {len(matching)} {destination} bindings: {manifest_path}"
+            )
+        binding = dict(matching[0])
+        if (
+            binding.get("sink") != sink
+            or binding.get("capture_node") != capture_node
+            or binding.get("volume_percent") != volume_percent
+        ):
+            raise ProbeError(
+                f"post-carrier link observation does not match the pre-carrier "
+                f"{destination} binding"
+            )
+        raw_path = directory / f"{destination}-{volume_percent}.raw"
+        if raw_path.is_symlink():
+            raise ProbeError(f"capture origin input may not be a symlink: {raw_path}")
+        raw_stat = raw_path.resolve(strict=True).stat()
+        if not stat.S_ISREG(raw_stat.st_mode):
+            raise ProbeError(f"capture origin input is not a regular file: {raw_path}")
+        if (
+            binding.get("raw_device") != raw_stat.st_dev
+            or binding.get("raw_inode") != raw_stat.st_ino
+        ):
+            raise ProbeError(
+                f"{destination} capture inode changed during carrier acquisition: {raw_path}"
+            )
+        bound_size = binding.get("raw_size_at_binding")
+        if not isinstance(bound_size, int) or raw_stat.st_size <= bound_size:
+            raise ProbeError(
+                f"{destination} capture did not grow after its pre-carrier binding: {raw_path}"
+            )
+        binding["raw_size_at_seal"] = raw_stat.st_size
+        sealed_entries.append(binding)
+
+    resolved_post_link = links_path.resolve(strict=True)
+    if links_path.is_symlink() or resolved_post_link.parent != directory:
+        raise ProbeError(f"post-carrier link evidence left its evidence directory: {links_path}")
+    manifest.update(
+        {
+            "sealed": True,
+            "post_link_evidence": str(resolved_post_link),
+            "post_link_evidence_sha256": link_sha256,
+            "captures": sealed_entries,
+        }
+    )
+    _write_json(manifest_path, manifest)
+    return manifest_path
 
 
 def _authenticated_capture_origin(
@@ -708,6 +821,10 @@ def _authenticated_capture_origin(
         raise ProbeError(f"capture origin manifest has the wrong schema: {manifest_path}")
     if manifest.get("volume_percent") != volume_percent:
         raise ProbeError(f"capture origin manifest has the wrong volume: {manifest_path}")
+    if manifest.get("sealed") is not True:
+        raise ProbeError(
+            f"capture origin manifest lacks a post-carrier graph seal: {manifest_path}"
+        )
     link_value = manifest.get("link_evidence")
     if not isinstance(link_value, str) or not Path(link_value).is_absolute():
         raise ProbeError(f"capture origin manifest has no absolute link evidence: {manifest_path}")
@@ -720,6 +837,20 @@ def _authenticated_capture_origin(
     link_sha256 = _sha256_file(resolved_link)
     if manifest.get("link_evidence_sha256") != link_sha256:
         raise ProbeError(f"capture link evidence digest changed: {resolved_link}")
+    post_link_value = manifest.get("post_link_evidence")
+    if not isinstance(post_link_value, str) or not Path(post_link_value).is_absolute():
+        raise ProbeError(f"capture origin manifest has no post-carrier link evidence: {manifest_path}")
+    post_link_path = Path(post_link_value)
+    if post_link_path.is_symlink():
+        raise ProbeError(f"post-carrier link evidence may not be a symlink: {post_link_path}")
+    resolved_post_link = post_link_path.resolve(strict=True)
+    if resolved_post_link.parent != resolved_raw.parent:
+        raise ProbeError(
+            f"post-carrier link evidence left its evidence directory: {resolved_post_link}"
+        )
+    post_link_sha256 = _sha256_file(resolved_post_link)
+    if manifest.get("post_link_evidence_sha256") != post_link_sha256:
+        raise ProbeError(f"post-carrier link evidence digest changed: {resolved_post_link}")
     entries = manifest.get("captures")
     if not isinstance(entries, list):
         raise ProbeError(f"capture origin manifest has no capture bindings: {manifest_path}")
@@ -740,6 +871,17 @@ def _authenticated_capture_origin(
         raise ProbeError(f"capture origin binding has an invalid destination: {destination!r}")
     if binding.get("volume_percent") != volume_percent:
         raise ProbeError(f"capture origin binding has the wrong volume: {resolved_raw}")
+    bound_size = binding.get("raw_size_at_binding")
+    sealed_size = binding.get("raw_size_at_seal")
+    if (
+        not isinstance(bound_size, int)
+        or not isinstance(sealed_size, int)
+        or sealed_size <= bound_size
+        or raw_stat.st_size < sealed_size
+    ):
+        raise ProbeError(
+            f"capture extent is not bound across the carrier acquisition: {resolved_raw}"
+        )
     if binding.get("pilot_start_frame") != CAPTURE_ORIGIN_PILOT_START_FRAME or binding.get(
         "pilot_frames"
     ) != CAPTURE_ORIGIN_PILOT_FRAMES:
@@ -766,6 +908,8 @@ def _authenticated_capture_origin(
         "capture_origin_manifest_sha256": _sha256_file(manifest_path),
         "capture_origin_link_evidence": str(resolved_link),
         "capture_origin_link_sha256": link_sha256,
+        "capture_origin_post_link_evidence": str(resolved_post_link),
+        "capture_origin_post_link_sha256": post_link_sha256,
         "capture_origin_pilot_sha256": pilot_sha256,
         "capture_origin_raw_device": raw_stat.st_dev,
         "capture_origin_raw_inode": raw_stat.st_ino,
@@ -1002,45 +1146,57 @@ def _verify_evidence_snapshot(
 
 def _prepare_ratio_outputs(
     metrics_paths: list[Path], json_path: Path, human_path: Path
-) -> tuple[Path, Path, tuple[object, object], dict[Path, tuple[int, int, int, str]]]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    dict[Path, tuple[int, int, int, str]],
+]:
     evidence_paths: list[Path] = []
+    evidence_directory: Path | None = None
     for metrics_path in metrics_paths:
-        evidence_paths.append(metrics_path)
-        record = _load_json(metrics_path.resolve(strict=True))
+        if metrics_path.is_symlink():
+            raise ProbeError(f"metrics evidence may not be a symlink: {metrics_path}")
+        resolved_metrics = metrics_path.resolve(strict=True)
+        if evidence_directory is None:
+            evidence_directory = resolved_metrics.parent
+        elif resolved_metrics.parent != evidence_directory:
+            raise ProbeError("all ratio metrics must share one evidence directory")
+        evidence_paths.append(resolved_metrics)
+        record = _load_json(resolved_metrics)
         for key in (
             "capture",
             "capture_origin_manifest",
             "capture_origin_link_evidence",
+            "capture_origin_post_link_evidence",
         ):
             value = record.get(key)
             if isinstance(value, str) and Path(value).is_absolute():
                 evidence_paths.append(Path(value))
 
+    if evidence_directory is None:
+        raise ProbeError("ratio publication has no metrics evidence directory")
     json_output = _output_candidate(json_path)
     human_output = _output_candidate(human_path)
+    commit_output = _output_candidate(evidence_directory / RATIO_COMMIT_NAME)
+    expected_json = evidence_directory / RATIO_JSON_NAME
+    expected_human = evidence_directory / RATIO_HUMAN_NAME
+    if json_output != expected_json or human_output != expected_human:
+        raise ProbeError(
+            "ratio outputs must use the evidence directory's fixed publication paths: "
+            f"{expected_json}, {expected_human}"
+        )
     unique_evidence = list(dict.fromkeys(evidence_paths))
     evidence_snapshot = _evidence_snapshot(unique_evidence)
-    evidence_inodes = {
-        (state[0], state[1]) for state in evidence_snapshot.values()
-    }
-    output_states = (_path_state(json_output), _path_state(human_output))
-    if json_output == human_output:
-        raise ProbeError("ratio JSON and human outputs resolve to the same path")
-    output_inodes: list[tuple[int, int] | None] = []
-    for output, output_state in zip(
-        (json_output, human_output), output_states
-    ):
+    for output in (json_output, human_output, commit_output):
+        output_state = _path_state(output)
+        if output_state is not None:
+            raise ProbeError(
+                f"ratio publication is publish-once; remove the incomplete or prior artifact: {output}"
+            )
         if output in evidence_snapshot:
             raise ProbeError(f"ratio output directly aliases evidence: {output}")
-        output_inode = (
-            (output_state[1], output_state[2]) if output_state is not None else None
-        )
-        if output_inode in evidence_inodes:
-            raise ProbeError(f"ratio output hardlinks evidence: {output}")
-        output_inodes.append(output_inode)
-    if output_inodes[0] is not None and output_inodes[0] == output_inodes[1]:
-        raise ProbeError("ratio JSON and human outputs are hardlinks of each other")
-    return json_output, human_output, output_states, evidence_snapshot
+    return json_output, human_output, commit_output, evidence_snapshot
 
 
 def _stage_output(path: Path, data: bytes) -> Path:
@@ -1061,31 +1217,109 @@ def _stage_output(path: Path, data: bytes) -> Path:
     return temporary
 
 
+def _publish_staged_no_clobber(temporary: Path, destination: Path) -> None:
+    try:
+        os.link(temporary, destination, follow_symlinks=False)
+    except FileExistsError as error:
+        raise ProbeError(f"ratio publication path appeared concurrently: {destination}") from error
+    except OSError as error:
+        raise ProbeError(f"could not publish ratio artifact {destination}: {error}") from error
+    temporary.unlink()
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ratio_evidence_records(
+    snapshot: dict[Path, tuple[int, int, int, str]]
+) -> list[dict[str, object]]:
+    return [
+        {
+            "path": str(path),
+            "device": state[0],
+            "inode": state[1],
+            "size": state[2],
+            "sha256": state[3],
+        }
+        for path, state in sorted(snapshot.items(), key=lambda item: str(item[0]))
+    ]
+
+
 def _write_ratio_outputs(
     json_output: Path,
     human_output: Path,
-    output_states: tuple[object, object],
+    commit_output: Path,
     evidence_snapshot: dict[Path, tuple[int, int, int, str]],
     result: dict[str, object],
     human_text: str,
 ) -> None:
+    # POSIX cannot atomically expose two independent leaf names.  The leaves are
+    # therefore immutable, publish-once artifacts; only the final no-clobber
+    # commit record makes their matching hashes a valid publication.
+    evidence_records = _ratio_evidence_records(evidence_snapshot)
+    publication_id = _json_sha256(
+        {"result": result, "evidence": evidence_records}
+    )
+    result.update(
+        {
+            "publication_schema": RATIO_PUBLICATION_SCHEMA,
+            "publication_id": publication_id,
+            "publication_commit": str(commit_output),
+        }
+    )
     json_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    human_bytes = (human_text.rstrip() + "\n").encode("utf-8")
+    human_bytes = (
+        f"publication_schema: {RATIO_PUBLICATION_SCHEMA}\n"
+        f"publication_id: {publication_id}\n"
+        f"{human_text.rstrip()}\n"
+    ).encode("utf-8")
+    leaf_records = {
+        RATIO_JSON_NAME: hashlib.sha256(json_bytes).hexdigest(),
+        RATIO_HUMAN_NAME: hashlib.sha256(human_bytes).hexdigest(),
+    }
+    commit = {
+        "schema": RATIO_PUBLICATION_SCHEMA,
+        "publication_id": publication_id,
+        "leaves": leaf_records,
+        "evidence": evidence_records,
+        "evidence_snapshot_sha256": _json_sha256(evidence_records),
+    }
+    commit_bytes = (json.dumps(commit, indent=2, sort_keys=True) + "\n").encode("utf-8")
     json_temporary = _stage_output(json_output, json_bytes)
     human_temporary = _stage_output(human_output, human_bytes)
+    commit_temporary: Path | None = None
     try:
         _verify_evidence_snapshot(evidence_snapshot)
-        if (
-            _path_state(json_output),
-            _path_state(human_output),
-        ) != output_states:
-            raise ProbeError("ratio output path changed after alias preflight")
-        os.replace(json_temporary, json_output)
-        os.replace(human_temporary, human_output)
+        _publish_staged_no_clobber(json_temporary, json_output)
+        _publish_staged_no_clobber(human_temporary, human_output)
         _verify_evidence_snapshot(evidence_snapshot)
+        if (
+            _sha256_file(json_output) != leaf_records[RATIO_JSON_NAME]
+            or _sha256_file(human_output) != leaf_records[RATIO_HUMAN_NAME]
+        ):
+            raise ProbeError("published ratio leaf changed before commit")
+        commit_temporary = _stage_output(commit_output, commit_bytes)
+        _publish_staged_no_clobber(commit_temporary, commit_output)
+        _fsync_directory(json_output.parent)
+        _verify_evidence_snapshot(evidence_snapshot)
+        if _load_json(commit_output) != commit:
+            raise ProbeError("ratio publication commit did not persist exactly")
+        if (
+            _sha256_file(json_output) != leaf_records[RATIO_JSON_NAME]
+            or _sha256_file(human_output) != leaf_records[RATIO_HUMAN_NAME]
+        ):
+            raise ProbeError("published ratio leaves changed after commit")
     finally:
         json_temporary.unlink(missing_ok=True)
         human_temporary.unlink(missing_ok=True)
+        if commit_temporary is not None:
+            commit_temporary.unlink(missing_ok=True)
 
 
 def ratio_command(
@@ -1104,7 +1338,7 @@ def ratio_command(
     (
         json_output,
         human_output,
-        output_states,
+        commit_output,
         evidence_snapshot,
     ) = _prepare_ratio_outputs(metrics_paths, json_path, human_path)
     destinations: dict[str, dict[str, object]] = {}
@@ -1181,7 +1415,7 @@ def ratio_command(
     _write_ratio_outputs(
         json_output,
         human_output,
-        output_states,
+        commit_output,
         evidence_snapshot,
         result,
         "\n".join(human_lines),
@@ -1600,9 +1834,13 @@ def verify_links_command(
         )
         raise ProbeError(f"capture links did not target the intended distinct monitor ports: {details}")
 
-    volume_percent = _capture_origin_volume(json_path)
-    if volume_percent is not None:
-        manifest_path = _establish_capture_origins(
+    origin_phase = _capture_origin_phase(json_path)
+    if origin_phase is not None:
+        volume_percent, phase = origin_phase
+        origin_action = (
+            _establish_capture_origins if phase == "pre" else _seal_capture_origins
+        )
+        manifest_path = origin_action(
             json_path.parent.resolve(strict=True),
             volume_percent,
             links_path,
@@ -1615,6 +1853,7 @@ def verify_links_command(
         result.update(
             {
                 "capture_origin_schema": CAPTURE_ORIGIN_SCHEMA,
+                "capture_origin_phase": phase,
                 "capture_origin_manifest": str(manifest_path),
                 "capture_origin_manifest_sha256": _sha256_file(manifest_path),
             }
@@ -1774,10 +2013,12 @@ def _write_f32_capture(
     active_start: int = ACTIVE_START,
     active_end: int = ACTIVE_END,
     frequency_hz: float = 997.0,
+    first_frame: int = 0,
+    append: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as output:
-        for frame in range(frames):
+    with path.open("ab" if append else "wb") as output:
+        for frame in range(first_frame, frames):
             if active_start <= frame < active_end:
                 sample = amplitude * math.sin(
                     2.0 * math.pi * frequency_hz * (frame - active_start) / SAMPLE_RATE
@@ -1787,8 +2028,11 @@ def _write_f32_capture(
             output.write(struct.pack("<ff", sample, sample))
 
 
-def _self_test_establish_capture_origins(root: Path, volume_percent: int) -> None:
-    links = root / f"pw-link-{volume_percent}-lI.txt"
+def _self_test_establish_capture_origins(
+    root: Path, volume_percent: int, *, post: bool = False
+) -> None:
+    phase_suffix = "-post" if post else ""
+    links = root / f"pw-link-{volume_percent}{phase_suffix}-lI.txt"
     _write_text(
         links,
         "\n".join(
@@ -1810,8 +2054,8 @@ def _self_test_establish_capture_origins(root: Path, volume_percent: int) -> Non
         "monitor",
         f"capture-target-{volume_percent}",
         f"capture-monitor-{volume_percent}",
-        root / f"links-{volume_percent}.json",
-        root / f"links-{volume_percent}.txt",
+        root / f"links-{volume_percent}{phase_suffix}.json",
+        root / f"links-{volume_percent}{phase_suffix}.txt",
     )
 
 
@@ -1829,12 +2073,18 @@ def self_test() -> None:
         target_10 = root / "target-10.raw"
         monitor_100 = root / "monitor-100.raw"
         monitor_10 = root / "monitor-10.raw"
-        _write_f32_capture(target_100, 0.25)
-        _write_f32_capture(target_10, 0.025)
-        _write_f32_capture(monitor_100, 0.25)
-        _write_f32_capture(monitor_10, 0.025)
+        _write_f32_capture(target_100, 0.25, frames=768)
+        _write_f32_capture(target_10, 0.025, frames=768)
+        _write_f32_capture(monitor_100, 0.25, frames=768)
+        _write_f32_capture(monitor_10, 0.025, frames=768)
         _self_test_establish_capture_origins(root, 100)
         _self_test_establish_capture_origins(root, 10)
+        _write_f32_capture(target_100, 0.25, first_frame=768, append=True)
+        _write_f32_capture(target_10, 0.025, first_frame=768, append=True)
+        _write_f32_capture(monitor_100, 0.25, first_frame=768, append=True)
+        _write_f32_capture(monitor_10, 0.025, first_frame=768, append=True)
+        _self_test_establish_capture_origins(root, 100, post=True)
+        _self_test_establish_capture_origins(root, 10, post=True)
         for raw, volume in ((target_100, 100), (target_10, 10), (monitor_100, 100), (monitor_10, 10)):
             result = analyze_capture(raw, volume)
             if not result["valid"]:
@@ -1952,8 +2202,8 @@ def self_test() -> None:
         if analyze_capture(frequency_outside_tolerance, 100)["valid"]:
             raise ProbeError("fixture frequency outside tolerance unexpectedly passed")
 
-        ratio = root / "ratio.json"
-        ratio_human = root / "ratio.txt"
+        ratio = root / RATIO_JSON_NAME
+        ratio_human = root / RATIO_HUMAN_NAME
         ratio_command(
             _metric_file(root, target_100, 100),
             _metric_file(root, target_10, 10),

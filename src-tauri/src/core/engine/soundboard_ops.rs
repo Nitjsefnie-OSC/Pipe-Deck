@@ -896,6 +896,15 @@ mod live_tests {
                     probe_failure(format!("play_soundboard_clip at {volume}%: {error}"))
                 })?;
             wait_for_two_playback_exits(wrapper_log, volume)?;
+            verify_capture_links(
+                helper,
+                run_dir,
+                target_name,
+                monitor_name,
+                &target_capture_name,
+                &monitor_capture_name,
+                &format!("{suffix}-post"),
+            )?;
             Ok(())
         })();
         let capture_result = finish_capture_pair(&mut captures);

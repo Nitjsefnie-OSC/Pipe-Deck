@@ -33,17 +33,32 @@ def write_capture(
     right_amplitude: float | None = None,
     dc_offset: float = 0.0,
     second_harmonic_amplitude: float = 0.0,
+    right_dc_offset: float | None = None,
+    right_second_harmonic_amplitude: float | None = None,
+    first_frame: int = 0,
+    append: bool = False,
 ) -> None:
     """Write independent stereo-f32 test evidence without probe helpers."""
     if right_amplitude is None:
         right_amplitude = left_amplitude
-    with path.open("wb") as output:
-        for frame in range(frames):
+    if right_dc_offset is None:
+        right_dc_offset = dc_offset
+    if right_second_harmonic_amplitude is None:
+        right_second_harmonic_amplitude = second_harmonic_amplitude
+    with path.open("ab" if append else "wb") as output:
+        for frame in range(first_frame, frames):
             if active_start <= frame < active_end:
                 phase = 2.0 * math.pi * frequency_hz * (frame - active_start) / 48_000
-                harmonic = second_harmonic_amplitude * math.sin(2.0 * phase)
-                left = dc_offset + left_amplitude * math.sin(phase) + harmonic
-                right = dc_offset + right_amplitude * math.sin(phase) + harmonic
+                left = (
+                    dc_offset
+                    + left_amplitude * math.sin(phase)
+                    + second_harmonic_amplitude * math.sin(2.0 * phase)
+                )
+                right = (
+                    right_dc_offset
+                    + right_amplitude * math.sin(phase)
+                    + right_second_harmonic_amplitude * math.sin(2.0 * phase)
+                )
             else:
                 left = right = 0.0
             output.write(struct.pack("<ff", left, right))
@@ -59,18 +74,27 @@ def write_frame(path: Path, frame: int, left: float, right: float) -> None:
         output.write(struct.pack("<ff", left, right))
 
 
-def establish_capture_origins(root: Path, volume: int) -> None:
-    links = root / f"pw-link-{volume}-lI.txt"
+def establish_capture_origins(
+    root: Path,
+    volume: int,
+    *,
+    post: bool = False,
+    capture_name_suffix: str | None = None,
+) -> None:
+    suffix = str(volume) if capture_name_suffix is None else capture_name_suffix
+    target_capture = f"capture-target-{suffix}"
+    monitor_capture = f"capture-monitor-{suffix}"
+    links = root / f"pw-link-{volume}{'-post' if post else ''}-lI.txt"
     links.write_text(
         "\n".join(
             [
-                f"capture-target-{volume}:input_FL",
+                f"{target_capture}:input_FL",
                 "  |<- target:monitor_FL",
-                f"capture-target-{volume}:input_FR",
+                f"{target_capture}:input_FR",
                 "  |<- target:monitor_FR",
-                f"capture-monitor-{volume}:input_FL",
+                f"{monitor_capture}:input_FL",
                 "  |<- monitor:monitor_FL",
-                f"capture-monitor-{volume}:input_FR",
+                f"{monitor_capture}:input_FR",
                 "  |<- monitor:monitor_FR",
             ]
         )
@@ -81,11 +105,51 @@ def establish_capture_origins(root: Path, volume: int) -> None:
         links,
         "target",
         "monitor",
-        f"capture-target-{volume}",
-        f"capture-monitor-{volume}",
-        root / f"links-{volume}.json",
-        root / f"links-{volume}.txt",
+        target_capture,
+        monitor_capture,
+        root / f"links-{volume}{'-post' if post else ''}.json",
+        root / f"links-{volume}{'-post' if post else ''}.txt",
     )
+
+
+def acquire_capture_pair(
+    root: Path,
+    volume: int,
+    *,
+    amplitude: float = 0.25,
+    capture_name_suffix: str | None = None,
+    seal: bool = True,
+) -> None:
+    for destination in ("target", "monitor"):
+        write_capture(
+            root / f"{destination}-{volume}.raw",
+            frames=768,
+            active_start=12_000,
+            active_end=84_000,
+            left_amplitude=amplitude,
+        )
+    establish_capture_origins(
+        root,
+        volume,
+        capture_name_suffix=capture_name_suffix,
+    )
+    for destination in ("target", "monitor"):
+        write_capture(
+            root / f"{destination}-{volume}.raw",
+            frames=96_000,
+            active_start=12_000,
+            active_end=84_000,
+            left_amplitude=amplitude,
+            first_frame=768,
+            append=True,
+        )
+    if seal:
+        establish_capture_origins(
+            root,
+            volume,
+            post=True,
+            capture_name_suffix=capture_name_suffix,
+        )
 
 
 class ProbeAuthenticationTests(unittest.TestCase):
@@ -286,6 +350,27 @@ class ProbeAuthenticationTests(unittest.TestCase):
                     result = probe.analyze_capture(raw, 100)
                     self.assertEqual(result["valid"], expected_valid, result)
 
+    def test_capture_purity_authenticates_each_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, extras in (
+                ("right-dc", {"right_dc_offset": 0.20}),
+                (
+                    "right-second-harmonic",
+                    {"right_second_harmonic_amplitude": 0.10},
+                ),
+            ):
+                with self.subTest(contamination=name):
+                    raw = root / f"capture-{name}.raw"
+                    write_capture(
+                        raw,
+                        frames=96_000,
+                        active_start=12_000,
+                        active_end=84_000,
+                        **extras,
+                    )
+                    self.assertFalse(probe.analyze_capture(raw, 100)["valid"])
+
     def test_marker_rejects_dc_and_second_harmonic_contamination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -368,6 +453,43 @@ class ProbeAuthenticationTests(unittest.TestCase):
                         with self.assertRaises(probe.ProbeError):
                             action()
 
+    def test_marker_purity_authenticates_each_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silence = root / "silence.raw"
+            write_capture(
+                silence,
+                frames=12_000,
+                active_start=0,
+                active_end=0,
+                left_amplitude=0.0,
+            )
+            for name, extras in (
+                ("right-dc", {"right_dc_offset": 0.20}),
+                (
+                    "right-second-harmonic",
+                    {"right_second_harmonic_amplitude": 0.10},
+                ),
+            ):
+                with self.subTest(contamination=name):
+                    marker = root / f"marker-{name}.raw"
+                    write_capture(
+                        marker,
+                        frames=12_000,
+                        active_start=600,
+                        active_end=11_400,
+                        frequency_hz=733.0,
+                        **extras,
+                    )
+                    with self.assertRaises(probe.ProbeError):
+                        probe.marker_command(
+                            marker,
+                            silence,
+                            root / f"marker-{name}.json",
+                            root / f"marker-{name}.txt",
+                            "target",
+                        )
+
 
 class RatioEvidenceTests(unittest.TestCase):
     def _metric_paths(
@@ -378,16 +500,7 @@ class RatioEvidenceTests(unittest.TestCase):
     ) -> dict[tuple[str, int], Path]:
         paths: dict[tuple[str, int], Path] = {}
         for volume, amplitude in ((100, 0.25), (10, 0.025)):
-            for destination in ("target", "monitor"):
-                raw = root / f"{destination}-{volume}.raw"
-                write_capture(
-                    raw,
-                    frames=96_000,
-                    active_start=12_000,
-                    active_end=84_000,
-                    left_amplitude=amplitude,
-                )
-            establish_capture_origins(root, volume)
+            acquire_capture_pair(root, volume, amplitude=amplitude)
             if swap_destinations_before_metrics:
                 target = root / f"target-{volume}.raw"
                 monitor = root / f"monitor-{volume}.raw"
@@ -420,9 +533,59 @@ class RatioEvidenceTests(unittest.TestCase):
             paths[("target", 10)],
             paths[("monitor", 100)],
             paths[("monitor", 10)],
-            json_path or root / "ratios.json",
-            human_path or root / "ratios.txt",
+            json_path or root / "volume-ratios.json",
+            human_path or root / "volume-ratios.txt",
         )
+
+    def test_metrics_requires_post_carrier_link_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            acquire_capture_pair(root, 100, seal=False)
+
+            with self.assertRaises(probe.ProbeError):
+                probe.metrics_command(
+                    root / "target-100.raw",
+                    root / "target-100-metrics.json",
+                    root / "target-100-metrics.txt",
+                    100,
+                )
+
+    def test_post_carrier_relink_cannot_seal_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            acquire_capture_pair(root, 100, seal=False)
+            relinked = root / "pw-link-100-post-lI.txt"
+            relinked.write_text(
+                "\n".join(
+                    [
+                        "capture-target-100:input_FL",
+                        "  |<- monitor:monitor_FL",
+                        "capture-target-100:input_FR",
+                        "  |<- monitor:monitor_FR",
+                        "capture-monitor-100:input_FL",
+                        "  |<- target:monitor_FL",
+                        "capture-monitor-100:input_FR",
+                        "  |<- target:monitor_FR",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(probe.ProbeError):
+                probe.verify_links_command(
+                    relinked,
+                    "target",
+                    "monitor",
+                    "capture-target-100",
+                    "capture-monitor-100",
+                    root / "links-100-post.json",
+                    root / "links-100-post.txt",
+                )
+            manifest = json.loads(
+                (root / "capture-origin-100.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNot(manifest.get("sealed"), True)
 
     def test_metrics_requires_capture_time_origin_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -494,27 +657,125 @@ class RatioEvidenceTests(unittest.TestCase):
 
             after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in evidence}
             self.assertEqual(after, before)
-            ratio = json.loads((root / "ratios.json").read_text(encoding="utf-8"))
+            ratio = json.loads((root / "volume-ratios.json").read_text(encoding="utf-8"))
             self.assertEqual(ratio["overall_classification"], "conforming-scaled")
-            self.assertIn("overall_classification: conforming-scaled", (root / "ratios.txt").read_text(encoding="utf-8"))
+            self.assertIn("overall_classification: conforming-scaled", (root / "volume-ratios.txt").read_text(encoding="utf-8"))
+            self.assertTrue((root / "volume-ratios.commit.json").is_file())
+            commit = json.loads(
+                (root / "volume-ratios.commit.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(commit["publication_id"], ratio["publication_id"])
+
+    def test_ratio_rejects_outputs_in_another_evidence_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source_root = parent / "source"
+            victim_root = parent / "victim"
+            source_root.mkdir()
+            victim_root.mkdir()
+            source_paths = self._metric_paths(source_root)
+            self._metric_paths(victim_root)
+            victim_raw = victim_root / "target-100.raw"
+            before = hashlib.sha256(victim_raw.read_bytes()).hexdigest()
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(
+                    source_root,
+                    source_paths,
+                    json_path=victim_raw,
+                    human_path=source_root / "volume-ratios.txt",
+                )
+            self.assertEqual(hashlib.sha256(victim_raw.read_bytes()).hexdigest(), before)
+
+    def test_ratio_rejects_fresh_outputs_outside_evidence_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source_root = parent / "source"
+            foreign_root = parent / "foreign"
+            source_root.mkdir()
+            foreign_root.mkdir()
+            paths = self._metric_paths(source_root)
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(
+                    source_root,
+                    paths,
+                    json_path=foreign_root / "volume-ratios.json",
+                    human_path=foreign_root / "volume-ratios.txt",
+                )
+            self.assertFalse((foreign_root / "volume-ratios.json").exists())
+            self.assertFalse((foreign_root / "volume-ratios.txt").exists())
+            self.assertFalse((foreign_root / "volume-ratios.commit.json").exists())
+
+    def test_ratio_failed_second_leaf_publish_has_no_mixed_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            json_path = root / "volume-ratios.json"
+            human_path = root / "volume-ratios.txt"
+            json_path.write_text("old-json\n", encoding="utf-8")
+            human_path.write_text("old-human\n", encoding="utf-8")
+            original_replace = os.replace
+
+            def fail_second_leaf(source: object, destination: object) -> None:
+                if Path(destination) == human_path:
+                    raise OSError("injected second-leaf failure")
+                original_replace(source, destination)
+
+            with mock.patch.object(
+                probe.os, "replace", side_effect=fail_second_leaf
+            ), self.assertRaises((probe.ProbeError, OSError)):
+                self._ratio(root, paths, json_path=json_path, human_path=human_path)
+
+            self.assertEqual(json_path.read_text(encoding="utf-8"), "old-json\n")
+            self.assertEqual(human_path.read_text(encoding="utf-8"), "old-human\n")
+            self.assertFalse((root / "volume-ratios.commit.json").exists())
+
+    def test_ratio_second_leaf_failure_has_no_committed_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            original_publish = probe._publish_staged_no_clobber
+            publication_count = 0
+
+            def fail_second_leaf(source: Path, destination: Path) -> None:
+                nonlocal publication_count
+                publication_count += 1
+                if publication_count == 2:
+                    raise probe.ProbeError("injected second-leaf failure")
+                original_publish(source, destination)
+
+            with mock.patch.object(
+                probe,
+                "_publish_staged_no_clobber",
+                side_effect=fail_second_leaf,
+            ), self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths)
+
+            self.assertTrue((root / "volume-ratios.json").is_file())
+            self.assertFalse((root / "volume-ratios.txt").exists())
+            self.assertFalse((root / "volume-ratios.commit.json").exists())
 
     def test_ratio_rehashes_evidence_after_both_outputs_exist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = self._metric_paths(root)
             raw = root / "target-100.raw"
-            original_replace = os.replace
+            original_publish = probe._publish_staged_no_clobber
 
-            def replace_and_mutate(source: object, destination: object) -> None:
-                original_replace(source, destination)
-                if Path(destination).name == "ratios.txt":
+            def publish_and_mutate(source: Path, destination: Path) -> None:
+                original_publish(source, destination)
+                if Path(destination).name == "volume-ratios.txt":
                     with raw.open("ab") as output:
                         output.write(struct.pack("<ff", 0.0, 0.0))
 
             with mock.patch.object(
-                probe.os, "replace", side_effect=replace_and_mutate
+                probe,
+                "_publish_staged_no_clobber",
+                side_effect=publish_and_mutate,
             ), self.assertRaises(probe.ProbeError):
                 self._ratio(root, paths)
+            self.assertFalse((root / "volume-ratios.commit.json").exists())
 
     def test_ratio_rejects_output_path_replacement_after_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -528,7 +789,7 @@ class RatioEvidenceTests(unittest.TestCase):
                 temporary = original_stage(path, data)
                 staged += 1
                 if staged == 2:
-                    (root / "ratios.txt").write_text("raced\n", encoding="utf-8")
+                    (root / "volume-ratios.txt").write_text("raced\n", encoding="utf-8")
                 return temporary
 
             with mock.patch.object(
@@ -541,8 +802,8 @@ class RatioEvidenceTests(unittest.TestCase):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 paths = self._metric_paths(root)
-                json_path = root / "ratios.json"
-                human_path = root / "ratios.txt"
+                json_path = root / "volume-ratios.json"
+                human_path = root / "volume-ratios.txt"
                 if scenario == "metrics":
                     json_path = paths[("target", 100)]
                 elif scenario == "raw":
@@ -578,7 +839,7 @@ class RatioEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = self._metric_paths(root)
-            human_alias = root / "ratios.txt"
+            human_alias = root / "volume-ratios.txt"
             human_alias.symlink_to(root / "target-100.raw")
 
             with self.assertRaises(probe.ProbeError):
@@ -588,7 +849,7 @@ class RatioEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = self._metric_paths(root)
-            human_alias = root / "ratios.txt"
+            human_alias = root / "volume-ratios.txt"
             os.link(root / "target-100.raw", human_alias)
 
             with self.assertRaises(probe.ProbeError):
@@ -688,6 +949,70 @@ class RatioEvidenceTests(unittest.TestCase):
 
                 with self.assertRaises(probe.ProbeError):
                     self._ratio(root, paths)
+
+    def test_metrics_rejects_changed_pre_or_post_link_evidence(self) -> None:
+        for phase in ("pre", "post"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = self._metric_paths(root)
+                link_path = root / (
+                    "pw-link-100-lI.txt"
+                    if phase == "pre"
+                    else "pw-link-100-post-lI.txt"
+                )
+                with link_path.open("ab") as output:
+                    output.write(b"\n")
+
+                with self.assertRaises(probe.ProbeError):
+                    probe.metrics_command(
+                        root / "target-100.raw",
+                        root / "target-100-metrics.json",
+                        root / "target-100-metrics.txt",
+                        100,
+                    )
+
+    def test_capture_origin_pilot_authenticates_volume_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for volume in (100, 10):
+                acquire_capture_pair(
+                    root, volume, capture_name_suffix="shared"
+                )
+
+            target_100 = root / "target-100.raw"
+            target_100.write_bytes((root / "target-10.raw").read_bytes())
+            with self.assertRaises(probe.ProbeError):
+                probe.metrics_command(
+                    target_100,
+                    root / "target-100-metrics.json",
+                    root / "target-100-metrics.txt",
+                    100,
+                )
+
+    def test_capture_origin_rejects_renamed_foreign_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for generation in ("first", "second"):
+                acquire_capture_pair(root, 100, capture_name_suffix="shared")
+                if generation == "first":
+                    for destination in ("target", "monitor"):
+                        os.replace(
+                            root / f"{destination}-100.raw",
+                            root / f"saved-{destination}-100.raw",
+                        )
+
+            for destination in ("target", "monitor"):
+                os.replace(
+                    root / f"saved-{destination}-100.raw",
+                    root / f"{destination}-100.raw",
+                )
+            with self.assertRaises(probe.ProbeError):
+                probe.metrics_command(
+                    root / "target-100.raw",
+                    root / "target-100-metrics.json",
+                    root / "target-100-metrics.txt",
+                    100,
+                )
 
     def test_ratio_rejects_metrics_bound_to_the_wrong_leg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
