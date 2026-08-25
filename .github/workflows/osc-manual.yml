@@ -69,12 +69,12 @@ jobs:
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+          save-if: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
 
       - name: Install frontend dependencies
         run: npm ci
@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); process.stdout.write(package_json.scripts && typeof package_json.scripts["format:check"] === "string" ? "present" : "missing");')"
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "format:check"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].length > 0 ? "present" : "invalid");')"
           case "$script_state" in
             present)
               npm run format:check
@@ -92,6 +92,12 @@ jobs:
               message='SKIPPED npm run format:check: package.json on this target ref has no scripts.format:check; the upstream formatter gate is unavailable on this legacy fork ref.'
               echo "::warning::$message"
               printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            invalid)
+              message='FAILED npm run format:check: package.json on this target ref has a present scripts.format:check value that is not a non-empty string.'
+              echo "::error::$message"
+              printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
               ;;
             *)
               echo "::error::Unexpected format script probe result: $script_state"
@@ -103,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); process.stdout.write(package_json.scripts && typeof package_json.scripts.lint === "string" ? "present" : "missing");')"
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "lint"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].length > 0 ? "present" : "invalid");')"
           case "$script_state" in
             present)
               npm run lint
@@ -112,6 +118,12 @@ jobs:
               message='SKIPPED npm run lint: package.json on this target ref has no scripts.lint; the upstream ESLint gate is unavailable on this legacy fork ref.'
               echo "::warning::$message"
               printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            invalid)
+              message='FAILED npm run lint: package.json on this target ref has a present scripts.lint value that is not a non-empty string.'
+              echo "::error::$message"
+              printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
               ;;
             *)
               echo "::error::Unexpected lint script probe result: $script_state"
