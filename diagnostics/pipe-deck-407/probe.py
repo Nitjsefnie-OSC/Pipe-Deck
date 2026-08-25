@@ -12,9 +12,12 @@ from collections.abc import Callable
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 import struct
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -45,6 +48,22 @@ MARKER_FREQUENCY_SCORE_MIN = 0.50
 MARKER_MINIMUM_PEAK = 0.05
 MARKER_MINIMUM_RMS = MARKER_MINIMUM_PEAK / math.sqrt(2.0)
 METRICS_EVIDENCE_SCHEMA = "pipe-deck-407-authenticated-capture-v1"
+CAPTURE_ORIGIN_SCHEMA = "pipe-deck-407-capture-origin-v1"
+# The pilot occupies generated leading silence and is half the existing
+# outside-silence ceiling, so it does not enter the trimmed carrier window.
+CAPTURE_ORIGIN_PILOT_START_FRAME = 512
+CAPTURE_ORIGIN_PILOT_FRAMES = 256
+CAPTURE_ORIGIN_PILOT_AMPLITUDE = OUTSIDE_THRESHOLD / 2.0
+CAPTURE_ORIGIN_WAIT_SECONDS = 2.0
+MAX_CHANNEL_DC_OFFSET = OUTSIDE_THRESHOLD
+# A contaminant at 20% of the carrier has this energy share.  The extra 1e-5
+# is over 1,000 times the clean generated fixture's measured residual ratio.
+RESIDUAL_AMPLITUDE_MARGIN = 0.20
+RESIDUAL_NUMERICAL_ENERGY_MARGIN = 1e-5
+MAX_RESIDUAL_ENERGY_RATIO = (
+    RESIDUAL_AMPLITUDE_MARGIN**2 / (1.0 + RESIDUAL_AMPLITUDE_MARGIN**2)
+    + RESIDUAL_NUMERICAL_ENERGY_MARGIN
+)
 
 
 class ProbeError(RuntimeError):
@@ -64,13 +83,34 @@ def _expect_probe_error(action: Callable[[], object], description: str) -> None:
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_bytes(
+        path,
+        (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
 
 
 def _write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, (text.rstrip() + "\n").encode("utf-8"))
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+    parent = path.parent.resolve(strict=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, parent / path.name)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _pcm16_sample(frame: int, frequency_hz: float, amplitude: float, active_start: int, active_end: int) -> int:
@@ -199,6 +239,75 @@ def _channel_energy_metrics(
     return rms_values, peaks
 
 
+def _channel_tone_purity(
+    frames: list[tuple[float, float]],
+    start: int,
+    end: int,
+    frequency_hz: float,
+    channel: int,
+) -> tuple[float, float]:
+    samples = [frame[channel] for frame in frames[start:end]]
+    if not samples:
+        return 0.0, 1.0
+    mean = sum(samples) / len(samples)
+    centered = [sample - mean for sample in samples]
+    sample_energy = sum(sample * sample for sample in centered)
+    if sample_energy <= 0.0:
+        return mean, 1.0
+
+    sine_energy = 0.0
+    cosine_energy = 0.0
+    cross_energy = 0.0
+    sample_sine = 0.0
+    sample_cosine = 0.0
+    basis: list[tuple[float, float]] = []
+    for index, sample in enumerate(centered):
+        phase = 2.0 * math.pi * frequency_hz * index / SAMPLE_RATE
+        sine = math.sin(phase)
+        cosine = math.cos(phase)
+        basis.append((sine, cosine))
+        sine_energy += sine * sine
+        cosine_energy += cosine * cosine
+        cross_energy += sine * cosine
+        sample_sine += sample * sine
+        sample_cosine += sample * cosine
+    determinant = sine_energy * cosine_energy - cross_energy**2
+    if determinant <= 0.0:
+        return mean, 1.0
+    sine_coefficient = (
+        sample_sine * cosine_energy - sample_cosine * cross_energy
+    ) / determinant
+    cosine_coefficient = (
+        sample_cosine * sine_energy - sample_sine * cross_energy
+    ) / determinant
+    residual_energy = sum(
+        (
+            sample
+            - sine_coefficient * sine
+            - cosine_coefficient * cosine
+        )
+        ** 2
+        for sample, (sine, cosine) in zip(centered, basis)
+    )
+    return mean, max(0.0, min(1.0, residual_energy / sample_energy))
+
+
+def _channel_purity_metrics(
+    frames: list[tuple[float, float]],
+    start: int,
+    end: int,
+    frequencies: list[float],
+) -> tuple[list[float], list[float]]:
+    metrics = [
+        _channel_tone_purity(frames, start, end, frequency, channel)
+        for channel, frequency in enumerate(frequencies)
+    ]
+    return (
+        [dc_offset for dc_offset, _residual_ratio in metrics],
+        [residual_ratio for _dc_offset, residual_ratio in metrics],
+    )
+
+
 def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     frames = _read_f32_stereo(path)
     peaks = _frame_peaks(frames)
@@ -214,12 +323,27 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         if MIN_CAPTURE_RUN_FRAMES <= end - start <= MAX_CAPTURE_RUN_FRAMES
     ]
     authenticated_runs: list[
-        tuple[int, int, list[float], list[float], list[float], list[float]]
+        tuple[
+            int,
+            int,
+            list[float],
+            list[float],
+            list[float],
+            list[float],
+            list[float],
+            list[float],
+        ]
     ] = []
     for start, end in eligible_runs:
         frequencies, scores = _capture_run_frequency_metrics(frames, start, end)
         channel_rms, channel_peaks = _channel_energy_metrics(
             frames, start + TRIM_FRAMES, end - TRIM_FRAMES
+        )
+        channel_dc_offsets, channel_residual_ratios = _channel_purity_metrics(
+            frames,
+            start + TRIM_FRAMES,
+            end - TRIM_FRAMES,
+            frequencies,
         )
         if all(
             _frequency_within_tolerance(
@@ -228,12 +352,28 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
             and score >= CAPTURE_FREQUENCY_SCORE_MIN
             and rms > minimum_rms
             and peak > minimum_peak
-            for frequency, score, rms, peak in zip(
-                frequencies, scores, channel_rms, channel_peaks
+            and abs(dc_offset) <= MAX_CHANNEL_DC_OFFSET
+            and residual_ratio <= MAX_RESIDUAL_ENERGY_RATIO
+            for frequency, score, rms, peak, dc_offset, residual_ratio in zip(
+                frequencies,
+                scores,
+                channel_rms,
+                channel_peaks,
+                channel_dc_offsets,
+                channel_residual_ratios,
             )
         ):
             authenticated_runs.append(
-                (start, end, frequencies, scores, channel_rms, channel_peaks)
+                (
+                    start,
+                    end,
+                    frequencies,
+                    scores,
+                    channel_rms,
+                    channel_peaks,
+                    channel_dc_offsets,
+                    channel_residual_ratios,
+                )
             )
 
     if len(authenticated_runs) == 1:
@@ -244,6 +384,8 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
             channel_scores,
             channel_rms,
             channel_peaks,
+            channel_dc_offsets,
+            channel_residual_ratios,
         ) = authenticated_runs[0]
     else:
         active_start, active_end_exclusive = max(
@@ -257,6 +399,12 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
             frames,
             active_start + TRIM_FRAMES,
             active_end_exclusive - TRIM_FRAMES,
+        )
+        channel_dc_offsets, channel_residual_ratios = _channel_purity_metrics(
+            frames,
+            active_start + TRIM_FRAMES,
+            active_end_exclusive - TRIM_FRAMES,
+            channel_frequencies,
         )
 
     run_frames = active_end_exclusive - active_start
@@ -302,8 +450,22 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         violations.append(
             f"trailing_silence_frames {trailing_silence_frames} < {FIXTURE_TRAILING_SILENCE_FRAMES}"
         )
-    for channel, (frequency, score, channel_rms_value, channel_peak) in enumerate(
-        zip(channel_frequencies, channel_scores, channel_rms, channel_peaks)
+    for channel, (
+        frequency,
+        score,
+        channel_rms_value,
+        channel_peak,
+        dc_offset,
+        residual_ratio,
+    ) in enumerate(
+        zip(
+            channel_frequencies,
+            channel_scores,
+            channel_rms,
+            channel_peaks,
+            channel_dc_offsets,
+            channel_residual_ratios,
+        )
     ):
         if not _frequency_within_tolerance(
             frequency, CAPTURE_FREQUENCY_HZ, CAPTURE_FREQUENCY_TOLERANCE_HZ
@@ -324,6 +486,16 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         if channel_peak <= minimum_peak:
             violations.append(
                 f"channel_{channel}_peak {channel_peak:.9f} <= {minimum_peak}"
+            )
+        if abs(dc_offset) > MAX_CHANNEL_DC_OFFSET:
+            violations.append(
+                f"channel_{channel}_dc_offset {dc_offset:.9f} exceeds absolute "
+                f"maximum {MAX_CHANNEL_DC_OFFSET:.9f}"
+            )
+        if residual_ratio > MAX_RESIDUAL_ENERGY_RATIO:
+            violations.append(
+                f"channel_{channel}_residual_energy_ratio {residual_ratio:.9f} > "
+                f"{MAX_RESIDUAL_ENERGY_RATIO:.9f}"
             )
     if active_frames < MIN_ACTIVE_FRAMES:
         violations.append(f"active_frames {active_frames} < {MIN_ACTIVE_FRAMES}")
@@ -354,6 +526,8 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "channel_frequency_identity_score": channel_scores,
         "channel_rms": channel_rms,
         "channel_peak": channel_peaks,
+        "channel_dc_offset": channel_dc_offsets,
+        "channel_residual_energy_ratio": channel_residual_ratios,
         "leading_silence_frames": leading_silence_frames,
         "trailing_silence_frames": trailing_silence_frames,
         "rms": rms,
@@ -368,6 +542,9 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "maximum_capture_run_frames": MAX_CAPTURE_RUN_FRAMES,
         "minimum_rms": minimum_rms,
         "minimum_peak": minimum_peak,
+        "maximum_channel_dc_offset": MAX_CHANNEL_DC_OFFSET,
+        "residual_amplitude_margin": RESIDUAL_AMPLITUDE_MARGIN,
+        "maximum_residual_energy_ratio": MAX_RESIDUAL_ENERGY_RATIO,
         "valid": not violations,
         "violations": violations,
     }
@@ -391,8 +568,213 @@ def _json_sha256(value: object) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _capture_origin_pilot_bytes(
+    link_sha256: str, destination: str, volume_percent: int
+) -> bytes:
+    seed = hashlib.sha256(
+        (
+            f"{CAPTURE_ORIGIN_SCHEMA}\0{link_sha256}\0"
+            f"{destination}\0{volume_percent}"
+        ).encode("utf-8")
+    ).digest()
+    pilot = bytearray()
+    for frame in range(CAPTURE_ORIGIN_PILOT_FRAMES):
+        left_bit = (seed[(2 * frame) % len(seed)] >> (frame % 8)) & 1
+        right_bit = (seed[(2 * frame + 1) % len(seed)] >> ((frame + 3) % 8)) & 1
+        left = CAPTURE_ORIGIN_PILOT_AMPLITUDE if left_bit else -CAPTURE_ORIGIN_PILOT_AMPLITUDE
+        right = CAPTURE_ORIGIN_PILOT_AMPLITUDE if right_bit else -CAPTURE_ORIGIN_PILOT_AMPLITUDE
+        pilot.extend(struct.pack("<ff", left, right))
+    return bytes(pilot)
+
+
+def _capture_origin_volume(json_path: Path) -> int | None:
+    match = re.fullmatch(r"links-(10|100)\.json", json_path.name)
+    return int(match.group(1)) if match else None
+
+
+def _capture_origin_manifest_path(directory: Path, volume_percent: int) -> Path:
+    return directory / f"capture-origin-{volume_percent}.json"
+
+
+def _wait_for_capture_extent(path: Path, required_bytes: int) -> None:
+    deadline = time.monotonic() + CAPTURE_ORIGIN_WAIT_SECONDS
+    while True:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if size >= required_bytes:
+            return
+        if time.monotonic() >= deadline:
+            raise ProbeError(
+                f"capture did not reach {required_bytes} bytes before origin pilot: {path}"
+            )
+        time.sleep(0.01)
+
+
+def _establish_capture_origins(
+    directory: Path,
+    volume_percent: int,
+    links_path: Path,
+    link_sha256: str,
+    target_sink: str,
+    monitor_sink: str,
+    target_capture: str,
+    monitor_capture: str,
+) -> Path:
+    pilot_offset = CAPTURE_ORIGIN_PILOT_START_FRAME * STEREO * 4
+    pilot_length = CAPTURE_ORIGIN_PILOT_FRAMES * STEREO * 4
+    required_bytes = pilot_offset + pilot_length
+    captures: list[dict[str, object]] = []
+    for destination, sink, capture_node in (
+        ("target", target_sink, target_capture),
+        ("monitor", monitor_sink, monitor_capture),
+    ):
+        raw_path = directory / f"{destination}-{volume_percent}.raw"
+        _wait_for_capture_extent(raw_path, required_bytes)
+        pilot = _capture_origin_pilot_bytes(
+            link_sha256, destination, volume_percent
+        )
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(raw_path, flags)
+        try:
+            raw_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(raw_stat.st_mode):
+                raise ProbeError(f"capture origin input is not a regular file: {raw_path}")
+            if raw_stat.st_size < required_bytes:
+                raise ProbeError(f"capture shrank while writing origin pilot: {raw_path}")
+            written = os.pwrite(descriptor, pilot, pilot_offset)
+            if written != len(pilot):
+                raise ProbeError(f"short write while binding capture origin: {raw_path}")
+            os.fsync(descriptor)
+            if os.pread(descriptor, len(pilot), pilot_offset) != pilot:
+                raise ProbeError(f"capture origin pilot did not persist: {raw_path}")
+            raw_stat = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        captures.append(
+            {
+                "destination": destination,
+                "volume_percent": volume_percent,
+                "sink": sink,
+                "capture_node": capture_node,
+                "raw_capture_at_binding": str(raw_path.resolve(strict=True)),
+                "raw_device": raw_stat.st_dev,
+                "raw_inode": raw_stat.st_ino,
+                "pilot_start_frame": CAPTURE_ORIGIN_PILOT_START_FRAME,
+                "pilot_frames": CAPTURE_ORIGIN_PILOT_FRAMES,
+                "pilot_sha256": hashlib.sha256(pilot).hexdigest(),
+            }
+        )
+
+    manifest_path = _capture_origin_manifest_path(directory, volume_percent)
+    manifest = {
+        "schema": CAPTURE_ORIGIN_SCHEMA,
+        "volume_percent": volume_percent,
+        "link_evidence": str(links_path.resolve(strict=True)),
+        "link_evidence_sha256": link_sha256,
+        "pilot_amplitude": CAPTURE_ORIGIN_PILOT_AMPLITUDE,
+        "captures": captures,
+    }
+    _write_json(manifest_path, manifest)
+    return manifest_path.resolve(strict=True)
+
+
+def _authenticated_capture_origin(
+    raw_path: Path, volume_percent: int
+) -> tuple[str, dict[str, object]]:
+    if raw_path.is_symlink():
+        raise ProbeError(f"capture origin input may not be a symlink: {raw_path}")
+    try:
+        resolved_raw = raw_path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ProbeError(f"capture origin input is missing: {raw_path}") from error
+    raw_stat = resolved_raw.stat()
+    if not stat.S_ISREG(raw_stat.st_mode):
+        raise ProbeError(f"capture origin input is not a regular file: {resolved_raw}")
+    manifest_candidate = _capture_origin_manifest_path(
+        resolved_raw.parent, volume_percent
+    )
+    if manifest_candidate.is_symlink():
+        raise ProbeError(f"capture origin manifest may not be a symlink: {manifest_candidate}")
+    try:
+        manifest_path = manifest_candidate.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ProbeError(
+            f"capture-time origin manifest is missing: {manifest_candidate}"
+        ) from error
+    manifest = _load_json(manifest_path)
+    if manifest.get("schema") != CAPTURE_ORIGIN_SCHEMA:
+        raise ProbeError(f"capture origin manifest has the wrong schema: {manifest_path}")
+    if manifest.get("volume_percent") != volume_percent:
+        raise ProbeError(f"capture origin manifest has the wrong volume: {manifest_path}")
+    link_value = manifest.get("link_evidence")
+    if not isinstance(link_value, str) or not Path(link_value).is_absolute():
+        raise ProbeError(f"capture origin manifest has no absolute link evidence: {manifest_path}")
+    link_path = Path(link_value)
+    if link_path.is_symlink():
+        raise ProbeError(f"capture link evidence may not be a symlink: {link_path}")
+    resolved_link = link_path.resolve(strict=True)
+    if resolved_link.parent != resolved_raw.parent:
+        raise ProbeError(f"capture link evidence left its evidence directory: {resolved_link}")
+    link_sha256 = _sha256_file(resolved_link)
+    if manifest.get("link_evidence_sha256") != link_sha256:
+        raise ProbeError(f"capture link evidence digest changed: {resolved_link}")
+    entries = manifest.get("captures")
+    if not isinstance(entries, list):
+        raise ProbeError(f"capture origin manifest has no capture bindings: {manifest_path}")
+    matching = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("raw_device") == raw_stat.st_dev
+        and entry.get("raw_inode") == raw_stat.st_ino
+    ]
+    if len(matching) != 1:
+        raise ProbeError(
+            f"raw capture inode has {len(matching)} capture-time origin bindings: {resolved_raw}"
+        )
+    binding = matching[0]
+    destination = binding.get("destination")
+    if destination not in MARKER_FREQUENCIES:
+        raise ProbeError(f"capture origin binding has an invalid destination: {destination!r}")
+    if binding.get("volume_percent") != volume_percent:
+        raise ProbeError(f"capture origin binding has the wrong volume: {resolved_raw}")
+    if binding.get("pilot_start_frame") != CAPTURE_ORIGIN_PILOT_START_FRAME or binding.get(
+        "pilot_frames"
+    ) != CAPTURE_ORIGIN_PILOT_FRAMES:
+        raise ProbeError(f"capture origin pilot contract changed: {manifest_path}")
+    expected_pilot = _capture_origin_pilot_bytes(
+        link_sha256, str(destination), volume_percent
+    )
+    pilot_offset = CAPTURE_ORIGIN_PILOT_START_FRAME * STEREO * 4
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(resolved_raw, flags)
+    try:
+        observed_pilot = os.pread(descriptor, len(expected_pilot), pilot_offset)
+    finally:
+        os.close(descriptor)
+    pilot_sha256 = hashlib.sha256(observed_pilot).hexdigest()
+    if observed_pilot != expected_pilot or binding.get("pilot_sha256") != pilot_sha256:
+        raise ProbeError(
+            f"raw capture does not contain its capture-time {destination} "
+            f"{volume_percent}% origin pilot: {resolved_raw}"
+        )
+    proof = {
+        "capture_origin_schema": CAPTURE_ORIGIN_SCHEMA,
+        "capture_origin_manifest": str(manifest_path),
+        "capture_origin_manifest_sha256": _sha256_file(manifest_path),
+        "capture_origin_link_evidence": str(resolved_link),
+        "capture_origin_link_sha256": link_sha256,
+        "capture_origin_pilot_sha256": pilot_sha256,
+        "capture_origin_raw_device": raw_stat.st_dev,
+        "capture_origin_raw_inode": raw_stat.st_ino,
+    }
+    return str(destination), proof
+
+
 def _metrics_destination(
-    raw_path: Path, json_path: Path, volume_percent: int
+    raw_path: Path, json_path: Path, volume_percent: int, origin_destination: str
 ) -> str:
     json_resolved = json_path.resolve()
     if raw_path.parent != json_resolved.parent:
@@ -406,6 +788,11 @@ def _metrics_destination(
             and json_resolved.name
             == f"{destination}-{volume_percent}-metrics.json"
         ):
+            if destination != origin_destination:
+                raise ProbeError(
+                    f"metrics leg is labelled {destination}, but captured bytes prove "
+                    f"{origin_destination} origin"
+                )
             return destination
     raise ProbeError(
         f"metrics paths do not identify target/monitor {volume_percent}% leg: "
@@ -415,7 +802,12 @@ def _metrics_destination(
 
 def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_percent: int) -> None:
     resolved_raw = raw_path.resolve(strict=True)
-    destination = _metrics_destination(resolved_raw, json_path, volume_percent)
+    origin_destination, origin_proof = _authenticated_capture_origin(
+        raw_path, volume_percent
+    )
+    destination = _metrics_destination(
+        resolved_raw, json_path, volume_percent, origin_destination
+    )
     result = analyze_capture(resolved_raw, volume_percent)
     analysis_sha256 = _json_sha256(result)
     result.update(
@@ -424,6 +816,7 @@ def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_pe
             "expected_destination": destination,
             "capture_sha256": _sha256_file(resolved_raw),
             "authenticated_analysis_sha256": analysis_sha256,
+            **origin_proof,
         }
     )
     _write_json(json_path, result)
@@ -435,6 +828,8 @@ def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_pe
                 f"expected_destination: {destination}",
                 f"capture_sha256: {result['capture_sha256']}",
                 f"authenticated_analysis_sha256: {analysis_sha256}",
+                f"capture_origin_manifest: {origin_proof['capture_origin_manifest']}",
+                f"capture_origin_pilot_sha256: {origin_proof['capture_origin_pilot_sha256']}",
                 f"volume_percent: {volume_percent}",
                 f"frames: {result['frames']}",
                 f"active_frames: {result['active_frames']}",
@@ -443,6 +838,12 @@ def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_pe
                 f"authenticated_fixture_run_count: {result['authenticated_fixture_run_count']}",
                 f"channel_frequency_hz: {result['channel_frequency_hz']}",
                 f"channel_frequency_identity_score: {result['channel_frequency_identity_score']}",
+                f"channel_rms: {result['channel_rms']}",
+                f"channel_peak: {result['channel_peak']}",
+                f"channel_dc_offset: {result['channel_dc_offset']}",
+                f"channel_residual_energy_ratio: {result['channel_residual_energy_ratio']}",
+                f"maximum_channel_dc_offset: {result['maximum_channel_dc_offset']}",
+                f"maximum_residual_energy_ratio: {result['maximum_residual_energy_ratio']}",
                 f"rms: {result['rms']:.9f}",
                 f"peak: {result['peak']:.9f}",
                 f"outside_peak: {result['outside_peak']:.9f}",
@@ -465,7 +866,9 @@ def _load_json(path: Path) -> dict[str, object]:
 
 def _authenticated_metrics_record(
     metrics_path: Path, expected_destination: str, expected_volume: int
-) -> tuple[dict[str, object], Path, str]:
+) -> tuple[dict[str, object], Path, str, dict[str, object]]:
+    if metrics_path.is_symlink():
+        raise ProbeError(f"metrics evidence may not be a symlink: {metrics_path}")
     resolved_metrics = metrics_path.resolve(strict=True)
     expected_metrics_name = (
         f"{expected_destination}-{expected_volume}-metrics.json"
@@ -503,6 +906,19 @@ def _authenticated_metrics_record(
         )
     if not raw_path.is_file():
         raise ProbeError(f"bound raw capture is missing: {raw_path}")
+    origin_destination, origin_proof = _authenticated_capture_origin(
+        raw_path, expected_volume
+    )
+    if origin_destination != expected_destination:
+        raise ProbeError(
+            f"bound raw bytes prove {origin_destination} origin, expected "
+            f"{expected_destination}: {raw_path}"
+        )
+    for key, value in origin_proof.items():
+        if record.get(key) != value:
+            raise ProbeError(
+                f"stored capture-origin field {key} is stale or altered for {raw_path}"
+            )
     capture_sha256 = _sha256_file(raw_path)
     if record.get("capture_sha256") != capture_sha256:
         raise ProbeError(f"bound raw capture digest changed: {raw_path}")
@@ -524,7 +940,152 @@ def _authenticated_metrics_record(
             raise ProbeError(
                 f"stored metric {key} is stale or altered for {raw_path}"
             )
-    return revalidated, raw_path, capture_sha256
+    return revalidated, raw_path, capture_sha256, origin_proof
+
+
+def _path_state(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (
+        path_stat.st_mode,
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+    )
+
+
+def _output_candidate(path: Path) -> Path:
+    parent = path.parent.resolve(strict=True)
+    candidate = parent / path.name
+    if candidate.is_symlink():
+        raise ProbeError(f"ratio output may not be a symlink: {candidate}")
+    state = _path_state(candidate)
+    if state is not None and not stat.S_ISREG(state[0]):
+        raise ProbeError(f"ratio output is not a regular file: {candidate}")
+    return candidate
+
+
+def _evidence_snapshot(paths: list[Path]) -> dict[Path, tuple[int, int, int, str]]:
+    snapshot: dict[Path, tuple[int, int, int, str]] = {}
+    for path in paths:
+        if path.is_symlink():
+            raise ProbeError(f"ratio evidence may not be a symlink: {path}")
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise ProbeError(f"ratio evidence is missing: {path}") from error
+        path_stat = resolved.stat()
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise ProbeError(f"ratio evidence is not a regular file: {resolved}")
+        snapshot[resolved] = (
+            path_stat.st_dev,
+            path_stat.st_ino,
+            path_stat.st_size,
+            _sha256_file(resolved),
+        )
+    return snapshot
+
+
+def _verify_evidence_snapshot(
+    snapshot: dict[Path, tuple[int, int, int, str]]
+) -> None:
+    try:
+        current = _evidence_snapshot(list(snapshot))
+    except (FileNotFoundError, OSError) as error:
+        raise ProbeError(f"ratio evidence disappeared or changed type: {error}") from error
+    if current != snapshot:
+        raise ProbeError("ratio evidence changed while outputs were being produced")
+
+
+def _prepare_ratio_outputs(
+    metrics_paths: list[Path], json_path: Path, human_path: Path
+) -> tuple[Path, Path, tuple[object, object], dict[Path, tuple[int, int, int, str]]]:
+    evidence_paths: list[Path] = []
+    for metrics_path in metrics_paths:
+        evidence_paths.append(metrics_path)
+        record = _load_json(metrics_path.resolve(strict=True))
+        for key in (
+            "capture",
+            "capture_origin_manifest",
+            "capture_origin_link_evidence",
+        ):
+            value = record.get(key)
+            if isinstance(value, str) and Path(value).is_absolute():
+                evidence_paths.append(Path(value))
+
+    json_output = _output_candidate(json_path)
+    human_output = _output_candidate(human_path)
+    unique_evidence = list(dict.fromkeys(evidence_paths))
+    evidence_snapshot = _evidence_snapshot(unique_evidence)
+    evidence_inodes = {
+        (state[0], state[1]) for state in evidence_snapshot.values()
+    }
+    output_states = (_path_state(json_output), _path_state(human_output))
+    if json_output == human_output:
+        raise ProbeError("ratio JSON and human outputs resolve to the same path")
+    output_inodes: list[tuple[int, int] | None] = []
+    for output, output_state in zip(
+        (json_output, human_output), output_states
+    ):
+        if output in evidence_snapshot:
+            raise ProbeError(f"ratio output directly aliases evidence: {output}")
+        output_inode = (
+            (output_state[1], output_state[2]) if output_state is not None else None
+        )
+        if output_inode in evidence_inodes:
+            raise ProbeError(f"ratio output hardlinks evidence: {output}")
+        output_inodes.append(output_inode)
+    if output_inodes[0] is not None and output_inodes[0] == output_inodes[1]:
+        raise ProbeError("ratio JSON and human outputs are hardlinks of each other")
+    return json_output, human_output, output_states, evidence_snapshot
+
+
+def _stage_output(path: Path, data: bytes) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _write_ratio_outputs(
+    json_output: Path,
+    human_output: Path,
+    output_states: tuple[object, object],
+    evidence_snapshot: dict[Path, tuple[int, int, int, str]],
+    result: dict[str, object],
+    human_text: str,
+) -> None:
+    json_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    human_bytes = (human_text.rstrip() + "\n").encode("utf-8")
+    json_temporary = _stage_output(json_output, json_bytes)
+    human_temporary = _stage_output(human_output, human_bytes)
+    try:
+        _verify_evidence_snapshot(evidence_snapshot)
+        if (
+            _path_state(json_output),
+            _path_state(human_output),
+        ) != output_states:
+            raise ProbeError("ratio output path changed after alias preflight")
+        os.replace(json_temporary, json_output)
+        os.replace(human_temporary, human_output)
+        _verify_evidence_snapshot(evidence_snapshot)
+    finally:
+        json_temporary.unlink(missing_ok=True)
+        human_temporary.unlink(missing_ok=True)
 
 
 def ratio_command(
@@ -539,12 +1100,19 @@ def ratio_command(
         "target": (target_100_path, target_10_path),
         "monitor": (monitor_100_path, monitor_10_path),
     }
+    metrics_paths = [path for pair in source_paths.values() for path in pair]
+    (
+        json_output,
+        human_output,
+        output_states,
+        evidence_snapshot,
+    ) = _prepare_ratio_outputs(metrics_paths, json_path, human_path)
     destinations: dict[str, dict[str, object]] = {}
     for destination, (full_path, reduced_path) in source_paths.items():
-        full, full_raw, full_digest = _authenticated_metrics_record(
+        full, full_raw, full_digest, full_origin = _authenticated_metrics_record(
             full_path, destination, 100
         )
-        reduced, reduced_raw, reduced_digest = _authenticated_metrics_record(
+        reduced, reduced_raw, reduced_digest, reduced_origin = _authenticated_metrics_record(
             reduced_path, destination, 10
         )
         rms_ratio = float(reduced["rms"]) / float(full["rms"])
@@ -574,6 +1142,24 @@ def ratio_command(
             "full_volume_capture_sha256": full_digest,
             "ten_percent_capture_sha256": reduced_digest,
             "evidence_schema": METRICS_EVIDENCE_SCHEMA,
+            "full_volume_capture_origin_manifest": full_origin[
+                "capture_origin_manifest"
+            ],
+            "full_volume_capture_origin_manifest_sha256": full_origin[
+                "capture_origin_manifest_sha256"
+            ],
+            "full_volume_capture_origin_pilot_sha256": full_origin[
+                "capture_origin_pilot_sha256"
+            ],
+            "ten_percent_capture_origin_manifest": reduced_origin[
+                "capture_origin_manifest"
+            ],
+            "ten_percent_capture_origin_manifest_sha256": reduced_origin[
+                "capture_origin_manifest_sha256"
+            ],
+            "ten_percent_capture_origin_pilot_sha256": reduced_origin[
+                "capture_origin_pilot_sha256"
+            ],
         }
 
     if all(item["classification"] == "conforming-scaled" for item in destinations.values()):
@@ -583,7 +1169,6 @@ def ratio_command(
     else:
         overall = "inconclusive-nonconforming"
     result = {"overall_classification": overall, "destinations": destinations}
-    _write_json(json_path, result)
     human_lines = [f"overall_classification: {overall}"]
     for destination, item in destinations.items():
         human_lines.extend(
@@ -593,7 +1178,14 @@ def ratio_command(
                 f"{destination}.classification: {item['classification']}",
             ]
         )
-    _write_text(human_path, "\n".join(human_lines))
+    _write_ratio_outputs(
+        json_output,
+        human_output,
+        output_states,
+        evidence_snapshot,
+        result,
+        "\n".join(human_lines),
+    )
     if overall != "conforming-scaled":
         raise ProbeError(f"volume ratio classification is {overall}; it never passes as scaled volume")
 
@@ -697,6 +1289,12 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
     channel_rms, channel_peaks = _channel_energy_metrics(
         expected_frames, active_start, active_end_exclusive
     )
+    channel_dc_offsets, channel_residual_ratios = _channel_purity_metrics(
+        expected_frames,
+        active_start,
+        active_end_exclusive,
+        channel_frequencies,
+    )
     authenticated_runs = []
     for start, end in expected_runs:
         if end - start < MARKER_MIN_ACTIVE_FRAMES:
@@ -712,6 +1310,9 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         run_channel_rms, run_channel_peaks = _channel_energy_metrics(
             expected_frames, start, end
         )
+        run_dc_offsets, run_residual_ratios = _channel_purity_metrics(
+            expected_frames, start, end, frequencies
+        )
         if all(
             _frequency_within_tolerance(
                 frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
@@ -719,8 +1320,15 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
             and score >= MARKER_FREQUENCY_SCORE_MIN
             and rms > MARKER_MINIMUM_RMS
             and peak > MARKER_MINIMUM_PEAK
-            for frequency, score, rms, peak in zip(
-                frequencies, scores, run_channel_rms, run_channel_peaks
+            and abs(dc_offset) <= MAX_CHANNEL_DC_OFFSET
+            and residual_ratio <= MAX_RESIDUAL_ENERGY_RATIO
+            for frequency, score, rms, peak, dc_offset, residual_ratio in zip(
+                frequencies,
+                scores,
+                run_channel_rms,
+                run_channel_peaks,
+                run_dc_offsets,
+                run_residual_ratios,
             )
         ):
             authenticated_runs.append((start, end))
@@ -739,8 +1347,15 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         violations.append(
             f"expected_peak {expected_peak:.9f} <= {MARKER_MINIMUM_PEAK}"
         )
-    for channel, (frequency, score, rms, peak) in enumerate(
-        zip(channel_frequencies, channel_scores, channel_rms, channel_peaks)
+    for channel, (frequency, score, rms, peak, dc_offset, residual_ratio) in enumerate(
+        zip(
+            channel_frequencies,
+            channel_scores,
+            channel_rms,
+            channel_peaks,
+            channel_dc_offsets,
+            channel_residual_ratios,
+        )
     ):
         if not _frequency_within_tolerance(
             frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
@@ -761,6 +1376,16 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         if peak <= MARKER_MINIMUM_PEAK:
             violations.append(
                 f"channel_{channel}_peak {peak:.9f} <= {MARKER_MINIMUM_PEAK:.9f}"
+            )
+        if abs(dc_offset) > MAX_CHANNEL_DC_OFFSET:
+            violations.append(
+                f"channel_{channel}_dc_offset {dc_offset:.9f} exceeds absolute "
+                f"maximum {MAX_CHANNEL_DC_OFFSET:.9f}"
+            )
+        if residual_ratio > MAX_RESIDUAL_ENERGY_RATIO:
+            violations.append(
+                f"channel_{channel}_residual_energy_ratio {residual_ratio:.9f} > "
+                f"{MAX_RESIDUAL_ENERGY_RATIO:.9f}"
             )
     if expected_outside_peak >= OUTSIDE_THRESHOLD:
         violations.append(
@@ -785,10 +1410,15 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         "channel_frequency_identity_score": channel_scores,
         "channel_rms": channel_rms,
         "channel_peak": channel_peaks,
+        "channel_dc_offset": channel_dc_offsets,
+        "channel_residual_energy_ratio": channel_residual_ratios,
         "marker_min_active_frames": MARKER_MIN_ACTIVE_FRAMES,
         "marker_frequency_tolerance_hz": MARKER_FREQUENCY_TOLERANCE_HZ,
         "marker_minimum_rms": MARKER_MINIMUM_RMS,
         "marker_minimum_peak": MARKER_MINIMUM_PEAK,
+        "maximum_channel_dc_offset": MAX_CHANNEL_DC_OFFSET,
+        "residual_amplitude_margin": RESIDUAL_AMPLITUDE_MARGIN,
+        "maximum_residual_energy_ratio": MAX_RESIDUAL_ENERGY_RATIO,
         "expected_active_threshold": ACTIVE_THRESHOLD,
         "other_silence_threshold": OUTSIDE_THRESHOLD,
         "valid": not violations,
@@ -808,6 +1438,8 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
                 f"channel_frequency_identity_score: {result['channel_frequency_identity_score']}",
                 f"channel_rms: {result['channel_rms']}",
                 f"channel_peak: {result['channel_peak']}",
+                f"channel_dc_offset: {result['channel_dc_offset']}",
+                f"channel_residual_energy_ratio: {result['channel_residual_energy_ratio']}",
                 f"expected_peak: {expected_peak:.9f}",
                 f"other_peak: {other_peak:.9f}",
                 f"expected_outside_peak: {expected_outside_peak:.9f}",
@@ -924,7 +1556,8 @@ def verify_links_command(
     json_path: Path,
     human_path: Path,
 ) -> None:
-    links = _parse_pw_link_list(links_path.read_text(encoding="utf-8"))
+    links_text = links_path.read_text(encoding="utf-8")
+    links = _parse_pw_link_list(links_text)
     expected = {target_capture: target_sink, monitor_capture: monitor_sink}
     details: dict[str, object] = {}
     for capture, sink in expected.items():
@@ -953,6 +1586,39 @@ def verify_links_command(
         "captures": details,
         "valid": valid,
     }
+    if not valid:
+        _write_json(json_path, result)
+        _write_text(
+            human_path,
+            "\n".join(
+                [
+                    f"target_capture: {target_capture} -> {target_sink}:monitor_FL/monitor_FR",
+                    f"monitor_capture: {monitor_capture} -> {monitor_sink}:monitor_FL/monitor_FR",
+                    f"valid: {valid}",
+                ]
+            ),
+        )
+        raise ProbeError(f"capture links did not target the intended distinct monitor ports: {details}")
+
+    volume_percent = _capture_origin_volume(json_path)
+    if volume_percent is not None:
+        manifest_path = _establish_capture_origins(
+            json_path.parent.resolve(strict=True),
+            volume_percent,
+            links_path,
+            _sha256_file(links_path.resolve(strict=True)),
+            target_sink,
+            monitor_sink,
+            target_capture,
+            monitor_capture,
+        )
+        result.update(
+            {
+                "capture_origin_schema": CAPTURE_ORIGIN_SCHEMA,
+                "capture_origin_manifest": str(manifest_path),
+                "capture_origin_manifest_sha256": _sha256_file(manifest_path),
+            }
+        )
     _write_json(json_path, result)
     _write_text(
         human_path,
@@ -960,12 +1626,15 @@ def verify_links_command(
             [
                 f"target_capture: {target_capture} -> {target_sink}:monitor_FL/monitor_FR",
                 f"monitor_capture: {monitor_capture} -> {monitor_sink}:monitor_FL/monitor_FR",
+                *(
+                    [f"capture_origin_manifest: {result['capture_origin_manifest']}"]
+                    if "capture_origin_manifest" in result
+                    else []
+                ),
                 f"valid: {valid}",
             ]
         ),
     )
-    if not valid:
-        raise ProbeError(f"capture links did not target the intended distinct monitor ports: {details}")
 
 
 def wrapper_command(
@@ -1118,6 +1787,34 @@ def _write_f32_capture(
             output.write(struct.pack("<ff", sample, sample))
 
 
+def _self_test_establish_capture_origins(root: Path, volume_percent: int) -> None:
+    links = root / f"pw-link-{volume_percent}-lI.txt"
+    _write_text(
+        links,
+        "\n".join(
+            [
+                f"capture-target-{volume_percent}:input_FL",
+                "  |<- target:monitor_FL",
+                f"capture-target-{volume_percent}:input_FR",
+                "  |<- target:monitor_FR",
+                f"capture-monitor-{volume_percent}:input_FL",
+                "  |<- monitor:monitor_FL",
+                f"capture-monitor-{volume_percent}:input_FR",
+                "  |<- monitor:monitor_FR",
+            ]
+        ),
+    )
+    verify_links_command(
+        links,
+        "target",
+        "monitor",
+        f"capture-target-{volume_percent}",
+        f"capture-monitor-{volume_percent}",
+        root / f"links-{volume_percent}.json",
+        root / f"links-{volume_percent}.txt",
+    )
+
+
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="pipe-deck-407-probe-self-test-") as directory:
         root = Path(directory)
@@ -1136,6 +1833,8 @@ def self_test() -> None:
         _write_f32_capture(target_10, 0.025)
         _write_f32_capture(monitor_100, 0.25)
         _write_f32_capture(monitor_10, 0.025)
+        _self_test_establish_capture_origins(root, 100)
+        _self_test_establish_capture_origins(root, 10)
         for raw, volume in ((target_100, 100), (target_10, 10), (monitor_100, 100), (monitor_10, 10)):
             result = analyze_capture(raw, volume)
             if not result["valid"]:

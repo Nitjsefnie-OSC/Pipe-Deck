@@ -7,10 +7,12 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 
 PROBE_PATH = Path(__file__).with_name("probe.py")
@@ -29,6 +31,8 @@ def write_capture(
     frequency_hz: float = 997.0,
     left_amplitude: float = 0.25,
     right_amplitude: float | None = None,
+    dc_offset: float = 0.0,
+    second_harmonic_amplitude: float = 0.0,
 ) -> None:
     """Write independent stereo-f32 test evidence without probe helpers."""
     if right_amplitude is None:
@@ -37,8 +41,9 @@ def write_capture(
         for frame in range(frames):
             if active_start <= frame < active_end:
                 phase = 2.0 * math.pi * frequency_hz * (frame - active_start) / 48_000
-                left = left_amplitude * math.sin(phase)
-                right = right_amplitude * math.sin(phase)
+                harmonic = second_harmonic_amplitude * math.sin(2.0 * phase)
+                left = dc_offset + left_amplitude * math.sin(phase) + harmonic
+                right = dc_offset + right_amplitude * math.sin(phase) + harmonic
             else:
                 left = right = 0.0
             output.write(struct.pack("<ff", left, right))
@@ -46,6 +51,41 @@ def write_capture(
 
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def write_frame(path: Path, frame: int, left: float, right: float) -> None:
+    with path.open("r+b") as output:
+        output.seek(frame * 8)
+        output.write(struct.pack("<ff", left, right))
+
+
+def establish_capture_origins(root: Path, volume: int) -> None:
+    links = root / f"pw-link-{volume}-lI.txt"
+    links.write_text(
+        "\n".join(
+            [
+                f"capture-target-{volume}:input_FL",
+                "  |<- target:monitor_FL",
+                f"capture-target-{volume}:input_FR",
+                "  |<- target:monitor_FR",
+                f"capture-monitor-{volume}:input_FL",
+                "  |<- monitor:monitor_FL",
+                f"capture-monitor-{volume}:input_FR",
+                "  |<- monitor:monitor_FR",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    probe.verify_links_command(
+        links,
+        "target",
+        "monitor",
+        f"capture-target-{volume}",
+        f"capture-monitor-{volume}",
+        root / f"links-{volume}.json",
+        root / f"links-{volume}.txt",
+    )
 
 
 class ProbeAuthenticationTests(unittest.TestCase):
@@ -132,14 +172,214 @@ class ProbeAuthenticationTests(unittest.TestCase):
             [(0, 10), (15, 25)],
         )
 
+    def test_capture_duration_exact_fenceposts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for detected_frames, generated_frames, expected_valid in (
+                (71_991, 71_992, False),
+                (71_992, 71_993, True),
+                (72_008, 72_009, True),
+                (72_009, 72_010, False),
+            ):
+                with self.subTest(detected_frames=detected_frames):
+                    raw = root / f"duration-{detected_frames}.raw"
+                    write_capture(
+                        raw,
+                        frames=max(96_000, 24_000 + generated_frames),
+                        active_start=12_000,
+                        active_end=12_000 + generated_frames,
+                    )
+                    result = probe.analyze_capture(raw, 100)
+                    self.assertEqual(
+                        result["active_frames_before_trim"], detected_frames
+                    )
+                    self.assertEqual(result["valid"], expected_valid, result)
+
+    def test_capture_outside_silence_exact_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for outside_value, expected_valid in (
+                (0.000999, True),
+                (0.001001, False),
+            ):
+                with self.subTest(outside_value=outside_value):
+                    raw = root / f"outside-{outside_value}.raw"
+                    write_capture(
+                        raw,
+                        frames=96_000,
+                        active_start=12_000,
+                        active_end=84_000,
+                    )
+                    write_frame(raw, 6_000, outside_value, outside_value)
+                    result = probe.analyze_capture(raw, 100)
+                    self.assertEqual(result["valid"], expected_valid, result)
+
+    def test_capture_leading_and_trailing_silence_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            leading = root / "leading-one-short.raw"
+            write_capture(
+                leading,
+                frames=96_000,
+                active_start=11_998,
+                active_end=83_998,
+            )
+            leading_result = probe.analyze_capture(leading, 100)
+            self.assertEqual(leading_result["leading_silence_frames"], 11_999)
+            self.assertFalse(leading_result["valid"], leading_result)
+
+            trailing = root / "trailing-one-short.raw"
+            write_capture(
+                trailing,
+                frames=96_000,
+                active_start=12_001,
+                active_end=84_001,
+            )
+            trailing_result = probe.analyze_capture(trailing, 100)
+            self.assertEqual(trailing_result["trailing_silence_frames"], 11_999)
+            self.assertFalse(trailing_result["valid"], trailing_result)
+
+    def test_capture_rejects_dc_and_second_harmonic_contamination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, extras in (
+                ("dc", {"dc_offset": 0.20}),
+                ("second-harmonic", {"second_harmonic_amplitude": 0.10}),
+            ):
+                with self.subTest(contamination=name):
+                    raw = root / f"capture-{name}.raw"
+                    write_capture(
+                        raw,
+                        frames=96_000,
+                        active_start=12_000,
+                        active_end=84_000,
+                        **extras,
+                    )
+                    self.assertFalse(probe.analyze_capture(raw, 100)["valid"])
+
+    def test_capture_purity_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, extras, expected_valid in (
+                ("dc-inside", {"dc_offset": 0.0009}, True),
+                ("dc-outside", {"dc_offset": 0.0011}, False),
+                (
+                    "residual-inside",
+                    {"second_harmonic_amplitude": 0.0475},
+                    True,
+                ),
+                (
+                    "residual-outside",
+                    {"second_harmonic_amplitude": 0.0525},
+                    False,
+                ),
+            ):
+                with self.subTest(case=name):
+                    raw = root / f"purity-{name}.raw"
+                    write_capture(
+                        raw,
+                        frames=96_000,
+                        active_start=12_000,
+                        active_end=84_000,
+                        **extras,
+                    )
+                    result = probe.analyze_capture(raw, 100)
+                    self.assertEqual(result["valid"], expected_valid, result)
+
+    def test_marker_rejects_dc_and_second_harmonic_contamination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silence = root / "silence.raw"
+            write_capture(
+                silence,
+                frames=12_000,
+                active_start=0,
+                active_end=0,
+                left_amplitude=0.0,
+            )
+            for name, extras in (
+                ("dc", {"dc_offset": 0.20}),
+                ("second-harmonic", {"second_harmonic_amplitude": 0.10}),
+            ):
+                with self.subTest(contamination=name):
+                    marker = root / f"marker-{name}.raw"
+                    write_capture(
+                        marker,
+                        frames=12_000,
+                        active_start=600,
+                        active_end=11_400,
+                        frequency_hz=733.0,
+                        **extras,
+                    )
+                    with self.assertRaises(probe.ProbeError):
+                        probe.marker_command(
+                            marker,
+                            silence,
+                            root / f"marker-{name}.json",
+                            root / f"marker-{name}.txt",
+                            "target",
+                        )
+
+    def test_marker_purity_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silence = root / "silence.raw"
+            write_capture(
+                silence,
+                frames=12_000,
+                active_start=0,
+                active_end=0,
+                left_amplitude=0.0,
+            )
+            for name, extras, expected_valid in (
+                ("dc-inside", {"dc_offset": 0.0009}, True),
+                ("dc-outside", {"dc_offset": 0.0011}, False),
+                (
+                    "residual-inside",
+                    {"second_harmonic_amplitude": 0.0475},
+                    True,
+                ),
+                (
+                    "residual-outside",
+                    {"second_harmonic_amplitude": 0.0525},
+                    False,
+                ),
+            ):
+                with self.subTest(case=name):
+                    marker = root / f"marker-boundary-{name}.raw"
+                    write_capture(
+                        marker,
+                        frames=12_000,
+                        active_start=600,
+                        active_end=11_400,
+                        frequency_hz=733.0,
+                        **extras,
+                    )
+                    action = lambda: probe.marker_command(
+                        marker,
+                        silence,
+                        root / f"marker-boundary-{name}.json",
+                        root / f"marker-boundary-{name}.txt",
+                        "target",
+                    )
+                    if expected_valid:
+                        action()
+                    else:
+                        with self.assertRaises(probe.ProbeError):
+                            action()
+
 
 class RatioEvidenceTests(unittest.TestCase):
-    def _metric_paths(self, root: Path) -> dict[tuple[str, int], Path]:
+    def _metric_paths(
+        self,
+        root: Path,
+        *,
+        swap_destinations_before_metrics: bool = False,
+    ) -> dict[tuple[str, int], Path]:
         paths: dict[tuple[str, int], Path] = {}
-        for destination in ("target", "monitor"):
-            for volume, amplitude in ((100, 0.25), (10, 0.025)):
+        for volume, amplitude in ((100, 0.25), (10, 0.025)):
+            for destination in ("target", "monitor"):
                 raw = root / f"{destination}-{volume}.raw"
-                metrics = root / f"{destination}-{volume}-metrics.json"
                 write_capture(
                     raw,
                     frames=96_000,
@@ -147,6 +387,17 @@ class RatioEvidenceTests(unittest.TestCase):
                     active_end=84_000,
                     left_amplitude=amplitude,
                 )
+            establish_capture_origins(root, volume)
+            if swap_destinations_before_metrics:
+                target = root / f"target-{volume}.raw"
+                monitor = root / f"monitor-{volume}.raw"
+                target_bytes = target.read_bytes()
+                monitor_bytes = monitor.read_bytes()
+                target.write_bytes(monitor_bytes)
+                monitor.write_bytes(target_bytes)
+            for destination in ("target", "monitor"):
+                raw = root / f"{destination}-{volume}.raw"
+                metrics = root / f"{destination}-{volume}-metrics.json"
                 probe.metrics_command(
                     raw,
                     metrics,
@@ -156,15 +407,220 @@ class RatioEvidenceTests(unittest.TestCase):
                 paths[(destination, volume)] = metrics
         return paths
 
-    def _ratio(self, root: Path, paths: dict[tuple[str, int], Path]) -> None:
+    def _ratio(
+        self,
+        root: Path,
+        paths: dict[tuple[str, int], Path],
+        *,
+        json_path: Path | None = None,
+        human_path: Path | None = None,
+    ) -> None:
         probe.ratio_command(
             paths[("target", 100)],
             paths[("target", 10)],
             paths[("monitor", 100)],
             paths[("monitor", 10)],
-            root / "ratios.json",
-            root / "ratios.txt",
+            json_path or root / "ratios.json",
+            human_path or root / "ratios.txt",
         )
+
+    def test_metrics_requires_capture_time_origin_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "target-100.raw"
+            write_capture(
+                raw,
+                frames=96_000,
+                active_start=12_000,
+                active_end=84_000,
+            )
+
+            with self.assertRaises(probe.ProbeError):
+                probe.metrics_command(
+                    raw,
+                    root / "target-100-metrics.json",
+                    root / "target-100-metrics.txt",
+                    100,
+                )
+
+    def test_ratio_rejects_destination_origin_swapped_before_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            with self.assertRaises(probe.ProbeError):
+                paths = self._metric_paths(
+                    root,
+                    swap_destinations_before_metrics=True,
+                )
+                self._ratio(root, paths)
+
+    def test_metrics_rejects_wrong_volume_origin_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for volume in (100, 10):
+                for destination in ("target", "monitor"):
+                    write_capture(
+                        root / f"{destination}-{volume}.raw",
+                        frames=96_000,
+                        active_start=12_000,
+                        active_end=84_000,
+                        left_amplitude=0.25,
+                    )
+                establish_capture_origins(root, volume)
+            target_100 = root / "target-100.raw"
+            target_100.write_bytes((root / "target-10.raw").read_bytes())
+
+            with self.assertRaises(probe.ProbeError):
+                probe.metrics_command(
+                    target_100,
+                    root / "target-100-metrics.json",
+                    root / "target-100-metrics.txt",
+                    100,
+                )
+
+    def test_ratio_normal_outputs_preserve_all_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            evidence = [
+                *paths.values(),
+                *(root / f"{destination}-{volume}.raw"
+                  for destination in ("target", "monitor")
+                  for volume in (100, 10)),
+            ]
+            before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in evidence}
+
+            self._ratio(root, paths)
+
+            after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in evidence}
+            self.assertEqual(after, before)
+            ratio = json.loads((root / "ratios.json").read_text(encoding="utf-8"))
+            self.assertEqual(ratio["overall_classification"], "conforming-scaled")
+            self.assertIn("overall_classification: conforming-scaled", (root / "ratios.txt").read_text(encoding="utf-8"))
+
+    def test_ratio_rehashes_evidence_after_both_outputs_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            raw = root / "target-100.raw"
+            original_replace = os.replace
+
+            def replace_and_mutate(source: object, destination: object) -> None:
+                original_replace(source, destination)
+                if Path(destination).name == "ratios.txt":
+                    with raw.open("ab") as output:
+                        output.write(struct.pack("<ff", 0.0, 0.0))
+
+            with mock.patch.object(
+                probe.os, "replace", side_effect=replace_and_mutate
+            ), self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths)
+
+    def test_ratio_rejects_output_path_replacement_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            original_stage = probe._stage_output
+            staged = 0
+
+            def stage_and_replace(path: Path, data: bytes) -> Path:
+                nonlocal staged
+                temporary = original_stage(path, data)
+                staged += 1
+                if staged == 2:
+                    (root / "ratios.txt").write_text("raced\n", encoding="utf-8")
+                return temporary
+
+            with mock.patch.object(
+                probe, "_stage_output", side_effect=stage_and_replace
+            ), self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths)
+
+    def test_ratio_rejects_direct_output_aliases(self) -> None:
+        for scenario in ("metrics", "raw", "outputs-each-other"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = self._metric_paths(root)
+                json_path = root / "ratios.json"
+                human_path = root / "ratios.txt"
+                if scenario == "metrics":
+                    json_path = paths[("target", 100)]
+                elif scenario == "raw":
+                    human_path = root / "target-100.raw"
+                else:
+                    json_path = human_path = root / "same-output"
+
+                evidence = [
+                    *paths.values(),
+                    *(root / f"{destination}-{volume}.raw"
+                      for destination in ("target", "monitor")
+                      for volume in (100, 10)),
+                ]
+                before = {
+                    path: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in evidence
+                }
+
+                with self.assertRaises(probe.ProbeError):
+                    self._ratio(
+                        root,
+                        paths,
+                        json_path=json_path,
+                        human_path=human_path,
+                    )
+                after = {
+                    path: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in evidence
+                }
+                self.assertEqual(after, before)
+
+    def test_ratio_rejects_symlink_output_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            human_alias = root / "ratios.txt"
+            human_alias.symlink_to(root / "target-100.raw")
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths, human_path=human_alias)
+
+    def test_ratio_rejects_hardlink_output_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            human_alias = root / "ratios.txt"
+            os.link(root / "target-100.raw", human_alias)
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths, human_path=human_alias)
+
+    def test_ratio_rejects_stale_or_missing_analysis_digest(self) -> None:
+        for scenario in ("stale", "missing"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = self._metric_paths(root)
+                metrics = paths[("target", 100)]
+                record = json.loads(metrics.read_text(encoding="utf-8"))
+                if scenario == "stale":
+                    record["authenticated_analysis_sha256"] = "0" * 64
+                else:
+                    record.pop("authenticated_analysis_sha256")
+                write_json(metrics, record)
+
+                with self.assertRaises(probe.ProbeError):
+                    self._ratio(root, paths)
+
+    def test_ratio_rejects_stale_stored_analysis_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            metrics = paths[("target", 100)]
+            record = json.loads(metrics.read_text(encoding="utf-8"))
+            record["rms"] = float(record["rms"]) * 2.0
+            write_json(metrics, record)
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths)
 
     def test_ratio_rejects_forged_valid_booleans_without_raw_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -199,6 +655,36 @@ class RatioEvidenceTests(unittest.TestCase):
                         output.write(struct.pack("<ff", 0.0, 0.0))
                 else:
                     raw.unlink()
+
+                with self.assertRaises(probe.ProbeError):
+                    self._ratio(root, paths)
+
+    def test_ratio_rejects_stable_raw_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._metric_paths(root)
+            raw = root / "target-100.raw"
+            replacement = root / "replacement.raw"
+            replacement.write_bytes(raw.read_bytes())
+            os.replace(replacement, raw)
+
+            with self.assertRaises(probe.ProbeError):
+                self._ratio(root, paths)
+
+    def test_ratio_rejects_changed_leg_and_schema_fields(self) -> None:
+        for field, value in (
+            ("expected_destination", "monitor"),
+            ("volume_percent", 10),
+            ("evidence_schema", "changed-schema"),
+            ("capture_origin_schema", "changed-origin-schema"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths = self._metric_paths(root)
+                metrics = paths[("target", 100)]
+                record = json.loads(metrics.read_text(encoding="utf-8"))
+                record[field] = value
+                write_json(metrics, record)
 
                 with self.assertRaises(probe.ProbeError):
                     self._ratio(root, paths)
