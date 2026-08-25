@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "format:check"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].length > 0 ? "present" : "invalid");')"
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "format:check"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].trim().length > 0 ? "present" : "invalid");')"
           case "$script_state" in
             present)
               npm run format:check
@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "lint"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].length > 0 ? "present" : "invalid");')"
+          script_state="$(node -e 'const fs = require("node:fs"); const package_json = JSON.parse(fs.readFileSync("package.json", "utf8")); const scripts = package_json.scripts; const script_name = "lint"; if (!scripts || typeof scripts !== "object" || !Object.prototype.hasOwnProperty.call(scripts, script_name)) process.stdout.write("missing"); else process.stdout.write(typeof scripts[script_name] === "string" && scripts[script_name].trim().length > 0 ? "present" : "invalid");')"
           case "$script_state" in
             present)
               npm run lint
