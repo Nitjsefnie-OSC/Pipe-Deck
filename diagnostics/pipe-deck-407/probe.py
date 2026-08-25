@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import hashlib
 import json
 import math
 import re
@@ -23,6 +24,7 @@ STEREO = 2
 FIXTURE_FRAMES = 96_000
 ACTIVE_START = 12_000
 ACTIVE_END = 84_000
+FIXTURE_ACTIVE_FRAMES = ACTIVE_END - ACTIVE_START
 FIXTURE_TRAILING_SILENCE_FRAMES = FIXTURE_FRAMES - ACTIVE_END
 TRIM_FRAMES = 4_800
 MIN_ACTIVE_FRAMES = 57_600
@@ -32,12 +34,17 @@ CAPTURE_FREQUENCY_HZ = 997.0
 CAPTURE_FREQUENCY_TOLERANCE_HZ = 10.0
 CAPTURE_FREQUENCY_SCORE_MIN = 0.80
 CAPTURE_MAX_SILENT_GAP_FRAMES = 4
-MIN_CAPTURE_RUN_FRAMES = MIN_ACTIVE_FRAMES + (2 * TRIM_FRAMES)
+CAPTURE_RUN_EDGE_TOLERANCE_FRAMES = 2 * CAPTURE_MAX_SILENT_GAP_FRAMES
+MIN_CAPTURE_RUN_FRAMES = FIXTURE_ACTIVE_FRAMES - CAPTURE_RUN_EDGE_TOLERANCE_FRAMES
+MAX_CAPTURE_RUN_FRAMES = FIXTURE_ACTIVE_FRAMES + CAPTURE_RUN_EDGE_TOLERANCE_FRAMES
 MARKER_FREQUENCIES = {"target": 733.0, "monitor": 1237.0}
 MARKER_MIN_ACTIVE_FRAMES = SAMPLE_RATE // 10
 MARKER_MAX_SILENT_GAP_FRAMES = 4
 MARKER_FREQUENCY_TOLERANCE_HZ = 10.0
 MARKER_FREQUENCY_SCORE_MIN = 0.50
+MARKER_MINIMUM_PEAK = 0.05
+MARKER_MINIMUM_RMS = MARKER_MINIMUM_PEAK / math.sqrt(2.0)
+METRICS_EVIDENCE_SCHEMA = "pipe-deck-407-authenticated-capture-v1"
 
 
 class ProbeError(RuntimeError):
@@ -142,7 +149,7 @@ def _active_runs(
             last_active = index
             continue
         if current_start is not None and last_active is not None:
-            if index - last_active - 1 > max_silent_gap_frames:
+            if index - last_active > max_silent_gap_frames:
                 runs.append((current_start, last_active + 1))
                 current_start = None
                 last_active = None
@@ -175,6 +182,23 @@ def _capture_run_frequency_metrics(
     return frequencies, scores
 
 
+def _channel_energy_metrics(
+    frames: list[tuple[float, float]], start: int, end: int
+) -> tuple[list[float], list[float]]:
+    samples = frames[start:end]
+    if not samples:
+        return [0.0] * STEREO, [0.0] * STEREO
+    rms_values = [
+        math.sqrt(sum(frame[channel] ** 2 for frame in samples) / len(samples))
+        for channel in range(STEREO)
+    ]
+    peaks = [
+        max((abs(frame[channel]) for frame in samples), default=0.0)
+        for channel in range(STEREO)
+    ]
+    return rms_values, peaks
+
+
 def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     frames = _read_f32_stereo(path)
     peaks = _frame_peaks(frames)
@@ -182,25 +206,45 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     if not active_runs:
         raise ProbeError(f"capture has no active frames above {ACTIVE_THRESHOLD}: {path}")
 
+    minimum_rms = 0.02 if volume_percent == 100 else 0.002
+    minimum_peak = 0.05 if volume_percent == 100 else 0.005
     eligible_runs = [
         (start, end)
         for start, end in active_runs
-        if end - start >= MIN_CAPTURE_RUN_FRAMES
+        if MIN_CAPTURE_RUN_FRAMES <= end - start <= MAX_CAPTURE_RUN_FRAMES
     ]
-    authenticated_runs: list[tuple[int, int, list[float], list[float]]] = []
+    authenticated_runs: list[
+        tuple[int, int, list[float], list[float], list[float], list[float]]
+    ] = []
     for start, end in eligible_runs:
         frequencies, scores = _capture_run_frequency_metrics(frames, start, end)
+        channel_rms, channel_peaks = _channel_energy_metrics(
+            frames, start + TRIM_FRAMES, end - TRIM_FRAMES
+        )
         if all(
             _frequency_within_tolerance(
                 frequency, CAPTURE_FREQUENCY_HZ, CAPTURE_FREQUENCY_TOLERANCE_HZ
             )
             and score >= CAPTURE_FREQUENCY_SCORE_MIN
-            for frequency, score in zip(frequencies, scores)
+            and rms > minimum_rms
+            and peak > minimum_peak
+            for frequency, score, rms, peak in zip(
+                frequencies, scores, channel_rms, channel_peaks
+            )
         ):
-            authenticated_runs.append((start, end, frequencies, scores))
+            authenticated_runs.append(
+                (start, end, frequencies, scores, channel_rms, channel_peaks)
+            )
 
     if len(authenticated_runs) == 1:
-        active_start, active_end_exclusive, channel_frequencies, channel_scores = authenticated_runs[0]
+        (
+            active_start,
+            active_end_exclusive,
+            channel_frequencies,
+            channel_scores,
+            channel_rms,
+            channel_peaks,
+        ) = authenticated_runs[0]
     else:
         active_start, active_end_exclusive = max(
             eligible_runs or active_runs,
@@ -208,6 +252,11 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         )
         channel_frequencies, channel_scores = _capture_run_frequency_metrics(
             frames, active_start, active_end_exclusive
+        )
+        channel_rms, channel_peaks = _channel_energy_metrics(
+            frames,
+            active_start + TRIM_FRAMES,
+            active_end_exclusive - TRIM_FRAMES,
         )
 
     run_frames = active_end_exclusive - active_start
@@ -227,8 +276,6 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     leading_silence_frames = active_start
     trailing_silence_frames = len(frames) - active_end_exclusive
 
-    minimum_rms = 0.02 if volume_percent == 100 else 0.002
-    minimum_peak = 0.05 if volume_percent == 100 else 0.005
     violations: list[str] = []
     if len(frames) < FIXTURE_FRAMES:
         violations.append(f"frames {len(frames)} < generated fixture extent {FIXTURE_FRAMES}")
@@ -240,9 +287,12 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         violations.append(
             f"authenticated_fixture_runs {len(authenticated_runs)} != 1"
         )
-    if run_frames < MIN_CAPTURE_RUN_FRAMES:
+    if not MIN_CAPTURE_RUN_FRAMES <= run_frames <= MAX_CAPTURE_RUN_FRAMES:
         violations.append(
-            f"contiguous_fixture_run_frames {run_frames} < {MIN_CAPTURE_RUN_FRAMES}"
+            f"contiguous_fixture_run_frames {run_frames} outside "
+            f"[{MIN_CAPTURE_RUN_FRAMES}, {MAX_CAPTURE_RUN_FRAMES}] derived from "
+            f"generated fixture active frames {FIXTURE_ACTIVE_FRAMES} and detector "
+            f"edge tolerance {CAPTURE_RUN_EDGE_TOLERANCE_FRAMES}"
         )
     if leading_silence_frames < ACTIVE_START:
         violations.append(
@@ -252,7 +302,9 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         violations.append(
             f"trailing_silence_frames {trailing_silence_frames} < {FIXTURE_TRAILING_SILENCE_FRAMES}"
         )
-    for channel, (frequency, score) in enumerate(zip(channel_frequencies, channel_scores)):
+    for channel, (frequency, score, channel_rms_value, channel_peak) in enumerate(
+        zip(channel_frequencies, channel_scores, channel_rms, channel_peaks)
+    ):
         if not _frequency_within_tolerance(
             frequency, CAPTURE_FREQUENCY_HZ, CAPTURE_FREQUENCY_TOLERANCE_HZ
         ):
@@ -264,6 +316,14 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
             violations.append(
                 f"channel_{channel}_frequency_identity_score {score:.6f} < "
                 f"{CAPTURE_FREQUENCY_SCORE_MIN:.6f}"
+            )
+        if channel_rms_value <= minimum_rms:
+            violations.append(
+                f"channel_{channel}_rms {channel_rms_value:.9f} <= {minimum_rms}"
+            )
+        if channel_peak <= minimum_peak:
+            violations.append(
+                f"channel_{channel}_peak {channel_peak:.9f} <= {minimum_peak}"
             )
     if active_frames < MIN_ACTIVE_FRAMES:
         violations.append(f"active_frames {active_frames} < {MIN_ACTIVE_FRAMES}")
@@ -292,6 +352,8 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "capture_frequency_tolerance_hz": CAPTURE_FREQUENCY_TOLERANCE_HZ,
         "channel_frequency_hz": channel_frequencies,
         "channel_frequency_identity_score": channel_scores,
+        "channel_rms": channel_rms,
+        "channel_peak": channel_peaks,
         "leading_silence_frames": leading_silence_frames,
         "trailing_silence_frames": trailing_silence_frames,
         "rms": rms,
@@ -300,6 +362,10 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
         "trailing_silence_peak": trailing_silence_peak,
         "expected_frames": FIXTURE_FRAMES,
         "required_trailing_silence_frames": FIXTURE_TRAILING_SILENCE_FRAMES,
+        "expected_fixture_active_frames": FIXTURE_ACTIVE_FRAMES,
+        "capture_run_edge_tolerance_frames": CAPTURE_RUN_EDGE_TOLERANCE_FRAMES,
+        "minimum_capture_run_frames": MIN_CAPTURE_RUN_FRAMES,
+        "maximum_capture_run_frames": MAX_CAPTURE_RUN_FRAMES,
         "minimum_rms": minimum_rms,
         "minimum_peak": minimum_peak,
         "valid": not violations,
@@ -307,14 +373,68 @@ def analyze_capture(path: Path, volume_percent: int) -> dict[str, object]:
     }
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_sha256(value: object) -> str:
+    canonical = json.dumps(
+        value,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _metrics_destination(
+    raw_path: Path, json_path: Path, volume_percent: int
+) -> str:
+    json_resolved = json_path.resolve()
+    if raw_path.parent != json_resolved.parent:
+        raise ProbeError(
+            f"metrics and raw capture must share one evidence directory: "
+            f"{json_resolved.parent} != {raw_path.parent}"
+        )
+    for destination in MARKER_FREQUENCIES:
+        if (
+            raw_path.name == f"{destination}-{volume_percent}.raw"
+            and json_resolved.name
+            == f"{destination}-{volume_percent}-metrics.json"
+        ):
+            return destination
+    raise ProbeError(
+        f"metrics paths do not identify target/monitor {volume_percent}% leg: "
+        f"raw={raw_path.name}, json={json_resolved.name}"
+    )
+
+
 def metrics_command(raw_path: Path, json_path: Path, human_path: Path, volume_percent: int) -> None:
-    result = analyze_capture(raw_path, volume_percent)
+    resolved_raw = raw_path.resolve(strict=True)
+    destination = _metrics_destination(resolved_raw, json_path, volume_percent)
+    result = analyze_capture(resolved_raw, volume_percent)
+    analysis_sha256 = _json_sha256(result)
+    result.update(
+        {
+            "evidence_schema": METRICS_EVIDENCE_SCHEMA,
+            "expected_destination": destination,
+            "capture_sha256": _sha256_file(resolved_raw),
+            "authenticated_analysis_sha256": analysis_sha256,
+        }
+    )
     _write_json(json_path, result)
     _write_text(
         human_path,
         "\n".join(
             [
                 f"capture: {raw_path}",
+                f"expected_destination: {destination}",
+                f"capture_sha256: {result['capture_sha256']}",
+                f"authenticated_analysis_sha256: {analysis_sha256}",
                 f"volume_percent: {volume_percent}",
                 f"frames: {result['frames']}",
                 f"active_frames: {result['active_frames']}",
@@ -343,6 +463,70 @@ def _load_json(path: Path) -> dict[str, object]:
     return value
 
 
+def _authenticated_metrics_record(
+    metrics_path: Path, expected_destination: str, expected_volume: int
+) -> tuple[dict[str, object], Path, str]:
+    resolved_metrics = metrics_path.resolve(strict=True)
+    expected_metrics_name = (
+        f"{expected_destination}-{expected_volume}-metrics.json"
+    )
+    if resolved_metrics.name != expected_metrics_name:
+        raise ProbeError(
+            f"{expected_destination} {expected_volume}% metrics path is mislabelled: "
+            f"{resolved_metrics.name} != {expected_metrics_name}"
+        )
+    record = _load_json(resolved_metrics)
+    if record.get("evidence_schema") != METRICS_EVIDENCE_SCHEMA:
+        raise ProbeError(
+            f"{resolved_metrics} lacks {METRICS_EVIDENCE_SCHEMA} provenance"
+        )
+    if record.get("expected_destination") != expected_destination:
+        raise ProbeError(
+            f"{resolved_metrics} is bound to destination "
+            f"{record.get('expected_destination')!r}, expected {expected_destination!r}"
+        )
+    if record.get("volume_percent") != expected_volume:
+        raise ProbeError(
+            f"{resolved_metrics} is bound to volume "
+            f"{record.get('volume_percent')!r}, expected {expected_volume}"
+        )
+    capture_value = record.get("capture")
+    if not isinstance(capture_value, str):
+        raise ProbeError(f"{resolved_metrics} has no bound raw capture path")
+    raw_path = Path(capture_value)
+    if not raw_path.is_absolute():
+        raise ProbeError(f"{resolved_metrics} raw capture binding is not absolute")
+    expected_raw_name = f"{expected_destination}-{expected_volume}.raw"
+    if raw_path.name != expected_raw_name or raw_path.parent != resolved_metrics.parent:
+        raise ProbeError(
+            f"{resolved_metrics} raw capture binding is mislabelled: {raw_path}"
+        )
+    if not raw_path.is_file():
+        raise ProbeError(f"bound raw capture is missing: {raw_path}")
+    capture_sha256 = _sha256_file(raw_path)
+    if record.get("capture_sha256") != capture_sha256:
+        raise ProbeError(f"bound raw capture digest changed: {raw_path}")
+
+    revalidated = analyze_capture(raw_path, expected_volume)
+    if (
+        revalidated.get("valid") is not True
+        or revalidated.get("authenticated_fixture_run_count") != 1
+    ):
+        raise ProbeError(
+            f"bound raw capture is not authenticated fixture evidence: "
+            f"{raw_path}: {revalidated.get('violations')}"
+        )
+    analysis_sha256 = _json_sha256(revalidated)
+    if record.get("authenticated_analysis_sha256") != analysis_sha256:
+        raise ProbeError(f"authenticated analysis changed for {raw_path}")
+    for key, value in revalidated.items():
+        if record.get(key) != value:
+            raise ProbeError(
+                f"stored metric {key} is stale or altered for {raw_path}"
+            )
+    return revalidated, raw_path, capture_sha256
+
+
 def ratio_command(
     target_100_path: Path,
     target_10_path: Path,
@@ -357,12 +541,12 @@ def ratio_command(
     }
     destinations: dict[str, dict[str, object]] = {}
     for destination, (full_path, reduced_path) in source_paths.items():
-        full = _load_json(full_path)
-        reduced = _load_json(reduced_path)
-        if full.get("valid") is not True or reduced.get("valid") is not True:
-            raise ProbeError(
-                f"{destination} metrics are not authenticated capture evidence"
-            )
+        full, full_raw, full_digest = _authenticated_metrics_record(
+            full_path, destination, 100
+        )
+        reduced, reduced_raw, reduced_digest = _authenticated_metrics_record(
+            reduced_path, destination, 10
+        )
         rms_ratio = float(reduced["rms"]) / float(full["rms"])
         peak_ratio = float(reduced["peak"]) / float(full["peak"])
         ratios = (rms_ratio, peak_ratio)
@@ -385,6 +569,11 @@ def ratio_command(
             "classification": classification,
             "full_volume_metrics": str(full_path),
             "ten_percent_metrics": str(reduced_path),
+            "full_volume_capture": str(full_raw),
+            "ten_percent_capture": str(reduced_raw),
+            "full_volume_capture_sha256": full_digest,
+            "ten_percent_capture_sha256": reduced_digest,
+            "evidence_schema": METRICS_EVIDENCE_SCHEMA,
         }
 
     if all(item["classification"] == "conforming-scaled" for item in destinations.values()):
@@ -505,6 +694,9 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         )
         for channel, frequency in enumerate(channel_frequencies)
     ]
+    channel_rms, channel_peaks = _channel_energy_metrics(
+        expected_frames, active_start, active_end_exclusive
+    )
     authenticated_runs = []
     for start, end in expected_runs:
         if end - start < MARKER_MIN_ACTIVE_FRAMES:
@@ -517,12 +709,19 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
             _frequency_identity_score(expected_frames, start, end, frequency, channel)
             for channel, frequency in enumerate(frequencies)
         ]
+        run_channel_rms, run_channel_peaks = _channel_energy_metrics(
+            expected_frames, start, end
+        )
         if all(
             _frequency_within_tolerance(
                 frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
             )
             and score >= MARKER_FREQUENCY_SCORE_MIN
-            for frequency, score in zip(frequencies, scores)
+            and rms > MARKER_MINIMUM_RMS
+            and peak > MARKER_MINIMUM_PEAK
+            for frequency, score, rms, peak in zip(
+                frequencies, scores, run_channel_rms, run_channel_peaks
+            )
         ):
             authenticated_runs.append((start, end))
     expected_outside_values = expected_peaks[:active_start] + expected_peaks[active_end_exclusive:]
@@ -536,9 +735,13 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         violations.append(
             f"expected_active_frames {expected_active_frames} < {MARKER_MIN_ACTIVE_FRAMES}"
         )
-    if expected_peak <= 0.05:
-        violations.append(f"expected_peak {expected_peak:.9f} <= 0.05")
-    for channel, (frequency, score) in enumerate(zip(channel_frequencies, channel_scores)):
+    if expected_peak <= MARKER_MINIMUM_PEAK:
+        violations.append(
+            f"expected_peak {expected_peak:.9f} <= {MARKER_MINIMUM_PEAK}"
+        )
+    for channel, (frequency, score, rms, peak) in enumerate(
+        zip(channel_frequencies, channel_scores, channel_rms, channel_peaks)
+    ):
         if not _frequency_within_tolerance(
             frequency, expected_frequency, MARKER_FREQUENCY_TOLERANCE_HZ
         ):
@@ -550,6 +753,14 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
             violations.append(
                 f"channel_{channel}_frequency_identity_score {score:.6f} < "
                 f"{MARKER_FREQUENCY_SCORE_MIN:.6f}"
+            )
+        if rms <= MARKER_MINIMUM_RMS:
+            violations.append(
+                f"channel_{channel}_rms {rms:.9f} <= {MARKER_MINIMUM_RMS:.9f}"
+            )
+        if peak <= MARKER_MINIMUM_PEAK:
+            violations.append(
+                f"channel_{channel}_peak {peak:.9f} <= {MARKER_MINIMUM_PEAK:.9f}"
             )
     if expected_outside_peak >= OUTSIDE_THRESHOLD:
         violations.append(
@@ -572,8 +783,12 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
         "channel_measured_frequency_hz": channel_frequencies,
         "frequency_identity_score": frequency_score,
         "channel_frequency_identity_score": channel_scores,
+        "channel_rms": channel_rms,
+        "channel_peak": channel_peaks,
         "marker_min_active_frames": MARKER_MIN_ACTIVE_FRAMES,
         "marker_frequency_tolerance_hz": MARKER_FREQUENCY_TOLERANCE_HZ,
+        "marker_minimum_rms": MARKER_MINIMUM_RMS,
+        "marker_minimum_peak": MARKER_MINIMUM_PEAK,
         "expected_active_threshold": ACTIVE_THRESHOLD,
         "other_silence_threshold": OUTSIDE_THRESHOLD,
         "valid": not violations,
@@ -591,6 +806,8 @@ def marker_command(expected_path: Path, other_path: Path, json_path: Path, human
                 f"channel_measured_frequency_hz: {result['channel_measured_frequency_hz']}",
                 f"frequency_identity_score: {result['frequency_identity_score']:.6f}",
                 f"channel_frequency_identity_score: {result['channel_frequency_identity_score']}",
+                f"channel_rms: {result['channel_rms']}",
+                f"channel_peak: {result['channel_peak']}",
                 f"expected_peak: {expected_peak:.9f}",
                 f"other_peak: {other_peak:.9f}",
                 f"expected_outside_peak: {expected_outside_peak:.9f}",
@@ -1224,8 +1441,25 @@ def self_test() -> None:
 
 
 def _metric_file(root: Path, raw_path: Path, volume: int) -> Path:
-    path = root / f"{raw_path.stem}.json"
-    _write_json(path, analyze_capture(raw_path, volume))
+    destination = next(
+        (
+            name
+            for name in MARKER_FREQUENCIES
+            if raw_path.name == f"{name}-{volume}.raw"
+        ),
+        None,
+    )
+    if destination is None:
+        raise ProbeError(
+            f"self-test metric capture does not identify a ratio leg: {raw_path.name}"
+        )
+    path = root / f"{destination}-{volume}-metrics.json"
+    metrics_command(
+        raw_path,
+        path,
+        root / f"{destination}-{volume}-metrics.txt",
+        volume,
+    )
     return path
 
 
