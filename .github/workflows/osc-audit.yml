@@ -57,3 +57,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: src-tauri
+
+      - name: Fail on unsound RustSec advisories
+        run: cargo audit --file src-tauri/Cargo.lock --deny unsound
