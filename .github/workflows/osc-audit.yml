@@ -1,0 +1,59 @@
+name: Pipe Deck fork Cargo Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Git branch, tag, or 40-character commit SHA to audit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipe-deck-osc-audit-${{ github.repository }}-${{ inputs.target_ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Nitjsefnie-OSC/Pipe-Deck
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Report requested target and checked-out SHA
+        env:
+          REQUESTED_TARGET: ${{ inputs.target_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          printf 'requested target: %s\n' "$REQUESTED_TARGET"
+          printf 'git rev-parse HEAD: %s\n' "$checked_out_sha"
+
+          if [[ ! "$checked_out_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git rev-parse HEAD did not produce a lowercase 40-character commit SHA: $checked_out_sha"
+            exit 1
+          fi
+
+          if [[ "$REQUESTED_TARGET" =~ ^[0-9a-f]{40}$ ]] && [[ "$checked_out_sha" != "$REQUESTED_TARGET" ]]; then
+            echo "::error::Requested commit $REQUESTED_TARGET resolved to $checked_out_sha"
+            exit 1
+          fi
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
