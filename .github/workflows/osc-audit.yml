@@ -61,4 +61,4 @@ jobs:
       # The base already contains glib 0.18.5 / RUSTSEC-2024-0429; keep this
       # sole baseline exception hard-coded while failing on every other unsound advisory.
       - name: Fail on new unsound RustSec advisories
-        run: cargo-audit --file src-tauri/Cargo.lock --deny unsound --ignore RUSTSEC-2024-0429
+        run: cargo-audit audit --file src-tauri/Cargo.lock --deny unsound --ignore RUSTSEC-2024-0429
