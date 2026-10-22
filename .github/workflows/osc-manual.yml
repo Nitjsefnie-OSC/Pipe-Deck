@@ -153,3 +153,32 @@ jobs:
 
       - name: make test
         run: make test
+
+      # Mirrors the upstream ci.yml Playwright leg on any target ref whose
+      # Makefile has the upstream test-e2e gate; absent on a legacy ref skips
+      # loudly, an empty recipe fails closed.
+      - name: Playwright e2e parity for target refs with the upstream gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          e2e_plan="$(make -n test-e2e 2>&1)" && probe_status=0 || probe_status=$?
+          if [[ $probe_status -ne 0 ]]; then
+            if grep -q 'No rule to make target' <<<"$e2e_plan"; then
+              message='SKIPPED make test-e2e: Makefile on this target ref has no test-e2e target; the upstream Playwright gate is unavailable on this legacy fork ref.'
+              echo "::warning::$message"
+              printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            message='FAILED make test-e2e probe: make -n test-e2e failed on this target ref in a way that is not a missing target.'
+            echo "::error::$message"
+            printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if grep -q "Nothing to be done for 'test-e2e'" <<<"$e2e_plan"; then
+            message='FAILED make test-e2e probe: the test-e2e target on this target ref has an empty recipe.'
+            echo "::error::$message"
+            printf '%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          npx playwright install --with-deps chromium
+          make test-e2e
