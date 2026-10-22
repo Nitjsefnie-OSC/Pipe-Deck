@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// Whether `system_name` is a Pipe Deck-owned virtual device eligible for
+/// effects/processing — excludes the internal `pipe-deck-feed-`/
+/// `pipe-deck-split-` shadow devices, which are plumbing, not user-facing
+/// targets. Moved here (from `pipewire::filter_chain`, issue #74) since it's
+/// a pure naming-convention check with no PipeWire dependency — every
+/// caller, including `core::engine::effects_ops`, can use it without
+/// importing anything Linux-specific.
+pub fn is_pipe_deck_device(system_name: &str) -> bool {
+    system_name.starts_with("pipe-deck-")
+        && !system_name.starts_with("pipe-deck-feed-")
+        && !system_name.starts_with("pipe-deck-split-")
+}
+
+/// The playback-direction (virtual output) effects-hosted node name for
+/// `device_system_name`. Moved here alongside `is_pipe_deck_device` (issue
+/// #74) — pure string derivation, no PipeWire dependency.
+pub fn effect_output_name_for_device(device_system_name: &str) -> String {
+    format!("effect_output.{device_system_name}")
+}
+
+/// The capture-direction (virtual input/mic) effects-hosted node name for
+/// `device_system_name` (PD-024) — the counterpart to
+/// `effect_output_name_for_device`.
+pub fn effect_input_name_for_device(device_system_name: &str) -> String {
+    format!("effect_input.{device_system_name}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
@@ -44,12 +71,18 @@ pub struct Device {
     pub volume_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
+    /// Not legacy: just `current_targets.first()`, kept for single-target consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_target: Option<String>,
+    /// Source of truth: every live target this output fans out to (can be more than one).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_targets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mix_sources: Vec<MixSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u32>,
 }
 
 /// A single contributor to a virtual-mic mix, with a gain that only affects
@@ -81,6 +114,315 @@ impl MixSource {
     }
 }
 
+/// A first-class routable processing node — Mixer, Fan-out, or a single
+/// effect DSP stage (PD-032). Distinct from `Device`/`Stream`: it has
+/// explicit, independently-addressable input/output ports rather than at
+/// most one implicit stream of audio in and out, which is exactly the
+/// property `Device` has no field for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingNode {
+    pub id: String,
+    pub label: String,
+    pub kind: ProcessingNodeKind,
+    /// Stable PipeWire node name, `pipe-deck-proc-{kind}-{slug}` (PD-032) —
+    /// deliberately a sibling prefix to `pipe-deck-feed-`/`pipe-deck-split-`,
+    /// never one of those two, so `is_pipe_deck_device` (this module)
+    /// recognizes it with no code change, while `pactl::list_pipe_deck_modules`/
+    /// `VirtualDeviceRegistry::discover_from_pactl` explicitly exclude it so
+    /// it never gets merged into `RuntimeGraph.devices`.
+    pub system_name: String,
+    #[serde(default)]
+    pub bypassed: bool,
+    /// Whether a real PipeWire object currently backs this node — the same
+    /// PD-017-style live-vs-persisted-only signal as `EffectChainConfig::live`.
+    /// Always `false` for `Stub` kinds, which are never backed by a PipeWire
+    /// object at all (see `ProcessingNodeKind::Stub`).
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<ProcessingNodePort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<ProcessingNodePort>,
+}
+
+/// One addressable input or output port on a `ProcessingNode`. `index` is
+/// the stable address a kind's own per-port config (e.g. `Mixer`'s
+/// `input_gains_percent`) is keyed by — never re-derived from position in
+/// `inputs`/`outputs`, so reordering ports never silently reassigns a gain
+/// to a different physical port.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingNodePort {
+    pub index: u32,
+    /// Device id or stream id currently wired to this port, if any.
+    /// Denormalized convenience mirroring `Device.current_target`;
+    /// `RuntimeGraph.links` is the source of truth, not this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_id: Option<String>,
+    /// Only set for a Mixer input wired to a stream peer: the raw stream id
+    /// that named this port's per-pair feed sink at connect time
+    /// (`ensure_feed_sink_for_mix_pair`'s `id` argument in `live.rs`). Stays
+    /// fixed even after `connected_id` is reconciled onto a replacement
+    /// stream instance (issue #304) — the feed sink itself is a live
+    /// PipeWire object PipeWire keeps re-parking new same-app sink-inputs
+    /// onto automatically, so gain/mute control must keep addressing it by
+    /// this original id, never by whatever `connected_id` currently shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<String>,
+}
+
+/// Disambiguates a `ProcessingNode`'s `inputs` list from its `outputs` list
+/// when addressing a port purely by `(system_name, index)` — needed because
+/// a node's input port 0 and output port 0 are different physical ports.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PortDirection {
+    Input,
+    Output,
+}
+
+/// What a `ProcessingNode` does, and its kind-specific config. One variant
+/// per kind, not one bespoke struct per kind, so `ProcessingNode` itself
+/// stays uniform across Mixer/Fan-out/EQ/stub (PD-032).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum ProcessingNodeKind {
+    #[serde(rename = "mixer")]
+    Mixer {
+        /// Per-input gain, indexed by `ProcessingNodePort.index`. This is
+        /// the single durable shaping point PD-032 relies on to avoid
+        /// reproducing #105's per-connection feed-sink mistake: it lives
+        /// once, on the node, and is never re-synthesized per edge.
+        input_gains_percent: Vec<u8>,
+    },
+    #[serde(rename = "fan_out")]
+    FanOut {
+        /// Plain output volume on the node's own backing sink — unlike
+        /// Mixer's per-input `gain`, this isn't a shaping control (Fan-Out
+        /// has no DSP), so it's named and modeled the same as a device's
+        /// `volume_percent`/`muted`, not gain.
+        #[serde(default = "default_mix_volume")]
+        volume_percent: u8,
+        #[serde(default)]
+        muted: bool,
+    },
+    /// A user-named collection of existing output devices, created in one
+    /// atomic gesture (issue #80) rather than wired connection-by-connection
+    /// like `FanOut` — functionally identical at the PipeWire level (same
+    /// growable-output, single-input shape, same `module-null-sink` +
+    /// `pw-link` fan-out mechanism), kept as its own kind rather than
+    /// reusing `FanOut` so the UI identity/icon and future divergence (e.g.
+    /// per-member volume) don't require reinterpreting an already-shipped
+    /// node kind (PD-035).
+    #[serde(rename = "group")]
+    Group {
+        #[serde(default = "default_mix_volume")]
+        volume_percent: u8,
+        #[serde(default)]
+        muted: bool,
+    },
+    #[serde(rename = "eq5band")]
+    Eq5Band {
+        #[serde(default)]
+        eq_sub: i32,
+        #[serde(default, alias = "eq_low")]
+        eq_bass: i32,
+        #[serde(default)]
+        eq_mid: i32,
+        #[serde(default)]
+        eq_treble: i32,
+        #[serde(default, alias = "eq_high")]
+        eq_air: i32,
+        #[serde(default)]
+        output_gain: i32,
+    },
+    /// Backed by PipeWire's builtin `delay` filter-chain filter (issue
+    /// #313). `delay_ms` is stored as an integer millisecond count (not
+    /// `f64` seconds) purely so this enum can keep deriving `Eq` — floats
+    /// don't implement it — and converted to the filter's `"Delay (s)"`
+    /// control (a plain seconds float) only at render time.
+    #[serde(rename = "delay")]
+    Delay {
+        #[serde(default)]
+        delay_ms: i32,
+        #[serde(default)]
+        feedback_percent: i32,
+        #[serde(default)]
+        feedforward_percent: i32,
+    },
+    /// Backed by PipeWire's builtin `clamp` filter-chain filter (issue
+    /// #311) — a hard-ceiling brick-wall clamp, NOT a real attack/release
+    /// dynamics limiter (PipeWire ships no builtin for that; see
+    /// `fx_capability::builtin_limiter`, which stays permanently `false`
+    /// and gates a separate, still-fully-blocked older concept; real
+    /// dynamics processing is tracked in issue #86). `ceiling_db`/`floor_db`
+    /// are each 0 (full scale, no clamp) down to more negative (more
+    /// aggressive) — `ceiling_db` bounds the positive peak, `floor_db` the
+    /// negative peak. `symmetric` locks `floor_db` to always equal
+    /// `ceiling_db` (the UI keeps them in sync while this is `true`); toggling
+    /// it off unlocks independent control, toggling it back on snaps
+    /// `floor_db` to whatever `ceiling_db` currently is.
+    #[serde(rename = "limiter")]
+    Limiter {
+        #[serde(default)]
+        ceiling_db: i32,
+        #[serde(default)]
+        floor_db: i32,
+        #[serde(default = "default_true")]
+        symmetric: bool,
+    },
+    /// Backed by PipeWire's builtin `bq_highpass` filter-chain filter (issue
+    /// #312) — the same biquad type already used inside `Eq5Band`'s chain,
+    /// just exposed as its own single-purpose node with a Freq/Resonance
+    /// pair instead of a 5-band chain. `freq_hz` defaults to `20` (not `0`)
+    /// so a freshly created node is already a valid, near-transparent
+    /// cutoff rather than a preflight-rejecting `0`; `resonance_x10` is
+    /// `Q * 10` (kept as an integer for the same `Eq`-deriving reason as
+    /// `Delay`'s `delay_ms`), defaulting to `7` (Q ≈ 0.7, a flat
+    /// Butterworth-ish response with no resonant peak).
+    #[serde(rename = "hpf")]
+    Hpf {
+        #[serde(default = "default_hpf_freq_hz")]
+        freq_hz: i32,
+        #[serde(default = "default_hpf_resonance_x10")]
+        resonance_x10: i32,
+    },
+    /// Backed by two of PipeWire's builtin `convolver` filter-chain filters
+    /// (issue #327, the IR half of #313 that never shipped) — a stereo,
+    /// non-crossfeeding convolution against a small bundled impulse-response
+    /// WAV (`fx_validate::reverb_ir_path`), each channel wet-signal blended
+    /// against its own dry signal via a `mixer` node. `mix_percent` is the
+    /// only runtime-adjustable control (0 = fully dry, 100 = fully wet) —
+    /// the IR itself (and so the decay length/character) is fixed at load
+    /// time, not a live parameter.
+    #[serde(rename = "reverb")]
+    Reverb {
+        #[serde(default)]
+        mix_percent: i32,
+    },
+    /// Backed entirely by PipeWire's builtin `mixer`/`copy` filters (issue
+    /// #314) — a mid/side widener: split into `mid = 0.5L+0.5R` and
+    /// `side = 0.5L-0.5R`, then recombined as `out_L = mid + width*side`,
+    /// `out_R = mid - width*side`. No `Invert` filter needed — a `mixer`
+    /// node's per-input `Gain` control accepts a negative value directly, so
+    /// subtraction is just a negative gain rather than a separate inversion
+    /// stage. `width_percent` of `100` exactly reconstructs the original
+    /// signal (`out_L=L`, `out_R=R` — this is the neutral/bypass value, NOT
+    /// `0`, unlike every other processing node kind so far); `0` fully
+    /// narrows to mono; above `100` widens further, up to `200` (side
+    /// doubled).
+    #[serde(rename = "widener")]
+    Widener {
+        #[serde(default = "default_widener_width_percent")]
+        width_percent: i32,
+    },
+    /// Backed by two of PipeWire's builtin `linear` filter-chain filters
+    /// (issue #16) — a classic stereo balance control: one independent gain
+    /// per channel, no mid/side math needed since the input is already a
+    /// stereo pair (unlike `Widener`, no `copy`/fan-out is needed either —
+    /// each raw input channel feeds exactly one `linear` node). `balance_percent`
+    /// is `0` at center (both channels full gain, the neutral/bypass value,
+    /// same convention as Delay/HPF/Reverb) — positive attenuates the left
+    /// channel (panning right), negative attenuates the right (panning
+    /// left); `100`/`-100` fully silence the opposite channel.
+    #[serde(rename = "pan")]
+    Pan {
+        #[serde(default)]
+        balance_percent: i32,
+    },
+    /// A real envelope-following compressor (issue #86) — PipeWire ships no
+    /// builtin dynamics primitive (verified against `man 7
+    /// libpipewire-module-filter-chain`), so unlike every other DSP kind
+    /// above this is never backed by a filter-chain builtin at all; it's
+    /// hand-written DSP (`dsp::CompressorProcessor`) hosted via
+    /// `pipewire::native_dsp_host` (issue #74's portable real-time host,
+    /// extended for a standalone-bus identity — see PD-052). `threshold_db`
+    /// is where gain reduction starts (more negative = more of the signal
+    /// gets compressed); `ratio_x10` is fixed-point (`10` == 1:1/no
+    /// compression, `40` == 4:1, up to very high values approximating a
+    /// limiter) so this struct can keep deriving `Eq`; `attack_ms`/
+    /// `release_ms` are the envelope follower's time constants;
+    /// `makeup_gain_db` is a final linear trim applied after gain
+    /// reduction, to bring the now-quieter peaks back up.
+    #[serde(rename = "compressor")]
+    Compressor {
+        #[serde(default = "default_compressor_threshold_db")]
+        threshold_db: i32,
+        #[serde(default = "default_compressor_ratio_x10")]
+        ratio_x10: i32,
+        #[serde(default = "default_compressor_attack_ms")]
+        attack_ms: i32,
+        #[serde(default = "default_compressor_release_ms")]
+        release_ms: i32,
+        #[serde(default)]
+        makeup_gain_db: i32,
+    },
+    /// One of issue #293's non-DSP effect kinds — addable to the
+    /// graph and wired like any other node, but a pure pass-through: never
+    /// backed by a PipeWire object (`ProcessingNode::live` is always
+    /// `false` here), rendered with a visible "Not implemented yet" label.
+    #[serde(rename = "stub")]
+    Stub { stub_kind: StubEffectKind },
+}
+
+fn default_hpf_freq_hz() -> i32 {
+    20
+}
+
+fn default_hpf_resonance_x10() -> i32 {
+    7
+}
+
+fn default_widener_width_percent() -> i32 {
+    100
+}
+
+fn default_compressor_threshold_db() -> i32 {
+    -18
+}
+
+fn default_compressor_ratio_x10() -> i32 {
+    40
+}
+
+fn default_compressor_attack_ms() -> i32 {
+    10
+}
+
+fn default_compressor_release_ms() -> i32 {
+    150
+}
+
+impl ProcessingNodeKind {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ProcessingNodeKind::Mixer { .. } => "mixer",
+            ProcessingNodeKind::FanOut { .. } => "fan_out",
+            ProcessingNodeKind::Group { .. } => "group",
+            ProcessingNodeKind::Eq5Band { .. } => "eq5band",
+            ProcessingNodeKind::Delay { .. } => "delay",
+            ProcessingNodeKind::Limiter { .. } => "limiter",
+            ProcessingNodeKind::Hpf { .. } => "hpf",
+            ProcessingNodeKind::Reverb { .. } => "reverb",
+            ProcessingNodeKind::Widener { .. } => "widener",
+            ProcessingNodeKind::Pan { .. } => "pan",
+            ProcessingNodeKind::Compressor { .. } => "compressor",
+            ProcessingNodeKind::Stub { .. } => "stub",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StubEffectKind {
+    NoiseGate,
+    Denoise,
+    DeEsser,
+    AutoGainLeveler,
+    PitchShift,
+    LoudnessNormalizer,
+    Saturation,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stream {
     pub id: String,
@@ -94,8 +436,6 @@ pub struct Stream {
     pub direction: StreamDirection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub current_targets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_name: Option<String>,
     #[serde(default)]
@@ -106,6 +446,10 @@ pub struct Stream {
     pub muted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_explanation: Option<RouteExplanation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +457,10 @@ pub struct Link {
     pub id: String,
     pub source_id: String,
     pub target_id: String,
+    /// True when this link represents a virtual sink's monitor port fanned
+    /// out to a real device, rather than a direct app/stream routing target
+    /// (issue #27) — lets the graph view style monitor paths distinctly.
+    pub is_monitor: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +493,16 @@ pub struct RuntimeGraph {
     pub notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_stream_identities: Vec<RecentStreamIdentity>,
+    /// Mixer/Fan-out/EQ/stub nodes (PD-032) — a separate top-level
+    /// collection, not folded into `devices`, since these have N
+    /// addressable ports rather than at most one implicit stream in/out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processing_nodes: Vec<ProcessingNode>,
+    /// `system_name` of the current default output device, if PipeWire has
+    /// one configured (issue #5's onboarding checklist reads this to check
+    /// "default output set" without new detection plumbing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_output_system_name: Option<String>,
 }
 
 fn default_data_source() -> String {
@@ -181,10 +539,43 @@ pub struct Preferences {
     pub dark_scheme: String,
     #[serde(default = "default_light_scheme")]
     pub light_scheme: String,
+    #[serde(default = "default_notice_duration_ms")]
+    pub notice_duration_ms: u32,
+    /// User-named tabs for the Soundboard (#127), each backing its own
+    /// folder of clips (Soundux-style — e.g. "Music", "SFX"). Empty until
+    /// the user adds one; no default board is created for them.
+    #[serde(default)]
+    pub soundboard_boards: Vec<crate::core::soundboard::SoundboardBoard>,
+    /// Behavior when the window's close (X) button is clicked: `"minimize"`
+    /// or `"quit"`. `None` means the user hasn't been asked yet — distinct
+    /// from any default — so the one-time prompt (#295) knows to fire.
+    #[serde(default)]
+    pub close_behavior: Option<String>,
+    /// Which manifest the in-app updater checks: "latest" (default, the
+    /// newest published non-prerelease GitHub release) or "prerelease"
+    /// (the newest tagged release regardless of prerelease status). Only
+    /// governs the manual "Check for updates" comparison and download-link
+    /// flow — the Tauri updater plugin's one-click AppImage auto-install
+    /// path always checks the stable channel (see src-tauri/tauri.conf.json's
+    /// static `plugins.updater.endpoints`).
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
+    /// Whether the first-run onboarding checklist has been dismissed
+    /// (issue #5). Never re-shown once true — no per-step tracking.
+    #[serde(default)]
+    pub onboarding_dismissed: bool,
 }
 
 fn default_theme_mode() -> String {
     "dark".into()
+}
+
+fn default_update_channel() -> String {
+    "latest".into()
+}
+
+fn default_notice_duration_ms() -> u32 {
+    5000
 }
 
 fn default_dark_scheme() -> String {
@@ -206,6 +597,11 @@ impl Default for Preferences {
             theme_mode: default_theme_mode(),
             dark_scheme: default_dark_scheme(),
             light_scheme: default_light_scheme(),
+            notice_duration_ms: default_notice_duration_ms(),
+            soundboard_boards: Vec::new(),
+            close_behavior: None,
+            update_channel: default_update_channel(),
+            onboarding_dismissed: false,
         }
     }
 }
@@ -268,18 +664,48 @@ impl ThemeColorOverrides {
     /// Merges these overrides on top of `base`, keeping `base`'s value for anything unset.
     pub fn resolve(&self, base: &ThemeColors) -> ThemeColors {
         ThemeColors {
-            background: self.background.clone().unwrap_or_else(|| base.background.clone()),
-            surface_1: self.surface_1.clone().unwrap_or_else(|| base.surface_1.clone()),
-            surface_2: self.surface_2.clone().unwrap_or_else(|| base.surface_2.clone()),
+            background: self
+                .background
+                .clone()
+                .unwrap_or_else(|| base.background.clone()),
+            surface_1: self
+                .surface_1
+                .clone()
+                .unwrap_or_else(|| base.surface_1.clone()),
+            surface_2: self
+                .surface_2
+                .clone()
+                .unwrap_or_else(|| base.surface_2.clone()),
             border: self.border.clone().unwrap_or_else(|| base.border.clone()),
             text: self.text.clone().unwrap_or_else(|| base.text.clone()),
-            text_muted: self.text_muted.clone().unwrap_or_else(|| base.text_muted.clone()),
-            accent_purple: self.accent_purple.clone().unwrap_or_else(|| base.accent_purple.clone()),
-            accent_teal: self.accent_teal.clone().unwrap_or_else(|| base.accent_teal.clone()),
-            accent_amber: self.accent_amber.clone().unwrap_or_else(|| base.accent_amber.clone()),
-            status_success: self.status_success.clone().unwrap_or_else(|| base.status_success.clone()),
-            status_warning: self.status_warning.clone().unwrap_or_else(|| base.status_warning.clone()),
-            status_danger: self.status_danger.clone().unwrap_or_else(|| base.status_danger.clone()),
+            text_muted: self
+                .text_muted
+                .clone()
+                .unwrap_or_else(|| base.text_muted.clone()),
+            accent_purple: self
+                .accent_purple
+                .clone()
+                .unwrap_or_else(|| base.accent_purple.clone()),
+            accent_teal: self
+                .accent_teal
+                .clone()
+                .unwrap_or_else(|| base.accent_teal.clone()),
+            accent_amber: self
+                .accent_amber
+                .clone()
+                .unwrap_or_else(|| base.accent_amber.clone()),
+            status_success: self
+                .status_success
+                .clone()
+                .unwrap_or_else(|| base.status_success.clone()),
+            status_warning: self
+                .status_warning
+                .clone()
+                .unwrap_or_else(|| base.status_warning.clone()),
+            status_danger: self
+                .status_danger
+                .clone()
+                .unwrap_or_else(|| base.status_danger.clone()),
         }
     }
 }
@@ -321,7 +747,11 @@ pub struct VirtualDeviceSpec {
     pub multi: bool,
     /// Physical capture device system names mixed into this virtual input (e.g. headset mic),
     /// each with its own gain (applied via a per-pair feed sink, not the source's own volume).
-    #[serde(default, deserialize_with = "deserialize_mix_source_specs", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_mix_source_specs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub mix_sources: Vec<MixSourceSpec>,
 }
 
@@ -370,8 +800,172 @@ where
         .collect())
 }
 
+/// Persisted counterpart to `ProcessingNode` (PD-032) — config.yaml storage,
+/// analogous to `VirtualDeviceSpec` for plain virtual devices. Wiring
+/// (`input_sources`/`output_targets`) is stored directly on the spec, the
+/// same way `VirtualDeviceSpec.mix_sources` already stores a mic-mix's
+/// contributors, rather than through `Profile.routing_intents` — a
+/// processing node's own configuration, like a virtual device's own
+/// existence, isn't something that varies by active profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingNodeSpec {
+    pub id: String,
+    pub slug: String,
+    pub label: String,
+    pub created_at: String,
+    pub kind: ProcessingNodeSpecKind,
+    /// System names feeding this node's input port(s), addressed by
+    /// position (index 0 == input port 0, etc.) — one entry per occupied
+    /// port. Not every kind uses more than one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_sources: Vec<ProcessingNodePortSpec>,
+    /// System names this node's output port currently feeds (plural since a
+    /// `FanOut` node's single input duplicates out to several).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_targets: Vec<String>,
+    /// Keeps the node wired exactly as-is but passes audio through
+    /// unprocessed — same "isolate this one out without touching
+    /// connections" meaning as `EffectChainConfig::bypassed` for a
+    /// device-attached effect. Only `Eq5Band` currently enforces this (it
+    /// reuses that same neutral-live-params mechanism); persisted for every
+    /// kind so the flag round-trips once a real-DSP stub kind picks it up
+    /// too, but Mixer/FanOut/Stub have no backend behavior change yet —
+    /// there's no "unprocessed" state for a node that doesn't itself
+    /// shape the signal beyond routing/summing it.
+    #[serde(default)]
+    pub bypassed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessingNodePortSpec {
+    pub source_system_name: String,
+    /// Only meaningful for `Mixer` — other kinds ignore this and leave it at
+    /// the default.
+    #[serde(default = "default_mix_volume")]
+    pub gain_percent: u8,
+    #[serde(default)]
+    pub muted: bool,
+    /// Captured only when `source_system_name` names a stream peer (the
+    /// `STREAM_PEER_PREFIX` synthetic form): the stream's app identity at
+    /// connect time, so a later refresh can re-resolve this port onto a
+    /// same-app replacement stream instance (a browser tab reload, etc. —
+    /// issue #304) even though the original stream's live PipeWire id is
+    /// permanently gone by then. `None` for a device/processing-node peer,
+    /// which re-resolves by its own stable `system_name` instead and needs
+    /// no identity fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_stream_identity: Option<crate::core::stream_identity::StreamIdentityKey>,
+}
+
+impl ProcessingNodePortSpec {
+    pub fn unity(source_system_name: impl Into<String>) -> Self {
+        Self {
+            source_system_name: source_system_name.into(),
+            gain_percent: default_mix_volume(),
+            muted: false,
+            source_stream_identity: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum ProcessingNodeSpecKind {
+    #[serde(rename = "mixer")]
+    Mixer,
+    #[serde(rename = "fan_out")]
+    FanOut {
+        #[serde(default = "default_mix_volume")]
+        volume_percent: u8,
+        #[serde(default)]
+        muted: bool,
+    },
+    #[serde(rename = "group")]
+    Group {
+        #[serde(default = "default_mix_volume")]
+        volume_percent: u8,
+        #[serde(default)]
+        muted: bool,
+    },
+    #[serde(rename = "eq5band")]
+    Eq5Band {
+        #[serde(default)]
+        eq_sub: i32,
+        #[serde(default, alias = "eq_low")]
+        eq_bass: i32,
+        #[serde(default)]
+        eq_mid: i32,
+        #[serde(default)]
+        eq_treble: i32,
+        #[serde(default, alias = "eq_high")]
+        eq_air: i32,
+        #[serde(default)]
+        output_gain: i32,
+    },
+    #[serde(rename = "delay")]
+    Delay {
+        #[serde(default)]
+        delay_ms: i32,
+        #[serde(default)]
+        feedback_percent: i32,
+        #[serde(default)]
+        feedforward_percent: i32,
+    },
+    #[serde(rename = "limiter")]
+    Limiter {
+        #[serde(default)]
+        ceiling_db: i32,
+        #[serde(default)]
+        floor_db: i32,
+        #[serde(default = "default_true")]
+        symmetric: bool,
+    },
+    #[serde(rename = "hpf")]
+    Hpf {
+        #[serde(default = "default_hpf_freq_hz")]
+        freq_hz: i32,
+        #[serde(default = "default_hpf_resonance_x10")]
+        resonance_x10: i32,
+    },
+    #[serde(rename = "reverb")]
+    Reverb {
+        #[serde(default)]
+        mix_percent: i32,
+    },
+    #[serde(rename = "widener")]
+    Widener {
+        #[serde(default = "default_widener_width_percent")]
+        width_percent: i32,
+    },
+    #[serde(rename = "pan")]
+    Pan {
+        #[serde(default)]
+        balance_percent: i32,
+    },
+    #[serde(rename = "compressor")]
+    Compressor {
+        #[serde(default = "default_compressor_threshold_db")]
+        threshold_db: i32,
+        #[serde(default = "default_compressor_ratio_x10")]
+        ratio_x10: i32,
+        #[serde(default = "default_compressor_attack_ms")]
+        attack_ms: i32,
+        #[serde(default = "default_compressor_release_ms")]
+        release_ms: i32,
+        #[serde(default)]
+        makeup_gain_db: i32,
+    },
+    #[serde(rename = "stub")]
+    Stub { stub_kind: StubEffectKind },
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_config_version")]
     pub version: u32,
     pub active_profile: Option<String>,
     pub profile_index: Vec<ProfileIndexEntry>,
@@ -385,6 +979,12 @@ pub struct AppConfig {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub virtual_devices: Vec<VirtualDeviceSpec>,
+    /// Mixer/Fan-out/EQ/stub nodes (PD-032). Migrated from legacy
+    /// `VirtualDeviceSpec.mix_sources` by
+    /// `config::store::migrate_mix_sources_to_mixer_nodes`, called from
+    /// `ConfigStore::load_config`.
+    #[serde(default)]
+    pub processing_nodes: Vec<ProcessingNodeSpec>,
     #[serde(default)]
     pub plugins: std::collections::HashMap<String, PluginEntry>,
 }
@@ -410,9 +1010,20 @@ pub enum ActionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    LowerPriority,
+    ManualOverride,
+    MissingMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkippedCandidate {
     pub rule_key: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    pub kind: SkipReason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,15 +1080,32 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleCondition {
-    AppName { value: String },
-    Executable { value: String },
-    WindowClass { value: String },
-    MediaName { value: String },
-    Direction { value: StreamDirection },
-    Category { value: String },
+    AppName {
+        value: String,
+    },
+    Executable {
+        value: String,
+    },
+    WindowClass {
+        value: String,
+    },
+    MediaName {
+        value: String,
+    },
+    Direction {
+        value: StreamDirection,
+    },
+    Category {
+        value: String,
+    },
     /// Matches when app name, executable, or PipeWire node name equals `value` (case-insensitive).
-    Identity { value: String },
-    Regex { field: String, pattern: String },
+    Identity {
+        value: String,
+    },
+    Regex {
+        field: String,
+        pattern: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -488,17 +1116,12 @@ pub struct RuleAction {
     pub target_system_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackPolicy {
+    #[default]
     KeepCurrent,
     SafeDefault,
-}
-
-impl Default for FallbackPolicy {
-    fn default() -> Self {
-        Self::KeepCurrent
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -518,32 +1141,10 @@ pub struct SimulationResult {
     pub would_target_device_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeviceRouteRule {
-    pub source_system_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_system_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub target_system_names: Vec<String>,
-    #[serde(default)]
-    pub safeguards: RuleSafeguards,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingRulesConfig {
     #[serde(default)]
     pub stream_rules: Vec<StreamRouteRule>,
-    #[serde(default)]
-    pub device_rules: Vec<DeviceRouteRule>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeviceRouteIntent {
-    pub source_device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub target_device_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -553,6 +1154,15 @@ pub struct RoutingIntent {
     pub target_device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_device_ids: Vec<String>,
+    /// `system_name` of the target device at capture time, e.g.
+    /// `bluez_output.AA_BB_CC_DD_EE_FF.1` or an ALSA card name. A hardware
+    /// device's PipeWire node id is not stable across a BT/USB
+    /// disconnect-reconnect cycle (#13, #14) — `system_name` is, so it's
+    /// used to re-resolve `target_device_id` to whatever the live id
+    /// happens to be when the intent is applied. `None` for profiles saved
+    /// before this field existed; resolution then falls back to the raw id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_system_name: Option<String>,
 }
 
 impl RoutingIntent {
@@ -561,15 +1171,6 @@ impl RoutingIntent {
             return self.target_device_ids.clone();
         }
         self.target_device_id.clone().into_iter().collect()
-    }
-}
-
-impl Stream {
-    pub fn resolved_targets(&self) -> Vec<String> {
-        if !self.current_targets.is_empty() {
-            return self.current_targets.clone();
-        }
-        self.current_target.clone().into_iter().collect()
     }
 }
 
@@ -583,24 +1184,6 @@ impl Device {
             return self.current_targets.clone();
         }
         self.current_target.clone().into_iter().collect()
-    }
-}
-
-impl DeviceRouteIntent {
-    pub fn target_ids(&self) -> Vec<String> {
-        if !self.target_device_ids.is_empty() {
-            return self.target_device_ids.clone();
-        }
-        self.target_device_id.clone().into_iter().collect()
-    }
-}
-
-impl DeviceRouteRule {
-    pub fn target_system_names_resolved(&self) -> Vec<String> {
-        if !self.target_system_names.is_empty() {
-            return self.target_system_names.clone();
-        }
-        self.target_system_name.clone().into_iter().collect()
     }
 }
 
@@ -627,6 +1210,12 @@ pub struct VolumeStateEntry {
     pub volume_percent: u8,
     #[serde(default)]
     pub muted: bool,
+    /// `system_name` of the device this entry was captured for — same
+    /// stable-identity fallback as `RoutingIntent::target_system_name`
+    /// (#13, #14), used to re-resolve the id when it no longer matches a
+    /// live device (e.g. after a BT/USB reconnect assigned a new one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_name: Option<String>,
 }
 
 /// A single dynamics processing block (compressor, limiter, or noise gate).
@@ -703,6 +1292,97 @@ pub enum EffectStage {
         #[serde(default)]
         output_gain: i32,
     },
+    /// Backed by PipeWire's builtin `delay` filter-chain filter (issue
+    /// #313) — only ever used to carry a `ProcessingNodeKind::Delay` node's
+    /// params through the existing `EffectChainConfig`/native-host transport
+    /// (`live.rs`'s `Delay` arm), never as a device-attached chain stage a
+    /// user picks alongside `Eq5Band`.
+    #[serde(rename = "delay")]
+    Delay {
+        id: String,
+        #[serde(default)]
+        delay_ms: i32,
+        #[serde(default)]
+        feedback_percent: i32,
+        #[serde(default)]
+        feedforward_percent: i32,
+    },
+    /// Backed by PipeWire's builtin `clamp` filter-chain filter (issue
+    /// #311) — same "carries a processing node's params through the
+    /// existing transport" role as `Delay` above. Distinct from this
+    /// struct's own `limiter: DynamicsStage` field just below, which is the
+    /// older, still fully-blocked device-attached dynamics-limiter concept —
+    /// this variant and that field are unrelated despite the shared name.
+    #[serde(rename = "limiter")]
+    Limiter {
+        id: String,
+        #[serde(default)]
+        ceiling_db: i32,
+        #[serde(default)]
+        floor_db: i32,
+        #[serde(default = "default_true")]
+        symmetric: bool,
+    },
+    /// Backed by PipeWire's builtin `bq_highpass` filter-chain filter (issue
+    /// #312) — same "carries a processing node's params through the
+    /// existing transport" role as `Delay`/`Limiter` above.
+    #[serde(rename = "hpf")]
+    Hpf {
+        id: String,
+        #[serde(default = "default_hpf_freq_hz")]
+        freq_hz: i32,
+        #[serde(default = "default_hpf_resonance_x10")]
+        resonance_x10: i32,
+    },
+    /// Backed by two of PipeWire's builtin `convolver` filters (issue #327)
+    /// — same "carries a processing node's params through the existing
+    /// transport" role as `Delay`/`Limiter` above.
+    #[serde(rename = "reverb")]
+    Reverb {
+        id: String,
+        #[serde(default)]
+        mix_percent: i32,
+    },
+    /// Backed by PipeWire's builtin `mixer`/`copy` filters (issue #314) —
+    /// same "carries a processing node's params through the existing
+    /// transport" role as `Delay`/`Limiter` above.
+    #[serde(rename = "widener")]
+    Widener {
+        id: String,
+        #[serde(default = "default_widener_width_percent")]
+        width_percent: i32,
+    },
+    /// Backed by PipeWire's builtin `linear` filters (issue #16) — same
+    /// "carries a processing node's params through the existing transport"
+    /// role as `Delay`/`Limiter` above.
+    #[serde(rename = "pan")]
+    Pan {
+        id: String,
+        #[serde(default)]
+        balance_percent: i32,
+    },
+    /// Carries a `ProcessingNodeKind::Compressor` node's params through the
+    /// existing `EffectChainConfig` transport (issue #86) — unlike every
+    /// other variant above, this one is *never* rendered by
+    /// `fx_validate::render_module_args` (there's no builtin filter-chain
+    /// dynamics primitive to render into): `backend::linux::live`'s
+    /// `ProcessingNodeKind::Compressor` arm dispatches it straight to
+    /// `pipewire::native_dsp_host` instead. See `dsp::CompressorProcessor`
+    /// for the actual DSP and PD-052 for the hosting design.
+    #[serde(rename = "compressor")]
+    Compressor {
+        id: String,
+        #[serde(default = "default_compressor_threshold_db")]
+        threshold_db: i32,
+        #[serde(default = "default_compressor_ratio_x10")]
+        ratio_x10: i32,
+        #[serde(default = "default_compressor_attack_ms")]
+        attack_ms: i32,
+        #[serde(default = "default_compressor_release_ms")]
+        release_ms: i32,
+        #[serde(default)]
+        makeup_gain_db: i32,
+    },
 }
 
 impl Default for EffectStage {
@@ -723,12 +1403,26 @@ impl EffectStage {
     pub fn kind(&self) -> &'static str {
         match self {
             EffectStage::Eq5Band { .. } => "eq5band",
+            EffectStage::Delay { .. } => "delay",
+            EffectStage::Limiter { .. } => "limiter",
+            EffectStage::Hpf { .. } => "hpf",
+            EffectStage::Reverb { .. } => "reverb",
+            EffectStage::Widener { .. } => "widener",
+            EffectStage::Pan { .. } => "pan",
+            EffectStage::Compressor { .. } => "compressor",
         }
     }
 
     pub fn id(&self) -> &str {
         match self {
             EffectStage::Eq5Band { id, .. } => id,
+            EffectStage::Delay { id, .. } => id,
+            EffectStage::Limiter { id, .. } => id,
+            EffectStage::Hpf { id, .. } => id,
+            EffectStage::Reverb { id, .. } => id,
+            EffectStage::Widener { id, .. } => id,
+            EffectStage::Pan { id, .. } => id,
+            EffectStage::Compressor { id, .. } => id,
         }
     }
 }
@@ -745,6 +1439,64 @@ pub struct EqStageParams {
     pub eq_treble: i32,
     pub eq_air: i32,
     pub output_gain: i32,
+}
+
+/// Flattened params for a chain's `Delay` stage, mirroring `EqStageParams`.
+/// Unlike `eq_stage()`, callers check `Option::is_some()` to decide whether
+/// to render the delay filter graph at all instead of the EQ one — a config
+/// is never expected to carry both stage kinds at once (see `live.rs`'s
+/// `Delay` processing-node arm, which builds a single-stage config).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DelayStageParams {
+    pub delay_ms: i32,
+    pub feedback_percent: i32,
+    pub feedforward_percent: i32,
+}
+
+/// Flattened params for a chain's `Limiter` stage, mirroring `DelayStageParams`.
+/// Unrelated to this struct's own `limiter: DynamicsStage` field below —
+/// that's the older, still fully-blocked device-attached dynamics-limiter
+/// concept; this is the new `Clamp`-backed processing node's params.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimiterStageParams {
+    pub ceiling_db: i32,
+    pub floor_db: i32,
+}
+
+/// Flattened params for a chain's `Hpf` stage, mirroring `LimiterStageParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HpfStageParams {
+    pub freq_hz: i32,
+    pub resonance_x10: i32,
+}
+
+/// Flattened params for a chain's `Reverb` stage, mirroring `LimiterStageParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReverbStageParams {
+    pub mix_percent: i32,
+}
+
+/// Flattened params for a chain's `Widener` stage, mirroring `LimiterStageParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WidenerStageParams {
+    pub width_percent: i32,
+}
+
+/// Flattened params for a chain's `Pan` stage, mirroring `LimiterStageParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanStageParams {
+    pub balance_percent: i32,
+}
+
+/// Flattened params for a chain's `Compressor` stage, mirroring
+/// `LimiterStageParams`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressorStageParams {
+    pub threshold_db: i32,
+    pub ratio_x10: i32,
+    pub attack_ms: i32,
+    pub release_ms: i32,
+    pub makeup_gain_db: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -767,6 +1519,21 @@ pub struct EffectChainConfig {
     /// individual stages.
     #[serde(default)]
     pub bypassed: bool,
+    /// Whether the user has explicitly confirmed live processing for this
+    /// chain (a real `apply_effect_chain_structural` succeeded and hasn't
+    /// been reverted since) — distinct from `is_active()`, which only means
+    /// "something is configured." PD-017 §1 requires restore to never
+    /// silently turn on live processing that wasn't explicitly confirmed;
+    /// before native transport this was inferred from a restart-based
+    /// conf.d file surviving on disk across restarts, but native transport's
+    /// liveness is in-memory in the daemon process and doesn't survive that
+    /// way, so this flag is the persisted signal instead. `#[serde(default)]`
+    /// means every pre-existing profile deserializes as `false` — an
+    /// accepted one-time transition: those chains stay persist-only until
+    /// re-applied once after upgrading, rather than guessing at legacy
+    /// conf-file state.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Accepts either the current `{ stages: [...], ... }` shape or a pre-PD-025
@@ -805,6 +1572,8 @@ impl<'de> Deserialize<'de> for EffectChainConfig {
             noise_gate: DynamicsStage,
             #[serde(default)]
             bypassed: bool,
+            #[serde(default)]
+            live: bool,
         }
 
         let raw = OnDisk::deserialize(deserializer)?;
@@ -837,6 +1606,7 @@ impl<'de> Deserialize<'de> for EffectChainConfig {
             limiter: raw.limiter,
             noise_gate: raw.noise_gate,
             bypassed: raw.bypassed,
+            live: raw.live,
         })
     }
 }
@@ -847,7 +1617,10 @@ impl EffectChainConfig {
     /// effect on audio without discarding its configured settings, so a
     /// bypassed-but-configured chain still counts as active here.
     pub fn is_active(&self) -> bool {
-        self.compressor.enabled || self.limiter.enabled || self.noise_gate.enabled || !self.stages.is_empty()
+        self.compressor.enabled
+            || self.limiter.enabled
+            || self.noise_gate.enabled
+            || !self.stages.is_empty()
     }
 
     /// The chain's `Eq5Band` stage, flattened — "no stage" is treated the
@@ -856,13 +1629,18 @@ impl EffectChainConfig {
     // but this is deliberately shaped to keep working once a second variant
     // exists (see `EffectStage`'s doc comment) — `.map().next()` would need
     // rewriting again at that point instead of just adding a match arm.
-    #[allow(clippy::unnecessary_find_map)]
     pub fn eq_stage(&self) -> EqStageParams {
         self.stages
             .iter()
             .find_map(|stage| match stage {
                 EffectStage::Eq5Band {
-                    eq_sub, eq_bass, eq_mid, eq_treble, eq_air, output_gain, ..
+                    eq_sub,
+                    eq_bass,
+                    eq_mid,
+                    eq_treble,
+                    eq_air,
+                    output_gain,
+                    ..
                 } => Some(EqStageParams {
                     eq_sub: *eq_sub,
                     eq_bass: *eq_bass,
@@ -871,8 +1649,162 @@ impl EffectChainConfig {
                     eq_air: *eq_air,
                     output_gain: *output_gain,
                 }),
+                EffectStage::Delay { .. }
+                | EffectStage::Limiter { .. }
+                | EffectStage::Hpf { .. }
+                | EffectStage::Reverb { .. }
+                | EffectStage::Widener { .. }
+                | EffectStage::Pan { .. }
+                | EffectStage::Compressor { .. } => None,
             })
             .unwrap_or_default()
+    }
+
+    /// The chain's `Delay` stage, flattened — `None` (rather than a neutral
+    /// default) so callers like `fx_validate::render_module_args` can tell
+    /// "render the delay filter graph" apart from "render the EQ one",
+    /// since a config only ever carries one processing-node stage kind.
+    pub fn delay_stage(&self) -> Option<DelayStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Delay {
+                delay_ms,
+                feedback_percent,
+                feedforward_percent,
+                ..
+            } => Some(DelayStageParams {
+                delay_ms: *delay_ms,
+                feedback_percent: *feedback_percent,
+                feedforward_percent: *feedforward_percent,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Pan { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Limiter` stage, flattened — mirrors `delay_stage()`.
+    /// Not to be confused with the `limiter: DynamicsStage` field above,
+    /// which this method does not read at all.
+    pub fn limiter_stage(&self) -> Option<LimiterStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Limiter {
+                ceiling_db,
+                floor_db,
+                ..
+            } => Some(LimiterStageParams {
+                ceiling_db: *ceiling_db,
+                floor_db: *floor_db,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Pan { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Hpf` stage, flattened — mirrors `limiter_stage()`.
+    pub fn hpf_stage(&self) -> Option<HpfStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Hpf {
+                freq_hz,
+                resonance_x10,
+                ..
+            } => Some(HpfStageParams {
+                freq_hz: *freq_hz,
+                resonance_x10: *resonance_x10,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Pan { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Reverb` stage, flattened — mirrors `limiter_stage()`.
+    pub fn reverb_stage(&self) -> Option<ReverbStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Reverb { mix_percent, .. } => Some(ReverbStageParams {
+                mix_percent: *mix_percent,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Pan { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Widener` stage, flattened — mirrors `limiter_stage()`.
+    pub fn widener_stage(&self) -> Option<WidenerStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Widener { width_percent, .. } => Some(WidenerStageParams {
+                width_percent: *width_percent,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Pan { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Pan` stage, flattened — mirrors `limiter_stage()`.
+    pub fn pan_stage(&self) -> Option<PanStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Pan {
+                balance_percent, ..
+            } => Some(PanStageParams {
+                balance_percent: *balance_percent,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Compressor { .. } => None,
+        })
+    }
+
+    /// The chain's `Compressor` stage, flattened — mirrors `limiter_stage()`.
+    pub fn compressor_stage(&self) -> Option<CompressorStageParams> {
+        self.stages.iter().find_map(|stage| match stage {
+            EffectStage::Compressor {
+                threshold_db,
+                ratio_x10,
+                attack_ms,
+                release_ms,
+                makeup_gain_db,
+                ..
+            } => Some(CompressorStageParams {
+                threshold_db: *threshold_db,
+                ratio_x10: *ratio_x10,
+                attack_ms: *attack_ms,
+                release_ms: *release_ms,
+                makeup_gain_db: *makeup_gain_db,
+            }),
+            EffectStage::Eq5Band { .. }
+            | EffectStage::Delay { .. }
+            | EffectStage::Limiter { .. }
+            | EffectStage::Hpf { .. }
+            | EffectStage::Reverb { .. }
+            | EffectStage::Widener { .. }
+            | EffectStage::Pan { .. } => None,
+        })
     }
 }
 
@@ -967,6 +1899,8 @@ impl VirtualDeviceInfo {
             current_target: None,
             current_targets: Vec::new(),
             mix_sources: Vec::new(),
+            sample_rate: None,
+            channels: None,
         }
     }
 }
@@ -1103,4 +2037,71 @@ pub struct RoutingSuggestion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub received_at: String,
+}
+
+/// One node along a signal path submitted for latency-ping measurement
+/// (issue #223). `id` is a `Device`/`Stream`/`ProcessingNode` id from the
+/// frontend's own graph traversal; `system_name` is only needed as a
+/// resolution fallback for `ProcessingNode`s, whose `id` has no numeric
+/// relationship to the live PipeWire node id the way `Device`/`Stream`'s
+/// `"node-{n}"` ids do (see `backend/linux/pw_dump.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatencyPathNode {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_name: Option<String>,
+}
+
+/// Theoretical/buffering latency contribution of a single node along a
+/// measured path, from `pw-top -b`'s QUANT/RATE columns. `latency_ms` (and
+/// `quantum`/`rate`) are `None` when the node has no current reading (not
+/// actively running, or not found live in PipeWire) — distinct from a real
+/// zero-latency reading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LatencyHop {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+}
+
+/// Result of measuring theoretical latency along a path (issue #223).
+/// `total_latency_ms` is `None` whenever any hop lacks data — a partial sum
+/// would misrepresent the path, so per-hop data is still returned for the UI
+/// to show exactly which hop is the gap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LatencyPingResult {
+    pub hops: Vec<LatencyHop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_latency_ms: Option<f64>,
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_pipe_deck_virtual_devices() {
+        assert!(is_pipe_deck_device("pipe-deck-game-mix"));
+        assert!(!is_pipe_deck_device("pipe-deck-split-firefox"));
+        assert!(!is_pipe_deck_device("pipe-deck-feed-firefox"));
+        assert!(!is_pipe_deck_device("alsa_output.pci"));
+    }
+
+    #[test]
+    fn derives_effect_node_names() {
+        assert_eq!(
+            effect_output_name_for_device("pipe-deck-game-mix"),
+            "effect_output.pipe-deck-game-mix"
+        );
+        assert_eq!(
+            effect_input_name_for_device("pipe-deck-mic"),
+            "effect_input.pipe-deck-mic"
+        );
+    }
 }

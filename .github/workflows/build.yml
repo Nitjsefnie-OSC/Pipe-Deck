@@ -16,14 +16,23 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-22.04
+    # 24.04, not 22.04: 22.04's apt libpipewire-0.3-dev is 0.3.48, which
+    # predates PipeWire 0.3.65 converting spa_meta_first/spa_meta_region_is_valid
+    # and the spa_video_info_raw flags/modifier fields from header macros to
+    # real symbols — the pinned `pipewire`/`libspa` v0.10 crates (see
+    # src-tauri/Cargo.toml, issue #148) fail to compile without them. 24.04's
+    # apt libpipewire-0.3-dev is 1.0.5, well past that threshold. This is a
+    # compile-time-only requirement — the daemon only calls stable, long-lived
+    # core client APIs (pw_context_load_module et al.), so it doesn't raise
+    # the effective minimum PipeWire version users need at runtime.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -51,7 +60,11 @@ jobs:
             build-essential \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            pkg-config \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            squashfs-tools
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -60,7 +73,7 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -78,49 +91,46 @@ jobs:
             "${{ steps.version.outputs.tag }}" \
             "${{ steps.version.outputs.version }}"
 
+      - name: Build maintainer checklist for release notes
+        id: checklist
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "checklist<<CHECKLIST_EOF"
+            echo "> **📋 Before publishing — you just built \`${{ steps.version.outputs.tag }}\`:**"
+            echo "> - [ ] Close the milestone for this release (if one exists) now that it's shipping."
+            echo "> - [ ] Create the milestone for whatever ships next, so incoming issues have somewhere to land."
+            echo "> - [ ] Milestone names don't have to be final — rename either one later if the next version number changes. See [Milestones & Releases](https://github.com/LunarVagabond/Pipe-Deck/blob/main/docs/project-management/milestones-and-releases.md)."
+            echo ""
+            echo "---"
+            echo "CHECKLIST_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build user feedback footer for release notes
+        id: feedback
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "feedback<<FEEDBACK_EOF"
+            echo "**Found something annoying?** [Open an issue](https://github.com/LunarVagabond/Pipe-Deck/issues/new/choose)."
+            echo "**Have an idea?** [Start a Discussion](https://github.com/LunarVagabond/Pipe-Deck/discussions)."
+            echo "**Want to hang out?** Join [Dev Syndicate on Discord](https://discord.gg/cHtuCFkRRm)."
+            echo ""
+            echo "---"
+            echo "FEEDBACK_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish draft GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Pipe Deck ${{ steps.version.outputs.tag }}
+          body: |
+            ${{ steps.checklist.outputs.checklist }}
+            ${{ steps.feedback.outputs.feedback }}
           draft: true
           prerelease: false
           generate_release_notes: true
           files: release-files/*
-
-  flatpak-build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    # Best-effort: a Flatpak build issue (Flathub availability, sandbox
-    # flakiness) should never block the native-bundle release above.
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Parse release tag
-        id: version
-        shell: bash
-        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Build Flatpak bundle
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          bundle: pipe-deck-${{ steps.version.outputs.tag }}.flatpak
-          manifest-path: flatpak/com.pipedeck.PipeDeck.yml
-
-      - name: Upload Flatpak bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flatpak-bundle
-          path: "*.flatpak"
-
-      - name: Attach Flatpak bundle to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          draft: true
-          prerelease: false
-          files: "*.flatpak"

@@ -1,15 +1,15 @@
 use crate::core::models::{
-    Device, DeviceDirection, DeviceKind, DeviceRouteRule, FallbackPolicy, RouteSource, Rule,
-    RuleCondition, RuntimeGraph, Stream, StreamDirection, StreamRouteRule,
+    Device, DeviceDirection, DeviceKind, FallbackPolicy, RouteSource, Rule, RuleCondition,
+    RuntimeGraph, Stream, StreamDirection, StreamRouteRule,
 };
 use crate::core::routing_rules::find_device_by_system_name;
 use crate::core::rules::CandidateRule;
-use crate::backend::AudioBackend;
 use regex::Regex;
-use std::collections::HashSet;
 
+// Counterpart: `inferStreamCategory` in src/utils/ruleConditions.ts — keep the
+// two heuristics in sync when editing either one.
 pub fn default_category(stream: &Stream) -> Option<&'static str> {
-    let executable = stream.executable.as_deref().unwrap_or("");
+    let executable = stream.executable.as_deref().unwrap_or("").to_lowercase();
     let app_lower = stream.app_name.to_lowercase();
 
     if executable.contains("steam") || app_lower.contains("steam") {
@@ -36,7 +36,10 @@ pub fn default_category(stream: &Stream) -> Option<&'static str> {
     None
 }
 
-pub fn stream_matches_persisted_rule(stream: &Stream, rule: &StreamRouteRule) -> Option<Vec<String>> {
+pub fn stream_matches_persisted_rule(
+    stream: &Stream,
+    rule: &StreamRouteRule,
+) -> Option<Vec<String>> {
     if rule.app_name.is_none() && rule.executable.is_none() && rule.media_name.is_none() {
         return None;
     }
@@ -191,6 +194,8 @@ pub(crate) fn collect_missing_metadata_skips(
                 crate::core::models::SkippedCandidate {
                     rule_key: rule.name.clone(),
                     reason,
+                    rule_id: Some(rule.id.clone()),
+                    kind: crate::core::models::SkipReason::MissingMetadata,
                 }
             })
         })
@@ -289,11 +294,14 @@ pub(crate) fn collect_stream_candidates(
         }
     }
 
-    candidates.sort_by(|left, right| right.priority.cmp(&left.priority));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
     candidates
 }
 
-pub(crate) fn find_safe_default_device(graph: &RuntimeGraph, direction: StreamDirection) -> Option<Device> {
+pub(crate) fn find_safe_default_device(
+    graph: &RuntimeGraph,
+    direction: StreamDirection,
+) -> Option<Device> {
     let device_direction = match direction {
         StreamDirection::Playback => DeviceDirection::Output,
         StreamDirection::Capture => DeviceDirection::Input,
@@ -326,59 +334,21 @@ pub(crate) fn resolve_target_device(
 
     match winner.fallback_policy {
         FallbackPolicy::KeepCurrent => None,
-        FallbackPolicy::SafeDefault => find_safe_default_device(graph, stream.direction.clone()).map(|device| {
-            (
-                device.clone(),
-                Some(format!(
-                    "Target unavailable; fell back to safe default ({})",
-                    device.label
-                )),
-            )
-        }),
+        FallbackPolicy::SafeDefault => find_safe_default_device(graph, stream.direction.clone())
+            .map(|device| {
+                (
+                    device.clone(),
+                    Some(format!(
+                        "Target unavailable; fell back to safe default ({})",
+                        device.label
+                    )),
+                )
+            }),
     }
 }
 
 fn persisted_rule_display_name() -> String {
     "Manual route".into()
-}
-
-pub(crate) fn actual_device_target_system_names(
-    graph: &RuntimeGraph,
-    source: &crate::core::models::Device,
-    backend: &dyn AudioBackend,
-) -> HashSet<String> {
-    let from_graph: HashSet<String> = source
-        .resolved_targets()
-        .iter()
-        .filter_map(|id| {
-            graph
-                .devices
-                .iter()
-                .find(|device| device.id == *id)
-                .map(|device| device.system_name.clone())
-        })
-        .collect();
-    if !from_graph.is_empty() {
-        return from_graph;
-    }
-
-    backend
-        .monitor_routes_for_source(&source.system_name)
-        .into_iter()
-        .collect()
-}
-
-pub(crate) fn device_matches_rule(
-    graph: &RuntimeGraph,
-    source: &crate::core::models::Device,
-    rule: &DeviceRouteRule,
-    backend: &dyn AudioBackend,
-) -> bool {
-    let expected: HashSet<String> = rule.target_system_names_resolved().into_iter().collect();
-    if expected.is_empty() {
-        return true;
-    }
-    actual_device_target_system_names(graph, source, backend) == expected
 }
 
 #[cfg(test)]
@@ -395,12 +365,13 @@ mod tests {
             system_name: None,
             direction: StreamDirection::Playback,
             current_target: None,
-            current_targets: Vec::new(),
             media_name: media_name.map(str::to_string),
             is_system: false,
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         }
     }
 
@@ -459,6 +430,13 @@ mod tests {
         };
 
         assert!(stream_matches_authored_rule(&stream, &rule).is_some());
+    }
+
+    #[test]
+    fn default_category_matches_uppercase_executable() {
+        let stream = sample_stream("MyApp", Some("Steam.exe"), None);
+
+        assert_eq!(default_category(&stream), Some("Game"));
     }
 
     #[test]

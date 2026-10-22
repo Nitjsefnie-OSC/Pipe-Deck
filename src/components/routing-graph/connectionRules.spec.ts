@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Connection } from "@vue-flow/core";
-import { makeDevice, makeGraph, makeStream } from "../../test/graphFixtures";
+import {
+  makeDevice,
+  makeGraph,
+  makeProcessingNode,
+  makeStream,
+} from "../../test/graphFixtures";
 import { resolveConnectionAction } from "./connectionRules";
 
 function connection(overrides: Partial<Connection>): Connection {
@@ -16,8 +21,13 @@ function connection(overrides: Partial<Connection>): Connection {
 describe("resolveConnectionAction — connect mode", () => {
   it("errors when source or target is missing", () => {
     const graph = makeGraph();
-    const result = resolveConnectionAction(graph, connection({ source: "stream:s1" }));
-    expect(result).toEqual({ error: "Drag needs both a source and a target port." });
+    const result = resolveConnectionAction(
+      graph,
+      connection({ source: "stream:s1" }),
+    );
+    expect(result).toEqual({
+      error: "Drag needs both a source and a target port.",
+    });
   });
 
   it("errors when the target handle is not an open slot", () => {
@@ -52,7 +62,8 @@ describe("resolveConnectionAction — connect mode", () => {
       }),
     );
     expect(result).toEqual({
-      error: "Could not identify one end of this connection — try refreshing the routing view.",
+      error:
+        "Could not identify one end of this connection — try refreshing the routing view.",
     });
   });
 
@@ -70,7 +81,8 @@ describe("resolveConnectionAction — connect mode", () => {
       }),
     );
     expect(result).toEqual({
-      error: '"App A" and "App B" are both application streams — connect a stream to a device instead.',
+      error:
+        '"App A" and "App B" are both application streams — connect a stream to a device instead.',
     });
   });
 
@@ -87,7 +99,9 @@ describe("resolveConnectionAction — connect mode", () => {
         targetHandle: "audio-in:empty",
       }),
     );
-    expect(result).toEqual({ action: { type: "stream_target", streamId: "s1", targetDeviceId: "d1" } });
+    expect(result).toEqual({
+      action: { type: "stream_target", streamId: "s1", targetDeviceId: "d1" },
+    });
   });
 
   it("resolves the same drag reversed (device onto stream)", () => {
@@ -103,12 +117,22 @@ describe("resolveConnectionAction — connect mode", () => {
         targetHandle: "audio-in",
       }),
     );
-    expect(result).toEqual({ action: { type: "stream_target", streamId: "s1", targetDeviceId: "d1" } });
+    expect(result).toEqual({
+      action: { type: "stream_target", streamId: "s1", targetDeviceId: "d1" },
+    });
   });
 
   it("errors when the target doesn't accept the stream's direction", () => {
-    const stream = makeStream({ id: "s1", app_name: "Capture App", direction: "capture" });
-    const device = makeDevice({ id: "d1", label: "Speakers", direction: "output" });
+    const stream = makeStream({
+      id: "s1",
+      app_name: "Capture App",
+      direction: "capture",
+    });
+    const device = makeDevice({
+      id: "d1",
+      label: "Speakers",
+      direction: "output",
+    });
     const graph = makeGraph([device], [stream]);
     const result = resolveConnectionAction(
       graph,
@@ -127,7 +151,12 @@ describe("resolveConnectionAction — connect mode", () => {
 
   it("adds a mic passthrough when a playback stream is dropped on a virtual mic", () => {
     const stream = makeStream({ id: "s1", direction: "playback" });
-    const mic = makeDevice({ id: "mic1", label: "Virtual Mic", kind: "virtual", direction: "input" });
+    const mic = makeDevice({
+      id: "mic1",
+      label: "Virtual Mic",
+      kind: "virtual",
+      direction: "input",
+    });
     const graph = makeGraph([mic], [stream]);
     const result = resolveConnectionAction(
       graph,
@@ -139,13 +168,26 @@ describe("resolveConnectionAction — connect mode", () => {
       }),
     );
     expect(result).toEqual({
-      action: { type: "stream_mic_passthrough_add", streamId: "s1", micDeviceId: "mic1" },
+      action: {
+        type: "stream_mic_passthrough_add",
+        streamId: "s1",
+        micDeviceId: "mic1",
+      },
     });
   });
 
   it("errors when the stream already passes through to that mic", () => {
-    const mic = makeDevice({ id: "mic1", label: "Virtual Mic", kind: "virtual", direction: "input" });
-    const stream = makeStream({ id: "s1", direction: "playback", current_target: "mic1" });
+    const mic = makeDevice({
+      id: "mic1",
+      label: "Virtual Mic",
+      kind: "virtual",
+      direction: "input",
+    });
+    const stream = makeStream({
+      id: "s1",
+      direction: "playback",
+      current_target: "mic1",
+    });
     const graph = makeGraph([mic], [stream]);
     const result = resolveConnectionAction(
       graph,
@@ -161,105 +203,48 @@ describe("resolveConnectionAction — connect mode", () => {
     });
   });
 
-  it("adds a mic-mix source for a physical mic into a virtual input", () => {
-    const physMic = makeDevice({ id: "mic1", label: "Headset Mic", kind: "physical", direction: "input" });
-    const virtualMic = makeDevice({ id: "mic2", label: "Virtual Mic", kind: "virtual", direction: "input" });
-    const graph = makeGraph([physMic, virtualMic], []);
-    const result = resolveConnectionAction(
-      graph,
-      connection({
-        source: "device:mic1",
-        target: "device:mic2",
-        sourceHandle: "audio-out:empty",
-        targetHandle: "audio-in:empty",
-      }),
-    );
-    expect(result).toEqual({
-      action: { type: "mic_mix_add", virtualMicDeviceId: "mic2", sourceDeviceId: "mic1" },
-    });
-  });
-
-  it("errors when the mic is already mixed into the target", () => {
-    const physMic = makeDevice({ id: "mic1", label: "Headset Mic", kind: "physical", direction: "input" });
-    const virtualMic = makeDevice({
-      id: "mic2",
-      label: "Virtual Mic",
-      kind: "virtual",
-      direction: "input",
-      mix_sources: [{ device_id: "mic1", volume_percent: 100, muted: false }],
-    });
-    const graph = makeGraph([physMic, virtualMic], []);
-    const result = resolveConnectionAction(
-      graph,
-      connection({
-        source: "device:mic1",
-        target: "device:mic2",
-        sourceHandle: "audio-out:empty",
-        targetHandle: "audio-in:empty",
-      }),
-    );
-    expect(result).toEqual({
-      error: '"Headset Mic" is already mixed into "Virtual Mic".',
-    });
-  });
-
-  it("errors when a virtual sink targets something outside its allowed set", () => {
-    const sink = makeDevice({ id: "sink1", label: "Virtual Sink", kind: "virtual", direction: "output" });
-    const physicalMic = makeDevice({
+  it("rejects dragging a physical mic directly onto a virtual input — mixing now goes through a Mixer Node", () => {
+    const physMic = makeDevice({
       id: "mic1",
       label: "Headset Mic",
       kind: "physical",
       direction: "input",
     });
-    const graph = makeGraph([sink, physicalMic], []);
-    const result = resolveConnectionAction(
-      graph,
-      connection({
-        source: "device:sink1",
-        target: "device:mic1",
-        sourceHandle: "audio-out:empty",
-        targetHandle: "audio-in:empty",
-      }),
-    );
-    expect(result).toEqual({
-      error:
-        '"Virtual Sink" can only route to a physical/virtual output or a virtual input — "Headset Mic" isn\'t one of those.',
-    });
-  });
-
-  it("errors when the source isn't a virtual output sink", () => {
-    const virtualInput = makeDevice({
-      id: "vin1",
-      label: "Virtual Input",
+    const virtualMic = makeDevice({
+      id: "mic2",
+      label: "Virtual Mic",
       kind: "virtual",
       direction: "input",
     });
-    const physicalOut = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const graph = makeGraph([virtualInput, physicalOut], []);
+    const graph = makeGraph([physMic, virtualMic], []);
     const result = resolveConnectionAction(
       graph,
       connection({
-        source: "device:vin1",
-        target: "device:out1",
+        source: "device:mic1",
+        target: "device:mic2",
         sourceHandle: "audio-out:empty",
         targetHandle: "audio-in:empty",
       }),
     );
     expect(result).toEqual({
       error:
-        '"Virtual Input" isn\'t a virtual output sink, so it can\'t be routed directly to another device. Drag an application stream instead.',
+        '"Headset Mic" can\'t be routed directly to "Virtual Mic" — plain devices no longer route onward to each other. Use a Mixer or Fan-Out node, or drag an application stream instead.',
     });
   });
 
-  it("errors when a multi-sink output is already connected to that target", () => {
+  it("rejects dragging one device directly onto another — #293, plain devices no longer route onward", () => {
     const sink = makeDevice({
       id: "sink1",
       label: "Virtual Sink",
       kind: "virtual",
       direction: "output",
-      current_targets: ["out1"],
     });
-    const out = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
+    const out = makeDevice({
+      id: "out1",
+      label: "Speakers",
+      kind: "physical",
+      direction: "output",
+    });
     const graph = makeGraph([sink, out], []);
     const result = resolveConnectionAction(
       graph,
@@ -270,57 +255,9 @@ describe("resolveConnectionAction — connect mode", () => {
         targetHandle: "audio-in:empty",
       }),
     );
-    expect(result).toEqual({ error: '"Virtual Sink" is already routed to "Speakers".' });
-  });
-
-  it("adds a new fan-out target for a multi-sink virtual output", () => {
-    const sink = makeDevice({
-      id: "sink1",
-      label: "Virtual Sink",
-      kind: "virtual",
-      direction: "output",
-      current_targets: ["out1"],
-    });
-    const out1 = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const out2 = makeDevice({ id: "out2", label: "Headphones", kind: "physical", direction: "output" });
-    const graph = makeGraph([sink, out1, out2], []);
-    const result = resolveConnectionAction(
-      graph,
-      connection({
-        source: "device:sink1",
-        target: "device:out2",
-        sourceHandle: "audio-out:empty",
-        targetHandle: "audio-in:empty",
-      }),
-    );
     expect(result).toEqual({
-      action: { type: "device_targets", sourceDeviceId: "sink1", targetDeviceIds: ["out1", "out2"] },
-    });
-  });
-
-  it("re-targets a multi-sink output during an edge_update drag", () => {
-    const sink = makeDevice({
-      id: "sink1",
-      label: "Virtual Sink",
-      kind: "virtual",
-      direction: "output",
-      current_targets: ["out1"],
-    });
-    const out1 = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const out2 = makeDevice({ id: "out2", label: "Headphones", kind: "physical", direction: "output" });
-    const graph = makeGraph([sink, out1, out2], []);
-    const result = resolveConnectionAction(
-      graph,
-      connection({
-        source: "device:sink1",
-        target: "device:out2",
-        sourceHandle: "audio-out:empty",
-        targetHandle: "audio-in:empty",
-      }),
-      { mode: "edge_update", previousEdge: { source: "device:sink1", target: "device:out1" } },
-    );
-    expect(result).toEqual({
-      action: { type: "device_targets", sourceDeviceId: "sink1", targetDeviceIds: ["out2"] },
+      error:
+        '"Virtual Sink" can\'t be routed directly to "Speakers" — plain devices no longer route onward to each other. Use a Mixer or Fan-Out node, or drag an application stream instead.',
     });
   });
 });
@@ -328,7 +265,9 @@ describe("resolveConnectionAction — connect mode", () => {
 describe("resolveConnectionAction — edge_disconnect mode", () => {
   it("errors when there is no previous edge", () => {
     const graph = makeGraph();
-    const result = resolveConnectionAction(graph, connection({}), { mode: "edge_disconnect" });
+    const result = resolveConnectionAction(graph, connection({}), {
+      mode: "edge_disconnect",
+    });
     expect(result).toEqual({ error: "Nothing to disconnect." });
   });
 
@@ -350,12 +289,20 @@ describe("resolveConnectionAction — edge_disconnect mode", () => {
       previousEdge: { source: "stream:s1", target: "device:d1" },
     });
     expect(result).toEqual({
-      action: { type: "clear_stream_target", streamId: "s1", previousTargetDeviceId: "d1" },
+      action: {
+        type: "clear_stream_target",
+        streamId: "s1",
+        previousTargetDeviceId: "d1",
+      },
     });
   });
 
   it("errors when a stream-device edge no longer matches the live route", () => {
-    const stream = makeStream({ id: "s1", app_name: "App A", current_target: "other-device" });
+    const stream = makeStream({
+      id: "s1",
+      app_name: "App A",
+      current_target: "other-device",
+    });
     const device = makeDevice({ id: "d1", label: "Speakers" });
     const graph = makeGraph([device], [stream]);
     const result = resolveConnectionAction(graph, connection({}), {
@@ -363,7 +310,8 @@ describe("resolveConnectionAction — edge_disconnect mode", () => {
       previousEdge: { source: "stream:s1", target: "device:d1" },
     });
     expect(result).toEqual({
-      error: '"App A" isn\'t currently routed to "Speakers" — nothing to disconnect.',
+      error:
+        '"App A" isn\'t currently routed to "Speakers" — nothing to disconnect.',
     });
   });
 
@@ -376,7 +324,11 @@ describe("resolveConnectionAction — edge_disconnect mode", () => {
       previousEdge: { source: "device:d1", target: "stream:s1" },
     });
     expect(result).toEqual({
-      action: { type: "clear_stream_target", streamId: "s1", previousTargetDeviceId: "d1" },
+      action: {
+        type: "clear_stream_target",
+        streamId: "s1",
+        previousTargetDeviceId: "d1",
+      },
     });
   });
 
@@ -391,93 +343,176 @@ describe("resolveConnectionAction — edge_disconnect mode", () => {
     expect(result).toEqual({ error: "Nothing to disconnect." });
   });
 
-  it("removes a mic-mix source when the edge matches the current mix", () => {
-    const physMic = makeDevice({ id: "mic1", label: "Headset Mic", kind: "physical", direction: "input" });
-    const virtualMic = makeDevice({
-      id: "mic2",
-      label: "Virtual Mic",
+  it("has nothing to disconnect for a device-to-device edge — #293, no such edge can exist anymore", () => {
+    const physOut = makeDevice({
+      id: "out1",
+      label: "Speakers",
+      kind: "physical",
+      direction: "output",
+    });
+    const sink = makeDevice({
+      id: "sink1",
+      label: "Virtual Sink",
       kind: "virtual",
-      direction: "input",
-      mix_sources: [{ device_id: "mic1", volume_percent: 100, muted: false }],
+      direction: "output",
     });
-    const graph = makeGraph([physMic, virtualMic], []);
-    const result = resolveConnectionAction(graph, connection({}), {
-      mode: "edge_disconnect",
-      previousEdge: { source: "device:mic1", target: "device:mic2" },
-    });
-    expect(result).toEqual({
-      action: { type: "mic_mix_remove", virtualMicDeviceId: "mic2", sourceDeviceId: "mic1" },
-    });
-  });
-
-  it("errors when the mic-mix edge no longer matches the current mix", () => {
-    const physMic = makeDevice({ id: "mic1", label: "Headset Mic", kind: "physical", direction: "input" });
-    const virtualMic = makeDevice({
-      id: "mic2",
-      label: "Virtual Mic",
-      kind: "virtual",
-      direction: "input",
-      mix_sources: [],
-    });
-    const graph = makeGraph([physMic, virtualMic], []);
-    const result = resolveConnectionAction(graph, connection({}), {
-      mode: "edge_disconnect",
-      previousEdge: { source: "device:mic1", target: "device:mic2" },
-    });
-    expect(result).toEqual({
-      error: '"Headset Mic" isn\'t currently mixed into "Virtual Mic" — nothing to disconnect.',
-    });
-  });
-
-  it("errors when disconnecting a non-virtual-output device route", () => {
-    const physOut = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const sink = makeDevice({ id: "sink1", label: "Virtual Sink", kind: "virtual", direction: "output" });
     const graph = makeGraph([physOut, sink], []);
     const result = resolveConnectionAction(graph, connection({}), {
       mode: "edge_disconnect",
       previousEdge: { source: "device:out1", target: "device:sink1" },
     });
+    expect(result).toEqual({ error: "Nothing to disconnect." });
+  });
+});
+
+describe("resolveConnectionAction — processing nodes (PD-032)", () => {
+  it("connects a device to a processing node's input", () => {
+    const source = makeDevice({
+      id: "src1",
+      kind: "virtual",
+      direction: "output",
+    });
+    const node = makeProcessingNode({ id: "proc-1" });
+    const graph = makeGraph([source], [], [], [node]);
+    const result = resolveConnectionAction(
+      graph,
+      connection({
+        source: "device:src1",
+        target: "processingNode:proc-1",
+        sourceHandle: "audio-out:empty",
+        targetHandle: "audio-in:empty",
+      }),
+    );
     expect(result).toEqual({
-      error:
-        '"Speakers" isn\'t a virtual sink route — only virtual-output connections can be dragged off to disconnect them.',
+      action: {
+        type: "processing_node_connect",
+        nodeId: "proc-1",
+        direction: "input",
+        peerId: "src1",
+      },
     });
   });
 
-  it("errors when the device-to-device edge no longer matches a live route", () => {
-    const sink = makeDevice({
-      id: "sink1",
-      label: "Virtual Sink",
-      kind: "virtual",
+  it("connects a processing node's output to a device", () => {
+    const target = makeDevice({
+      id: "out1",
+      kind: "physical",
       direction: "output",
-      current_targets: ["out2"],
     });
-    const out1 = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const graph = makeGraph([sink, out1], []);
-    const result = resolveConnectionAction(graph, connection({}), {
-      mode: "edge_disconnect",
-      previousEdge: { source: "device:sink1", target: "device:out1" },
-    });
+    const node = makeProcessingNode({ id: "proc-1" });
+    const graph = makeGraph([target], [], [], [node]);
+    const result = resolveConnectionAction(
+      graph,
+      connection({
+        source: "processingNode:proc-1",
+        target: "device:out1",
+        sourceHandle: "audio-out:empty",
+        targetHandle: "audio-in:empty",
+      }),
+    );
     expect(result).toEqual({
-      error: '"Virtual Sink" isn\'t currently routed to "Speakers" — nothing to disconnect.',
+      action: {
+        type: "processing_node_connect",
+        nodeId: "proc-1",
+        direction: "output",
+        peerId: "out1",
+      },
     });
   });
 
-  it("removes a fan-out target from a multi-sink virtual output", () => {
-    const sink = makeDevice({
-      id: "sink1",
-      label: "Virtual Sink",
+  it("errors when the peer is already connected to that port", () => {
+    const source = makeDevice({
+      id: "src1",
       kind: "virtual",
       direction: "output",
-      current_targets: ["out1", "out2"],
     });
-    const out1 = makeDevice({ id: "out1", label: "Speakers", kind: "physical", direction: "output" });
-    const graph = makeGraph([sink, out1], []);
+    const node = makeProcessingNode({
+      id: "proc-1",
+      inputs: [{ index: 0, connected_id: "src1" }],
+    });
+    const graph = makeGraph([source], [], [], [node]);
+    const result = resolveConnectionAction(
+      graph,
+      connection({
+        source: "device:src1",
+        target: "processingNode:proc-1",
+        sourceHandle: "audio-out:empty",
+        targetHandle: "audio-in:empty",
+      }),
+    );
+    expect(result).toEqual({
+      error: '"Speakers" is already connected to "Fan-out".',
+    });
+  });
+
+  it("chains one processing node's output into another's input", () => {
+    const nodeA = makeProcessingNode({
+      id: "proc-a",
+      kind: { kind: "fan_out", volume_percent: 100, muted: false },
+    });
+    const nodeB = makeProcessingNode({
+      id: "proc-b",
+      kind: { kind: "mixer", input_gains_percent: [] },
+    });
+    const graph = makeGraph([], [], [], [nodeA, nodeB]);
+    const result = resolveConnectionAction(
+      graph,
+      connection({
+        source: "processingNode:proc-a",
+        target: "processingNode:proc-b",
+        sourceHandle: "audio-out:empty",
+        targetHandle: "audio-in:empty",
+      }),
+    );
+    expect(result).toEqual({
+      action: {
+        type: "processing_node_connect",
+        nodeId: "proc-b",
+        direction: "input",
+        peerId: "proc-a",
+      },
+    });
+  });
+
+  it("errors when a processing node is chained into itself", () => {
+    const node = makeProcessingNode({ id: "proc-a" });
+    const graph = makeGraph([], [], [], [node]);
+    const result = resolveConnectionAction(
+      graph,
+      connection({
+        source: "processingNode:proc-a",
+        target: "processingNode:proc-a",
+        sourceHandle: "audio-out:empty",
+        targetHandle: "audio-in:empty",
+      }),
+    );
+    expect(result).toEqual({
+      error: "A processing node can't feed its own input.",
+    });
+  });
+
+  it("disconnects a processing node's output from a device via edge_disconnect", () => {
+    const target = makeDevice({
+      id: "out1",
+      kind: "physical",
+      direction: "output",
+    });
+    const node = makeProcessingNode({
+      id: "proc-1",
+      outputs: [{ index: 0, connected_id: "out1" }],
+    });
+    const graph = makeGraph([target], [], [], [node]);
     const result = resolveConnectionAction(graph, connection({}), {
       mode: "edge_disconnect",
-      previousEdge: { source: "device:sink1", target: "device:out1" },
+      previousEdge: { source: "processingNode:proc-1", target: "device:out1" },
     });
     expect(result).toEqual({
-      action: { type: "device_targets", sourceDeviceId: "sink1", targetDeviceIds: ["out2"] },
+      action: {
+        type: "processing_node_disconnect",
+        nodeId: "proc-1",
+        direction: "output",
+        portIndex: 0,
+      },
     });
   });
 });

@@ -56,6 +56,10 @@ preferences:
   theme_mode: dark                # "light" | "dark" | "system"
   dark_scheme: midnight-deck      # scheme id used when resolved mode is dark
   light_scheme: paper-deck        # scheme id used when resolved mode is light
+  notice_duration_ms: 5000        # toast auto-dismiss delay; 0 means "until dismissed"
+  close_behavior: null            # null (ask once) | "minimize" | "quit"
+  update_channel: latest          # "latest" | "prerelease"
+  onboarding_dismissed: false     # first-run checklist dismissed forever once true
 active_profile: gaming
 profile_index:
   - id: gaming
@@ -135,6 +139,35 @@ routing_intents:
 
 Fan-out uses a `pipe-deck-split-*` virtual sink plus `pw-link` monitor routes to each output.
 
+### Device identity across BT/USB reconnects (#13, #14)
+
+A hardware device's PipeWire node id is not stable across a Bluetooth or USB
+disconnect/reconnect cycle — the device gets a brand-new id when it comes
+back. Routing intents and volume-state entries therefore also carry a
+`target_system_name`/`system_name` (the device's PipeWire `node.name`, e.g.
+`bluez_output.AA_BB_CC_DD_EE_FF.1` or an ALSA card name), captured alongside
+the id when the profile is saved:
+
+```yaml
+routing_intents:
+  - stream_id: firefox-playback
+    target_device_id: "node-79"
+    target_system_name: "bluez_output.AA_BB_CC_DD_EE_FF.1"
+volume_state:
+  node-79:
+    volume_percent: 80
+    muted: false
+    system_name: "bluez_output.AA_BB_CC_DD_EE_FF.1"
+```
+
+When a profile is applied, the raw id is used if it still matches a live
+device; otherwise the matching `system_name` is used to find whatever id the
+device currently has. If neither resolves (the device is genuinely gone),
+the routing intent fails but a volume-state entry is skipped rather than
+aborting the rest of the profile apply. Both fields are optional and absent
+on profiles saved before this existed — resolution then falls back to the
+raw id only, same as before.
+
 ### Virtual devices (`virtual_devices[]`, Phase 4)
 
 Each entry describes a Pipe Deck-owned virtual sink or source that should be recreated after reboot or session restart:
@@ -156,13 +189,15 @@ On first run after upgrade, existing `pipe-deck-*` PipeWire modules are migrated
 
 - **theme_mode:** `"light"`, `"dark"`, or `"system"` (follows `prefers-color-scheme`). Defaults to `"dark"` so existing installs keep today's look.
 - **dark_scheme** / **light_scheme:** ids of the color scheme applied when the resolved mode is dark or light, respectively — selected independently, so a user can pair any dark scheme with any light scheme. Default to the built-in `midnight-deck` and `paper-deck`.
+- **notice_duration_ms:** how long a toast notice (route applied, profile saved, errors, ...) stays on screen before auto-dismissing, in milliseconds. `0` means the notice stays until manually dismissed. Defaults to `5000` (5 seconds), matching prior hardcoded behavior.
+- **close_behavior:** what clicking the window's close (X) button does — `"minimize"` hides the window (app keeps running in the background/tray), `"quit"` exits the app. `null`/absent means the user hasn't chosen yet; the first X click shows a one-time prompt, and the answer is persisted here so later clicks act without asking again. Changeable anytime in Settings.
+- **update_channel:** `"latest"` or `"prerelease"` — which GitHub release the in-app "Check for updates" comparison uses. `"latest"` (default) checks the newest published non-prerelease release; `"prerelease"` checks the newest tagged release regardless of prerelease status. Only affects the manual check/download-link flow — the bundled Tauri updater's one-click AppImage auto-install path always checks the `"latest"` channel (its endpoint is fixed at build time in `src-tauri/tauri.conf.json`), so a `"prerelease"` user still gets a manual download link rather than a one-click install.
 - Scheme ids resolve against the 4 built-in schemes plus any user-authored custom schemes under `<config_dir>/themes/*.yaml`. If a selected custom scheme's file is missing (deleted, moved), the app falls back to the built-in default for that mode. See [Theming](../specs/Theming.md) for the scheme file schema and fallback/merge rules.
 
 ### Daemon status and safe mode (Phase 4)
 
 - **Status file:** `~/.local/state/pipe-deck/daemon.json` (`pid`, `last_run`, `last_error`, `devices_restored`)
 - **Safe mode:** if config is missing or corrupt on daemon start, the daemon records the error and exits without modifying PipeWire
-- **Flatpak note:** user systemd background restore may be unavailable in the sandbox; in-app restore on launch remains supported
 
 ## Profile Format (`profiles/<name>.yaml`)
 
@@ -188,7 +223,7 @@ rule_overrides: []      # optional (Phase 3+)
 
 - **Metadata:** `id`, `name`, `created`, `updated`
 - **Routing intents:** stream → sink/source target mappings
-- **Volume/mute state:** optional capture of levels when saving
+- **Volume/mute state:** optional capture of levels when saving, each entry also carrying the device's `system_name` for BT/USB reconnect resolution (see above)
 - **Device assumptions:** virtual device IDs present when the profile was saved; used to restore missing devices before applying routing intents
 - **Rule overrides:** optional rule activation overrides (Phase 3+)
 

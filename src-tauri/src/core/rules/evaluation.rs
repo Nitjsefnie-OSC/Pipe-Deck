@@ -1,16 +1,14 @@
+use crate::backend::BackendError;
 use crate::config::store::ConfigStore;
 use crate::core::models::{
-    ActionStatus, DeviceDirection, DeviceKind, DeviceRouteRule, FallbackPolicy, RouteExplanation,
-    RouteSource, Rule, RuntimeGraph, SimulationResult, Stream, StreamDirection, StreamRouteRule,
+    ActionStatus, RouteExplanation, RouteSource, Rule, RuntimeGraph, SimulationResult, Stream,
+    StreamRouteRule,
 };
-use crate::core::routing_rules::find_device_by_system_name;
 use crate::core::rules::matching::{
-    collect_missing_metadata_skips, collect_stream_candidates, device_matches_rule,
-    find_safe_default_device, resolve_target_device,
+    collect_missing_metadata_skips, collect_stream_candidates, resolve_target_device,
 };
 use crate::core::rules::ApplyRulesContext;
 use crate::core::stream_identity::{stream_display_label, stream_identity_key};
-use crate::backend::BackendError;
 use std::collections::HashSet;
 
 pub fn evaluate_stream_route(
@@ -20,9 +18,9 @@ pub fn evaluate_stream_route(
     manual_overrides: &HashSet<crate::core::stream_identity::StreamIdentityKey>,
 ) -> RouteExplanation {
     let stream_key = stream_identity_key(stream);
-    let overridden = manual_overrides
-        .iter()
-        .any(|override_key| crate::core::stream_identity::identity_matches(&stream_key, override_key));
+    let overridden = manual_overrides.iter().any(|override_key| {
+        crate::core::stream_identity::identity_matches(&stream_key, override_key)
+    });
 
     let candidates = collect_stream_candidates(stream, authored_rules, persisted_rules);
 
@@ -37,6 +35,8 @@ pub fn evaluate_stream_route(
                 .map(|candidate| crate::core::models::SkippedCandidate {
                     rule_key: candidate.key,
                     reason: "Skipped because of manual override".into(),
+                    rule_id: candidate.rule_id,
+                    kind: crate::core::models::SkipReason::ManualOverride,
                 })
                 .collect(),
             action_status: ActionStatus::SkippedManualOverride,
@@ -69,6 +69,8 @@ pub fn evaluate_stream_route(
                 "Lower priority than {} (priority {})",
                 winner.key, winner.priority
             ),
+            rule_id: candidate.rule_id.clone(),
+            kind: crate::core::models::SkipReason::LowerPriority,
         })
         .collect();
 
@@ -95,20 +97,33 @@ pub fn apply_routing_rules_with_explanations(
     let authored_rules = config.rules;
     let persisted_rules = config.routing_rules.stream_rules;
 
-    for stream_id in graph.streams.iter().map(|stream| stream.id.clone()).collect::<Vec<_>>() {
-        let Some(stream) = graph.streams.iter().find(|stream| stream.id == stream_id).cloned() else {
+    for stream_id in graph
+        .streams
+        .iter()
+        .map(|stream| stream.id.clone())
+        .collect::<Vec<_>>()
+    {
+        let Some(stream) = graph
+            .streams
+            .iter()
+            .find(|stream| stream.id == stream_id)
+            .cloned()
+        else {
             continue;
         };
 
-        if let Some(limit) = ctx.limit_to_identities {
-            let key = stream_identity_key(&stream);
-            if !limit.contains(&key) {
+        if let Some(limit) = ctx.limit_to_stream_ids {
+            if !limit.contains(&stream.id) {
                 continue;
             }
         }
 
-        let mut explanation =
-            evaluate_stream_route(&stream, &authored_rules, &persisted_rules, ctx.manual_overrides);
+        let mut explanation = evaluate_stream_route(
+            &stream,
+            &authored_rules,
+            &persisted_rules,
+            ctx.manual_overrides,
+        );
 
         if explanation.source == RouteSource::ManualOverride {
             if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id) {
@@ -126,7 +141,8 @@ pub fn apply_routing_rules_with_explanations(
             continue;
         };
 
-        let Some((target_device, fallback_note)) = resolve_target_device(graph, &stream, winner) else {
+        let Some((target_device, fallback_note)) = resolve_target_device(graph, &stream, winner)
+        else {
             explanation.action_status = ActionStatus::TargetUnavailable;
             if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id) {
                 stream_mut.route_explanation = Some(explanation);
@@ -167,9 +183,9 @@ pub fn apply_routing_rules_with_explanations(
         match apply_result {
             Ok(()) => {
                 explanation.action_status = ActionStatus::Applied;
-                if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id) {
+                if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id)
+                {
                     stream_mut.current_target = Some(target_device.id.clone());
-                    stream_mut.current_targets.clear();
                     stream_mut.route_explanation = Some(explanation);
                 }
             }
@@ -178,152 +194,40 @@ pub fn apply_routing_rules_with_explanations(
                 explanation
                     .match_reasons
                     .push(format!("Apply failed: {error}"));
-                if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id) {
+                if let Some(stream_mut) = graph.streams.iter_mut().find(|item| item.id == stream_id)
+                {
                     stream_mut.route_explanation = Some(explanation);
                 }
             }
         }
     }
 
-    apply_device_rules(graph, &config.routing_rules.device_rules, ctx)?;
     Ok(())
-}
-
-fn apply_device_rules(
-    graph: &mut RuntimeGraph,
-    device_rules: &[DeviceRouteRule],
-    ctx: &ApplyRulesContext<'_>,
-) -> Result<(), BackendError> {
-    if ctx.dry_run {
-        return Ok(());
-    }
-
-    // A single linear pass isn't enough once virtual outputs can chain into
-    // other virtual outputs (PD-026): if rule A wants device X routed into Y
-    // and rule B (evaluated later in the same pass) wants Y routed into Z,
-    // X's pass sees Y's *stale, not-yet-updated* `current_target` (whatever
-    // it was before this refresh) rather than Y's true end state. If that
-    // stale value happens to point back toward X, `apply_sink_targets`'s
-    // cycle guard (`split_sink::would_create_cycle`) reports a false-positive
-    // cycle and silently drops X's route for this pass — the route was never
-    // actually cyclic, only the mid-pass snapshot looked that way. Repeating
-    // the pass until nothing changes (bounded by the rule count, since each
-    // full pass can resolve at least one more link in any dependency chain)
-    // lets a later rule's now-correct target be visible to an earlier one on
-    // the next iteration, without changing behavior for the common
-    // single-rule-per-refresh case (which converges in one pass either way).
-    let max_passes = device_rules.len().max(1);
-    for _ in 0..max_passes {
-        let mut changed = false;
-        apply_device_rules_pass(graph, device_rules, ctx, &mut changed);
-        if !changed {
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_device_rules_pass(
-    graph: &mut RuntimeGraph,
-    device_rules: &[DeviceRouteRule],
-    ctx: &ApplyRulesContext<'_>,
-    changed: &mut bool,
-) {
-    for rule in device_rules {
-        if let Some(source) = find_device_by_system_name(graph, &rule.source_system_name) {
-            if source.kind != DeviceKind::Virtual || source.direction != DeviceDirection::Output {
-                continue;
-            }
-            let source_id = source.id.clone();
-            if ctx.device_manual_overrides.contains(&source_id) {
-                continue;
-            }
-            let target_system_names = rule.target_system_names_resolved();
-            let target_devices: Vec<_> = target_system_names
-                .iter()
-                .filter_map(|system_name| find_device_by_system_name(graph, system_name).cloned())
-                .collect();
-            if target_devices.is_empty() {
-                if rule.safeguards.fallback_policy == FallbackPolicy::SafeDefault {
-                    if let Some(fallback_device) = find_safe_default_device(graph, StreamDirection::Playback)
-                    {
-                        let fallback_id = fallback_device.id.clone();
-                        if fallback_id != source_id {
-                            let routed = if ctx.mock_graph_only {
-                                true
-                            } else {
-                                crate::core::routing::apply_sink_targets(
-                                    graph,
-                                    &source_id,
-                                    std::slice::from_ref(&fallback_id),
-                                )
-                                .is_ok()
-                            };
-                            if routed {
-                                if let Some(device) =
-                                    graph.devices.iter_mut().find(|device| device.id == source_id)
-                                {
-                                    if device.current_targets != vec![fallback_id.clone()] {
-                                        *changed = true;
-                                    }
-                                    device.current_targets = vec![fallback_id.clone()];
-                                    device.current_target = Some(fallback_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let target_ids: Vec<String> = target_devices.iter().map(|device| device.id.clone()).collect();
-            let already = if source.is_multi_sink() {
-                device_matches_rule(graph, source, rule, ctx.backend)
-            } else if let Some(target) = target_devices.first() {
-                source
-                    .current_target
-                    .as_ref()
-                    .is_some_and(|id| id == &target.id)
-                    || ctx.backend.is_routed_to(
-                        &source.system_name,
-                        &target.system_name,
-                        target.direction == DeviceDirection::Input,
-                    )
-            } else {
-                false
-            };
-            let routed = if already {
-                true
-            } else if ctx.mock_graph_only {
-                true
-            } else {
-                crate::core::routing::apply_sink_targets(graph, &source_id, &target_ids)
-                    .is_ok()
-            };
-            if routed {
-                if let Some(device) = graph
-                    .devices
-                    .iter_mut()
-                    .find(|device| device.id == source_id)
-                {
-                    if device.current_targets != target_ids {
-                        *changed = true;
-                    }
-                    device.current_targets = target_ids.clone();
-                    device.current_target = target_ids.first().cloned();
-                }
-            }
-        }
-    }
 }
 
 pub fn simulate_rules(
     graph: &RuntimeGraph,
     recent_cache: &crate::core::recent_streams::RecentStreamCache,
+    priority_overrides: &std::collections::HashMap<String, i32>,
 ) -> Vec<SimulationResult> {
     let config = ConfigStore::new()
         .load_config()
         .unwrap_or_else(|_| ConfigStore::default_config());
+
+    let rules: Vec<Rule> = if priority_overrides.is_empty() {
+        config.rules
+    } else {
+        config
+            .rules
+            .into_iter()
+            .map(|mut rule| {
+                if let Some(priority) = priority_overrides.get(&rule.id) {
+                    rule.priority = *priority;
+                }
+                rule
+            })
+            .collect()
+    };
 
     let mut streams: Vec<Stream> = graph.streams.clone();
     streams.extend(recent_cache.synthetic_streams(&graph.streams));
@@ -335,24 +239,22 @@ pub fn simulate_rules(
             let is_recent = stream.id.starts_with("recent-");
             let mut explanation = evaluate_stream_route(
                 &stream,
-                &config.rules,
+                &rules,
                 &config.routing_rules.stream_rules,
                 &HashSet::new(),
             );
             let candidates =
-                collect_stream_candidates(&stream, &config.rules, &config.routing_rules.stream_rules);
+                collect_stream_candidates(&stream, &rules, &config.routing_rules.stream_rules);
             let resolved = candidates
                 .first()
                 .and_then(|winner| resolve_target_device(graph, &stream, winner));
             let would_target_device_id = resolved.as_ref().map(|(device, _)| device.id.clone());
-            if let Some((device, fallback_note)) = resolved {
-                if let Some(note) = fallback_note {
-                    explanation.match_reasons.push(note);
-                    explanation.target_system_name = Some(device.system_name.clone());
-                    explanation.target_system_names = vec![device.system_name.clone()];
-                    explanation.action_status = ActionStatus::Simulated;
-                    explanation.fallback_applied = true;
-                }
+            if let Some((device, Some(note))) = resolved {
+                explanation.match_reasons.push(note);
+                explanation.target_system_name = Some(device.system_name.clone());
+                explanation.target_system_names = vec![device.system_name.clone()];
+                explanation.action_status = ActionStatus::Simulated;
+                explanation.fallback_applied = true;
             }
             SimulationResult {
                 stream_id: stream.id.clone(),
@@ -384,12 +286,13 @@ mod tests {
             system_name: None,
             direction: StreamDirection::Playback,
             current_target: None,
-            current_targets: Vec::new(),
             media_name: media_name.map(str::to_string),
             is_system: false,
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         }
     }
 
@@ -413,7 +316,10 @@ mod tests {
         );
 
         assert_eq!(explanation.source, RouteSource::ManualOverride);
-        assert_eq!(explanation.action_status, ActionStatus::SkippedManualOverride);
+        assert_eq!(
+            explanation.action_status,
+            ActionStatus::SkippedManualOverride
+        );
     }
 
     #[test]
@@ -438,7 +344,10 @@ mod tests {
 
         assert_eq!(explanation.source, RouteSource::NoRule);
         assert_eq!(explanation.skipped_candidates.len(), 1);
-        assert_eq!(explanation.skipped_candidates[0].rule_key, "Window class rule");
+        assert_eq!(
+            explanation.skipped_candidates[0].rule_key,
+            "Window class rule"
+        );
         assert!(explanation.skipped_candidates[0]
             .reason
             .contains("window_class"));
@@ -469,6 +378,8 @@ mod tests {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: None,
+                    channels: None,
                 },
                 Device {
                     id: "hdmi".into(),
@@ -482,6 +393,8 @@ mod tests {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: None,
+                    channels: None,
                 },
             ],
             streams: Vec::new(),
@@ -555,10 +468,7 @@ mod tests {
 
         let explanation = evaluate_stream_route(&stream, &authored, &persisted, &HashSet::new());
         assert_eq!(explanation.source, RouteSource::AuthoredRule);
-        assert_eq!(
-            explanation.target_system_name.as_deref(),
-            Some("chat-sink")
-        );
+        assert_eq!(explanation.target_system_name.as_deref(), Some("chat-sink"));
     }
 
     #[test]
@@ -633,12 +543,13 @@ mod tests {
             system_name: Some("obs-capture".into()),
             direction: StreamDirection::Capture,
             current_target: None,
-            current_targets: Vec::new(),
             media_name: None,
             is_system: false,
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         };
         let authored = vec![crate::core::models::Rule {
             id: "capture".into(),
@@ -669,17 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn limit_to_identities_skips_other_streams() {
+    fn limit_to_stream_ids_skips_other_streams() {
         use crate::config::store::ConfigStore;
         use std::fs;
-        use std::sync::{Mutex, OnceLock};
 
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "pipe-deck-rules-test-{}",
-            std::process::id()
-        ));
+        let _guard = crate::config::store::lock_config_dir_env();
+        let temp_dir =
+            std::env::temp_dir().join(format!("pipe-deck-rules-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
 
@@ -703,24 +610,28 @@ mod tests {
         store.save_config(&config).expect("save config");
 
         let mut graph = graph_with_outputs();
-        graph.streams.push(sample_stream("Discord", Some("discord"), None));
-        graph.streams.push(sample_stream("Firefox", Some("firefox"), None));
-        let discord_key = stream_identity_key(
-            graph.streams.iter().find(|s| s.app_name == "Discord").unwrap(),
-        );
+        let mut discord = sample_stream("Discord", Some("discord"), None);
+        discord.id = "discord-stream".into();
+        let mut firefox = sample_stream("Firefox", Some("firefox"), None);
+        firefox.id = "firefox-stream".into();
+        graph.streams.push(discord);
+        graph.streams.push(firefox);
         let mut limit = HashSet::new();
-        limit.insert(discord_key);
+        limit.insert("discord-stream".to_string());
         let backend = crate::backend::mock::MockAudioBackend::new();
         let ctx = ApplyRulesContext {
             manual_overrides: &HashSet::new(),
-            device_manual_overrides: &HashSet::new(),
             dry_run: true,
             mock_graph_only: true,
-            limit_to_identities: Some(&limit),
+            limit_to_stream_ids: Some(&limit),
             backend: &backend,
         };
         apply_routing_rules_with_explanations(&mut graph, &ctx).expect("simulate");
-        let discord = graph.streams.iter().find(|s| s.app_name == "Discord").unwrap();
+        let discord = graph
+            .streams
+            .iter()
+            .find(|s| s.app_name == "Discord")
+            .unwrap();
         assert_eq!(
             discord
                 .route_explanation
@@ -728,7 +639,11 @@ mod tests {
                 .and_then(|e| e.matched_rule_key.as_deref()),
             Some("Discord"),
         );
-        let firefox = graph.streams.iter().find(|s| s.app_name == "Firefox").unwrap();
+        let firefox = graph
+            .streams
+            .iter()
+            .find(|s| s.app_name == "Firefox")
+            .unwrap();
         assert!(firefox.route_explanation.is_none());
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -739,10 +654,8 @@ mod tests {
     fn apply_marks_fallback_applied_when_safe_default_used() {
         use crate::config::store::ConfigStore;
         use std::fs;
-        use std::sync::{Mutex, OnceLock};
 
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = crate::config::store::lock_config_dir_env();
         let temp_dir = std::env::temp_dir().join(format!(
             "pipe-deck-rules-fallback-test-{}",
             std::process::id()
@@ -772,20 +685,28 @@ mod tests {
         store.save_config(&config).expect("save config");
 
         let mut graph = graph_with_outputs();
-        graph.streams.push(sample_stream("Firefox", Some("firefox"), None));
+        graph
+            .streams
+            .push(sample_stream("Firefox", Some("firefox"), None));
         let backend = crate::backend::mock::MockAudioBackend::new();
         let ctx = ApplyRulesContext {
             manual_overrides: &HashSet::new(),
-            device_manual_overrides: &HashSet::new(),
             dry_run: false,
             mock_graph_only: true,
-            limit_to_identities: None,
+            limit_to_stream_ids: None,
             backend: &backend,
         };
         apply_routing_rules_with_explanations(&mut graph, &ctx).expect("apply");
 
-        let firefox = graph.streams.iter().find(|s| s.app_name == "Firefox").unwrap();
-        let explanation = firefox.route_explanation.as_ref().expect("explanation present");
+        let firefox = graph
+            .streams
+            .iter()
+            .find(|s| s.app_name == "Firefox")
+            .unwrap();
+        let explanation = firefox
+            .route_explanation
+            .as_ref()
+            .expect("explanation present");
         assert!(explanation.fallback_applied);
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -796,10 +717,8 @@ mod tests {
     fn apply_does_not_mark_fallback_applied_when_target_resolves_directly() {
         use crate::config::store::ConfigStore;
         use std::fs;
-        use std::sync::{Mutex, OnceLock};
 
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = crate::config::store::lock_config_dir_env();
         let temp_dir = std::env::temp_dir().join(format!(
             "pipe-deck-rules-no-fallback-test-{}",
             std::process::id()
@@ -827,21 +746,115 @@ mod tests {
         store.save_config(&config).expect("save config");
 
         let mut graph = graph_with_outputs();
-        graph.streams.push(sample_stream("Firefox", Some("firefox"), None));
+        graph
+            .streams
+            .push(sample_stream("Firefox", Some("firefox"), None));
         let backend = crate::backend::mock::MockAudioBackend::new();
         let ctx = ApplyRulesContext {
             manual_overrides: &HashSet::new(),
-            device_manual_overrides: &HashSet::new(),
             dry_run: false,
             mock_graph_only: true,
-            limit_to_identities: None,
+            limit_to_stream_ids: None,
             backend: &backend,
         };
         apply_routing_rules_with_explanations(&mut graph, &ctx).expect("apply");
 
-        let firefox = graph.streams.iter().find(|s| s.app_name == "Firefox").unwrap();
-        let explanation = firefox.route_explanation.as_ref().expect("explanation present");
+        let firefox = graph
+            .streams
+            .iter()
+            .find(|s| s.app_name == "Firefox")
+            .unwrap();
+        let explanation = firefox
+            .route_explanation
+            .as_ref()
+            .expect("explanation present");
         assert!(!explanation.fallback_applied);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+    }
+
+    #[test]
+    fn simulate_rules_priority_override_flips_winner() {
+        use crate::config::store::ConfigStore;
+        use std::fs;
+
+        let _guard = crate::config::store::lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-rules-simulate-override-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let store = ConfigStore::new();
+        store.ensure_layout().expect("config layout");
+        let mut config = ConfigStore::default_config();
+        config.rules = vec![
+            crate::core::models::Rule {
+                id: "low".into(),
+                name: "Low".into(),
+                enabled: true,
+                priority: 5,
+                conditions: vec![RuleCondition::AppName {
+                    value: "Firefox".into(),
+                }],
+                action: crate::core::models::RuleAction {
+                    target_system_name: Some("speakers".into()),
+                    target_system_names: Vec::new(),
+                },
+                safeguards: Default::default(),
+            },
+            crate::core::models::Rule {
+                id: "high".into(),
+                name: "High".into(),
+                enabled: true,
+                priority: 50,
+                conditions: vec![RuleCondition::AppName {
+                    value: "Firefox".into(),
+                }],
+                action: crate::core::models::RuleAction {
+                    target_system_name: Some("hdmi".into()),
+                    target_system_names: Vec::new(),
+                },
+                safeguards: Default::default(),
+            },
+        ];
+        store.save_config(&config).expect("save config");
+
+        let mut graph = graph_with_outputs();
+        graph
+            .streams
+            .push(sample_stream("Firefox", Some("firefox"), None));
+        let recent_cache = crate::core::recent_streams::RecentStreamCache::default();
+
+        let baseline = simulate_rules(&graph, &recent_cache, &std::collections::HashMap::new());
+        let baseline_result = baseline
+            .iter()
+            .find(|result| result.stream_id == "stream-1")
+            .expect("baseline result present");
+        assert_eq!(
+            baseline_result.explanation.matched_rule_key.as_deref(),
+            Some("High")
+        );
+        assert!(baseline_result
+            .explanation
+            .skipped_candidates
+            .iter()
+            .any(|skip| skip.rule_id.as_deref() == Some("low")
+                && skip.kind == crate::core::models::SkipReason::LowerPriority));
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("low".to_string(), 100);
+        let overridden = simulate_rules(&graph, &recent_cache, &overrides);
+        let overridden_result = overridden
+            .iter()
+            .find(|result| result.stream_id == "stream-1")
+            .expect("overridden result present");
+        assert_eq!(
+            overridden_result.explanation.matched_rule_key.as_deref(),
+            Some("Low")
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
         std::env::remove_var("PIPE_DECK_CONFIG_DIR");
@@ -924,74 +937,5 @@ mod tests {
 
         let explanation = evaluate_stream_route(&stream, &authored, &[], &HashSet::new());
         assert_eq!(explanation.source, RouteSource::NoRule);
-    }
-
-    fn graph_with_virtual_sink() -> RuntimeGraph {
-        let mut graph = graph_with_outputs();
-        graph.devices.push(Device {
-            id: "chat-sink".into(),
-            system_name: "pipe-deck-chat".into(),
-            label: "Chat Mix".into(),
-            kind: DeviceKind::Virtual,
-            direction: DeviceDirection::Output,
-            sink_mode: None,
-            volume_percent: None,
-            muted: None,
-            current_target: None,
-            current_targets: Vec::new(),
-            mix_sources: Vec::new(),
-        });
-        graph
-    }
-
-    #[test]
-    fn device_rule_falls_back_to_safe_default_when_target_missing() {
-        let mut graph = graph_with_virtual_sink();
-        let device_rules = vec![DeviceRouteRule {
-            source_system_name: "pipe-deck-chat".into(),
-            target_system_name: Some("missing-target".into()),
-            target_system_names: Vec::new(),
-            safeguards: RuleSafeguards {
-                fallback_policy: FallbackPolicy::SafeDefault,
-            },
-        }];
-        let backend = crate::backend::mock::MockAudioBackend::new();
-        let ctx = ApplyRulesContext {
-            manual_overrides: &HashSet::new(),
-            device_manual_overrides: &HashSet::new(),
-            dry_run: false,
-            mock_graph_only: true,
-            limit_to_identities: None,
-            backend: &backend,
-        };
-        apply_device_rules(&mut graph, &device_rules, &ctx).expect("apply device rules");
-
-        let source = graph.devices.iter().find(|device| device.id == "chat-sink").unwrap();
-        // find_safe_default_device sorts physical outputs by label; "HDMI" < "Speakers".
-        assert_eq!(source.current_target.as_deref(), Some("hdmi"));
-    }
-
-    #[test]
-    fn device_rule_stays_unrouted_when_target_missing_and_keep_current() {
-        let mut graph = graph_with_virtual_sink();
-        let device_rules = vec![DeviceRouteRule {
-            source_system_name: "pipe-deck-chat".into(),
-            target_system_name: Some("missing-target".into()),
-            target_system_names: Vec::new(),
-            safeguards: RuleSafeguards::default(),
-        }];
-        let backend = crate::backend::mock::MockAudioBackend::new();
-        let ctx = ApplyRulesContext {
-            manual_overrides: &HashSet::new(),
-            device_manual_overrides: &HashSet::new(),
-            dry_run: false,
-            mock_graph_only: true,
-            limit_to_identities: None,
-            backend: &backend,
-        };
-        apply_device_rules(&mut graph, &device_rules, &ctx).expect("apply device rules");
-
-        let source = graph.devices.iter().find(|device| device.id == "chat-sink").unwrap();
-        assert_eq!(source.current_target, None);
     }
 }

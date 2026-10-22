@@ -1,15 +1,15 @@
+use crate::backend::linux::graph_enrich;
+use crate::backend::BackendError;
 use crate::core::models::{
     Device, DeviceDirection, DeviceKind, Link, RuntimeGraph, Stream, StreamDirection,
 };
 use crate::core::stream_identity::{
     is_internal_audio_client, parse_stream_identity, parse_window_class,
 };
-use crate::backend::BackendError;
-use crate::backend::linux::graph_enrich;
+use crate::sysproc;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 pub struct PwDumpObject {
@@ -20,10 +20,10 @@ pub struct PwDumpObject {
 }
 
 pub fn run_snapshot() -> Result<Vec<u8>, BackendError> {
-    let output = Command::new("timeout")
+    let output = sysproc::command("timeout")
         .args(["5", "pw-dump", "-N"])
         .output()
-        .or_else(|_| Command::new("pw-dump").arg("-N").output())
+        .or_else(|_| sysproc::command("pw-dump").arg("-N").output())
         .map_err(|error| BackendError::Message(format!("failed to run pw-dump: {error}")))?;
 
     if !output.status.success() {
@@ -77,12 +77,13 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
                     },
                     direction: StreamDirection::Playback,
                     current_target: None,
-                    current_targets: Vec::new(),
                     media_name: stream_media_name(props),
                     is_system: is_system_stream(props),
                     volume_percent: None,
                     muted: None,
                     route_explanation: None,
+                    sample_rate: audio_sample_rate(&object.info, props),
+                    channels: audio_channels(props),
                 });
                 continue;
             }
@@ -102,12 +103,13 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
                     },
                     direction: StreamDirection::Capture,
                     current_target: None,
-                    current_targets: Vec::new(),
                     media_name: stream_media_name(props),
                     is_system: is_system_stream(props),
                     volume_percent: None,
                     muted: None,
                     route_explanation: None,
+                    sample_rate: audio_sample_rate(&object.info, props),
+                    channels: audio_channels(props),
                 });
                 continue;
             }
@@ -129,6 +131,8 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: audio_sample_rate(&object.info, props),
+                    channels: audio_channels(props),
                 });
                 continue;
             }
@@ -152,6 +156,8 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: audio_sample_rate(&object.info, props),
+                    channels: audio_channels(props),
                 });
             }
         }
@@ -196,13 +202,26 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
         }
 
         if stream_ids.contains(&source_id) {
+            // Playback direction: the stream is the link's output side, the
+            // device it's routed to is the input side.
             stream_targets.insert(source_id.clone(), target_id.clone());
+        } else if stream_ids.contains(&target_id) {
+            // Capture direction (#432, Gap 1): the stream is the link's
+            // *input* side (a mic app records the device's output), so the
+            // roles are reversed from the playback case above — this branch
+            // is what makes a capture stream's `current_target` derivable
+            // from the live graph at all; before this, only
+            // `graph_enrich::apply_pactl_capture_targets`'s `pactl
+            // source-index` resolution ever set it, and nothing here
+            // covered the capture direction.
+            stream_targets.insert(target_id.clone(), source_id.clone());
         }
 
         links.push(Link {
             id: format!("link-{link_id}"),
             source_id,
             target_id,
+            is_monitor: false,
         });
     }
 
@@ -218,6 +237,7 @@ pub fn normalize(objects: &[PwDumpObject]) -> RuntimeGraph {
         links,
         data_source: "pipewire".into(),
         notice: None,
+        default_output_system_name: crate::backend::linux::pactl::get_default_sink_name(),
         ..Default::default()
     };
 
@@ -232,7 +252,8 @@ pub(crate) fn device_label(props: &serde_json::Map<String, Value>, media_class: 
     let node_name = prop_str(props, "node.name");
 
     if media_class == "Audio/Sink" {
-        if profile.is_empty() && description.is_empty() && card.is_empty() && !node_name.is_empty() {
+        if profile.is_empty() && description.is_empty() && card.is_empty() && !node_name.is_empty()
+        {
             return prettify_node_name(&node_name);
         }
 
@@ -254,10 +275,7 @@ pub(crate) fn device_label(props: &serde_json::Map<String, Value>, media_class: 
             return fallback_device_label(&description, &card, &node_name);
         }
 
-        let label = format!(
-            "Microphone - {}",
-            device_short_name(&card, &description)
-        );
+        let label = format!("Microphone - {}", device_short_name(&card, &description));
         if label != "Microphone - " {
             return label;
         }
@@ -290,14 +308,41 @@ fn value_as_u32(value: &Value) -> Option<u32> {
     }
 }
 
+fn audio_channels(props: &serde_json::Map<String, Value>) -> Option<u32> {
+    props.get("audio.channels").and_then(value_as_u32)
+}
+
+/// Sample rate isn't a plain prop — the negotiated rate only shows up in
+/// `info.params.Format[0].rate`, which stays empty until the node has
+/// actually run this session. `node.rate` (a `"1/48000"`-style quantum
+/// fraction, seen on stream nodes) is a fallback when the format param
+/// hasn't been populated yet.
+fn audio_sample_rate(info: &Option<Value>, props: &serde_json::Map<String, Value>) -> Option<u32> {
+    let from_format_param = info
+        .as_ref()
+        .and_then(|info| info.get("params"))
+        .and_then(|params| params.get("Format"))
+        .and_then(|format| format.as_array())
+        .and_then(|formats| formats.first())
+        .and_then(|format| format.get("rate"))
+        .and_then(value_as_u32);
+    if from_format_param.is_some() {
+        return from_format_param;
+    }
+
+    props
+        .get("node.rate")
+        .and_then(|value| value.as_str())
+        .and_then(|rate| rate.rsplit('/').next())
+        .and_then(|denominator| denominator.parse().ok())
+}
+
 fn node_id(id: u32) -> String {
     format!("node-{id}")
 }
 
 fn should_skip_media_class(media_class: &str) -> bool {
-    media_class.is_empty()
-        || media_class.starts_with("Midi/")
-        || media_class.starts_with("Video/")
+    media_class.is_empty() || media_class.starts_with("Midi/") || media_class.starts_with("Video/")
 }
 
 fn is_source_media_class(media_class: &str) -> bool {
@@ -420,10 +465,7 @@ mod tests {
             "node.name": "alsa_output.pci-0000_01_00.1.hdmi-stereo",
         });
 
-        let label = device_label(
-            props.as_object().expect("props object"),
-            "Audio/Sink",
-        );
+        let label = device_label(props.as_object().expect("props object"), "Audio/Sink");
         assert_eq!(label, "HDMI / DP - GA102 HD Audio");
     }
 
@@ -437,10 +479,7 @@ mod tests {
             "node.name": "alsa_output.usb-headset.analog-stereo",
         });
 
-        let label = device_label(
-            props.as_object().expect("props object"),
-            "Audio/Sink",
-        );
+        let label = device_label(props.as_object().expect("props object"), "Audio/Sink");
         assert_eq!(label, "Analog Output - Arctis Nova Pro Wireless");
     }
 
@@ -453,11 +492,44 @@ mod tests {
             "node.name": "alsa_input.usb-headset.mono-fallback",
         });
 
-        let label = device_label(
-            props.as_object().expect("props object"),
-            "Audio/Source",
-        );
+        let label = device_label(props.as_object().expect("props object"), "Audio/Source");
         assert_eq!(label, "Microphone - Arctis Nova Pro Wireless");
+    }
+
+    #[test]
+    fn audio_channels_reads_from_props() {
+        let props = serde_json::json!({ "audio.channels": 2 });
+        assert_eq!(audio_channels(props.as_object().unwrap()), Some(2));
+    }
+
+    #[test]
+    fn audio_sample_rate_parses_node_rate_fraction_fallback() {
+        let props = serde_json::json!({ "node.rate": "1/48000" });
+        assert_eq!(
+            audio_sample_rate(&None, props.as_object().unwrap()),
+            Some(48000)
+        );
+    }
+
+    #[test]
+    fn audio_sample_rate_prefers_format_param_over_node_rate() {
+        let info = serde_json::json!({
+            "params": {
+                "Format": [{ "rate": 44100, "channels": 2 }]
+            }
+        });
+        let props = serde_json::json!({ "node.rate": "1/48000" });
+        assert_eq!(
+            audio_sample_rate(&Some(info), props.as_object().unwrap()),
+            Some(44100)
+        );
+    }
+
+    #[test]
+    fn audio_sample_rate_and_channels_are_none_when_absent() {
+        let props = serde_json::json!({});
+        assert_eq!(audio_sample_rate(&None, props.as_object().unwrap()), None);
+        assert_eq!(audio_channels(props.as_object().unwrap()), None);
     }
 
     #[test]
@@ -582,5 +654,180 @@ mod tests {
         assert_eq!(graph.streams.len(), 1);
         assert_eq!(graph.streams[0].app_name, "Firefox");
         assert_eq!(graph.streams[0].current_target.as_deref(), Some("node-35"));
+    }
+
+    /// Capture-direction counterpart to `skips_fabricated_media_classes`'s
+    /// `current_target` assertion (#432, Gap 1) — a capture stream is the
+    /// link's *input* side (it records a source device's output), the
+    /// reverse of a playback stream's own output-side role, so it needs its
+    /// own branch in `normalize`'s link-walk rather than falling out of the
+    /// same one for free. Before that branch existed, a capture stream's
+    /// `current_target` was never set here at all — only
+    /// `graph_enrich::apply_pactl_capture_targets`'s `pactl` resolution ever
+    /// filled it in.
+    #[test]
+    fn derives_current_target_for_a_capture_stream_from_its_link() {
+        let objects = vec![
+            PwDumpObject {
+                id: 40,
+                object_type: "PipeWire:Interface:Node".into(),
+                info: Some(serde_json::json!({
+                    "props": {
+                        "media.class": "Audio/Source",
+                        "node.name": "alsa_input.usb-headset",
+                        "node.description": "Headset Mono",
+                    }
+                })),
+            },
+            PwDumpObject {
+                id: 80,
+                object_type: "PipeWire:Interface:Node".into(),
+                info: Some(serde_json::json!({
+                    "props": {
+                        "media.class": "Stream/Input/Audio",
+                        "application.name": "Discord"
+                    }
+                })),
+            },
+            PwDumpObject {
+                id: 81,
+                object_type: "PipeWire:Interface:Link".into(),
+                info: Some(serde_json::json!({
+                    "output-node-id": 40,
+                    "input-node-id": 80
+                })),
+            },
+        ];
+
+        let graph = normalize(&objects);
+        assert_eq!(graph.devices.len(), 1);
+        assert_eq!(graph.streams.len(), 1);
+        assert_eq!(graph.streams[0].app_name, "Discord");
+        assert_eq!(graph.streams[0].current_target.as_deref(), Some("node-40"));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! `#[ignore]`d: hits a real PipeWire session, same rationale as every
+    //! other `live_tests` module in this codebase. Confirms
+    //! `derives_current_target_for_a_capture_stream_from_its_link`'s fixture
+    //! test holds against a *real* `pw-dump` snapshot, not just a
+    //! hand-built one — calling `run_snapshot`/`normalize` directly (not
+    //! through `live.rs::enumerate_pipewire`) so `graph_enrich::
+    //! enrich_graph_from_pactl`'s separate pactl-based
+    //! `apply_pactl_capture_targets` never runs, isolating this test to
+    //! `normalize`'s own link-derived target — the actual thing #432, Gap 1
+    //! replaces it with.
+    use super::*;
+    use crate::backend::linux::pw_link;
+    use std::thread;
+    use std::time::Duration;
+
+    struct LoopedRecordStream {
+        child: std::process::Child,
+    }
+
+    impl LoopedRecordStream {
+        fn spawn() -> Self {
+            let child = crate::sysproc::command("sh")
+                .args(["-c", "while true; do pw-cat --record --format=s16 --rate=48000 --channels=2 /dev/null; done"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to spawn looped pw-cat --record");
+            Self { child }
+        }
+    }
+
+    impl Drop for LoopedRecordStream {
+        fn drop(&mut self) {
+            let _ = crate::sysproc::command("pkill")
+                .args(["-P", &self.child.id().to_string()])
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn snapshot_graph() -> RuntimeGraph {
+        let stdout = run_snapshot().expect("pw-dump snapshot should succeed");
+        let objects: Vec<PwDumpObject> =
+            serde_json::from_slice(&stdout).expect("pw-dump output should parse");
+        normalize(&objects)
+    }
+
+    #[test]
+    #[ignore]
+    fn derives_current_target_for_a_real_capture_stream_from_a_live_snapshot() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        // Deliberately a *real* hardware capture source, not a disposable
+        // virtual device: `normalize` unconditionally excludes every
+        // `pipe-deck-*` node from `graph.devices` (see
+        // `pipe_deck_devices_are_left_to_virtual_registry` above — virtual
+        // devices are merged in later, by `core::engine::virtual_ops`, a
+        // layer this test calls `normalize` beneath), so a virtual source's
+        // own link could never resolve to a known device id here regardless
+        // of whether this branch is correct — that's a different, unrelated
+        // limitation this specific test isn't about. The real target case is
+        // covered instead by `graph_routing::live_tests::
+        // resolves_a_capture_streams_target_to_a_virtual_device_natively`,
+        // which runs after the virtual-device merge step.
+        let hardware_source = {
+            let graph = snapshot_graph();
+            graph
+                .devices
+                .into_iter()
+                .find(|device| device.direction == DeviceDirection::Input)
+                .expect("expected at least one real hardware capture device on this session")
+        };
+
+        let _stream = LoopedRecordStream::spawn();
+        let routed = (0..50).any(|_| {
+            if pw_link::route_capture_stream(&hardware_source.system_name, "pw-cat").is_ok() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+            false
+        });
+        assert!(
+            routed,
+            "expected the capture route to succeed once pw-cat registers as a live node"
+        );
+
+        let found = (0..20).find_map(|_| {
+            // Re-assert the route on every attempt, not just once up front —
+            // a fresh `pw-cat --record` with no explicit target auto-connects
+            // to the session's default source the moment it appears, racing
+            // this test's own explicit route (confirmed live via a manual
+            // `pw-dump` link dump showing two simultaneous input links to
+            // `pw-cat`). Re-issuing `route_capture_stream` (itself a
+            // disconnect-then-link, #428) on every poll converges past that
+            // race instead of asserting on whichever link order the
+            // auto-connect and this test happened to land in.
+            let _ = pw_link::route_capture_stream(&hardware_source.system_name, "pw-cat");
+            let graph = snapshot_graph();
+            let stream = graph
+                .streams
+                .iter()
+                .find(|stream| stream.system_name.as_deref() == Some("pw-cat"))
+                .cloned();
+            if stream
+                .as_ref()
+                .and_then(|s| s.current_target.as_ref())
+                .is_some()
+            {
+                return stream;
+            }
+            thread::sleep(Duration::from_millis(100));
+            None
+        });
+        let stream =
+            found.expect("expected a live snapshot to show pw-cat's current_target once routed");
+        assert_eq!(
+            stream.current_target.as_deref(),
+            Some(hardware_source.id.as_str())
+        );
     }
 }

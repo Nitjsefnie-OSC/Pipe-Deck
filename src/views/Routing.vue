@@ -75,13 +75,18 @@ async function undoRouting() {
   if (!canUndo.value) return;
 
   try {
-    const result = await invoke<{ success: boolean; message?: string }>("undo_last_routing");
+    const result = await invoke<{ success: boolean; message?: string }>(
+      "undo_last_routing",
+    );
     handleApplyResult(result, "Routing change undone");
     await refreshCanUndo();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     handleApplyResult(
-      { success: false, message: `Couldn't undo the last routing change: ${message}` },
+      {
+        success: false,
+        message: `Couldn't undo the last routing change: ${message}`,
+      },
       "",
     );
   }
@@ -93,10 +98,6 @@ async function undoRouting() {
     <header class="routing-header view-header">
       <div>
         <p class="eyebrow">Topology and connections</p>
-        <p class="routing-lead">
-          Drag from an open output slot (right) to an open input slot (left) to connect — a new
-          empty slot appears after each connection. Drag a wire off its slot to disconnect.
-        </p>
       </div>
       <div class="routing-actions view-actions">
         <div class="header-toggle">
@@ -107,7 +108,9 @@ async function undoRouting() {
             @update:model-value="onToggleSystemStreams"
           />
         </div>
-        <button type="button" :disabled="!canUndo" @click="undoRouting">Undo</button>
+        <button type="button" :disabled="!canUndo" @click="undoRouting">
+          Undo
+        </button>
         <button type="button" @click="refresh">Refresh</button>
       </div>
     </header>

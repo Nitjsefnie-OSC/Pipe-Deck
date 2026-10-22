@@ -9,7 +9,10 @@ pub fn compare_profile_to_graph(profile: &Profile, graph: &RuntimeGraph) -> Rout
             .clone()
             .or_else(|| intent.target_device_ids.first().cloned());
 
-        let stream = graph.streams.iter().find(|stream| stream.id == intent.stream_id);
+        let stream = graph
+            .streams
+            .iter()
+            .find(|stream| stream.id == intent.stream_id);
         let live_target_id = stream.and_then(|stream| stream.current_target.clone());
 
         if live_target_id == desired_target_id {
@@ -54,8 +57,7 @@ fn device_label(graph: &RuntimeGraph, device_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::core::models::{
-        Device, DeviceDirection, DeviceKind, RoutingIntent, RuntimeGraph, Stream,
-        StreamDirection,
+        Device, DeviceDirection, DeviceKind, RoutingIntent, RuntimeGraph, Stream, StreamDirection,
     };
 
     #[test]
@@ -70,6 +72,7 @@ mod tests {
                 stream_id: "slack".into(),
                 target_device_id: Some("speakers".into()),
                 target_device_ids: Vec::new(),
+                target_system_name: None,
             }],
             volume_state: Default::default(),
             device_assumptions: Default::default(),
@@ -89,6 +92,8 @@ mod tests {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: None,
+                    channels: None,
                 },
                 Device {
                     id: "speakers".into(),
@@ -102,6 +107,8 @@ mod tests {
                     current_target: None,
                     current_targets: Vec::new(),
                     mix_sources: Vec::new(),
+                    sample_rate: None,
+                    channels: None,
                 },
             ],
             streams: vec![Stream {
@@ -112,12 +119,13 @@ mod tests {
                 system_name: None,
                 direction: StreamDirection::Playback,
                 current_target: Some("headphones".into()),
-                current_targets: Vec::new(),
                 media_name: None,
                 is_system: false,
                 volume_percent: None,
                 muted: None,
                 route_explanation: None,
+                sample_rate: None,
+                channels: None,
             }],
             links: Vec::new(),
             data_source: "pipewire".into(),
@@ -128,7 +136,13 @@ mod tests {
         let drift = compare_profile_to_graph(&profile, &graph);
         assert!(drift.has_drift);
         assert_eq!(drift.items.len(), 1);
-        assert_eq!(drift.items[0].live_target_label.as_deref(), Some("Headphones"));
-        assert_eq!(drift.items[0].desired_target_label.as_deref(), Some("Speakers"));
+        assert_eq!(
+            drift.items[0].live_target_label.as_deref(),
+            Some("Headphones")
+        );
+        assert_eq!(
+            drift.items[0].desired_target_label.as_deref(),
+            Some("Speakers")
+        );
     }
 }

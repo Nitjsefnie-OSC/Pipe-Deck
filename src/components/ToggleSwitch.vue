@@ -2,6 +2,7 @@
 withDefaults(
   defineProps<{
     modelValue: boolean;
+    inputId?: string;
     disabled?: boolean;
     showStateLabels?: boolean;
   }>(),
@@ -21,7 +22,10 @@ function onChange(event: Event) {
 </script>
 
 <template>
-  <div class="toggle-switch-row" :class="{ 'toggle-switch-row--compact': !showStateLabels }">
+  <div
+    class="toggle-switch-row"
+    :class="{ 'toggle-switch-row--compact': !showStateLabels }"
+  >
     <span
       v-if="showStateLabels"
       class="toggle-state-label"
@@ -31,6 +35,7 @@ function onChange(event: Event) {
     </span>
     <label class="toggle-switch">
       <input
+        :id="inputId"
         type="checkbox"
         class="toggle-input"
         :checked="modelValue"

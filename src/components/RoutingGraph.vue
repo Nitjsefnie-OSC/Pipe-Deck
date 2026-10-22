@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { computed, markRaw, nextTick, onMounted, onUnmounted, provide, ref, watch } from "vue";
+import {
+  computed,
+  markRaw,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  provide,
+  ref,
+  watch,
+} from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import {
   VueFlow,
@@ -13,7 +22,8 @@ import {
   type NodeDragEvent,
 } from "@vue-flow/core";
 import { Background } from "@vue-flow/background";
-import { Controls } from "@vue-flow/controls";
+import { Controls, ControlButton } from "@vue-flow/controls";
+import LatencyPingPanel from "./LatencyPingPanel.vue";
 import RoutingGraphContextMenu from "./RoutingGraphContextMenu.vue";
 import RoutingGraphNode from "./RoutingGraphNode.vue";
 import RoutingGraphGroupNode from "./RoutingGraphGroupNode.vue";
@@ -22,21 +32,35 @@ import {
   applyRoutingConnection,
 } from "./routing-graph/applyConnection";
 import { nodeIdsForLink } from "./routing-graph/connectionRules";
-import { buildRoutingGraph, parseGraphNodeId, saveNodePosition } from "./routing-graph/buildGraph";
-import type { RoutingGraphHandle } from "./routing-graph/buildGraph";
-import { LEGEND_ENTRIES } from "./routing-graph/portTypes";
-import { canConnectPorts } from "./routing-graph/portTypes";
+import {
+  buildRoutingGraph,
+  parseGraphNodeId,
+  saveNodePosition,
+} from "./routing-graph/buildGraph";
+import type {
+  RoutingGraphHandle,
+  RoutingGraphNodeData,
+} from "./routing-graph/buildGraph";
+import { resolveConnectionValidity } from "./routing-graph/connectionValidation";
+import {
+  computeSlotPosition,
+  findDropTarget,
+} from "./routing-graph/dropTarget";
+import { planDirectionalInsert } from "./routing-graph/directionalInsert";
+import { detectNewlyAddedNodes } from "./routing-graph/fitViewTrigger";
+import {
+  defaultLabelForProcessingNodeType,
+  isProcessingNodeSystemName,
+  isProcessingNodeType,
+} from "./routing-graph/graphActions";
 import {
   boundsForMembers,
   containmentRatio,
   createGroup,
   loadGroups,
-  MEMBER_GAP,
-  nearestGroupEdge,
   reflowMembers,
   saveGroups,
   type GraphGroup,
-  type GraphRect,
   type GroupEdge,
   type GroupLayoutAxis,
   type GroupMemberInput,
@@ -45,11 +69,18 @@ import {
   routingGraphActionsKey,
   type RoutingGraphMenuTarget,
 } from "../composables/routingGraphContext";
+import {
+  loadExpandedGroupNodeIds,
+  saveExpandedGroupNodeIds,
+} from "../composables/groupExpansion";
 import { useApplyResult } from "../stores/notices";
 import { useEffectChain } from "../composables/useEffectChain";
+import { useEffectIsolation } from "../composables/useEffectIsolation";
+import { exportRoutingGraphImage } from "../composables/useRoutingGraphExport";
 import { useConfirm } from "../stores/confirm";
 import { useNewDeviceDialog } from "../stores/newDeviceDialog";
 import { usePrompt } from "../stores/prompt";
+import { useShortcutsModal } from "../stores/shortcutsModal";
 import { streamDisplayLabel } from "../utils/routingLayout";
 import type { RuntimeGraph } from "../types/graph";
 
@@ -57,12 +88,50 @@ const props = defineProps<{
   graph: RuntimeGraph;
 }>();
 
+// Issue #227: a subtle idle glow on nodes when nothing is routed yet,
+// distinguishing "nothing routed" from "app frozen/broken" — stops the
+// instant any link exists. `graph.links` only ever reflects device-to-device
+// pw-link fan-out (`apply_pw_link_device_routes`) — a stream routed through
+// a processing node (Mixer/Fan-out/Group/EQ/...) is represented purely via
+// `ProcessingNode.inputs[]`/`outputs[]`, never a `Link`, so without this
+// check routing a stream into e.g. a Group node (issue #80) — which then
+// genuinely reaches a real terminal output, same as a direct hardware
+// connection — would still read as "idle" indefinitely.
+const isIdle = computed(
+  () =>
+    props.graph.links.length === 0 &&
+    !(props.graph.processing_nodes ?? []).some((node) =>
+      node.inputs?.some((port) => port.connected_id),
+    ),
+);
+
 const { handleApplyResult } = useApplyResult();
 const { addEq5BandStage } = useEffectChain();
+const { isolatedNodeId, toggleIsolation, clearIsolation } =
+  useEffectIsolation();
 const { confirm } = useConfirm();
 const { prompt } = usePrompt();
 const { openNewDeviceDialog } = useNewDeviceDialog();
+const { openShortcutsModal } = useShortcutsModal();
 const vueFlow = useVueFlow();
+const isInteractive = computed(
+  () =>
+    vueFlow.nodesDraggable.value ||
+    vueFlow.nodesConnectable.value ||
+    vueFlow.elementsSelectable.value,
+);
+
+const exportingImage = ref(false);
+
+async function onExportImage() {
+  if (exportingImage.value) return;
+  exportingImage.value = true;
+  try {
+    await exportRoutingGraphImage(vueFlow, handleApplyResult);
+  } finally {
+    exportingImage.value = false;
+  }
+}
 
 const edgeUpdatePending = ref<Edge | null>(null);
 const contextMenu = ref<RoutingGraphMenuTarget | null>(null);
@@ -71,6 +140,26 @@ const groups = ref<GraphGroup[]>(loadGroups());
 function persistGroups() {
   saveGroups(groups.value);
 }
+
+// Issue #80/PD-035: a Group node's member-name list is collapsed by
+// default, toggled per-node — purely a canvas display preference, unrelated
+// to `groups`/`GraphGroup` above (the cosmetic bounding-box feature).
+const expandedGroupNodeIds = ref<Set<string>>(loadExpandedGroupNodeIds());
+
+function toggleGroupExpansionState(nodeId: string) {
+  const next = new Set(expandedGroupNodeIds.value);
+  if (next.has(nodeId)) {
+    next.delete(nodeId);
+  } else {
+    next.add(nodeId);
+  }
+  expandedGroupNodeIds.value = next;
+  saveExpandedGroupNodeIds(next);
+}
+
+// Hovering a Group member row highlights that member's real node elsewhere
+// on the canvas — transient, not persisted, unlike the expand state above.
+const highlightedNodeId = ref<string | null>(null);
 
 const graphActions = {
   openMenu(target: RoutingGraphMenuTarget) {
@@ -101,6 +190,10 @@ const graphActions = {
     contextMenu.value = null;
     void removeVirtualDevice(systemName, label);
   },
+  deleteProcessingNode(nodeId: string, label: string) {
+    contextMenu.value = null;
+    void removeProcessingNode(nodeId, label);
+  },
   renameGroup(groupId: string, label: string) {
     const group = groups.value.find((entry) => entry.id === groupId);
     if (!group) return;
@@ -125,7 +218,11 @@ const graphActions = {
       for (const memberId of group.memberIds) {
         const memberNode = vueFlow.findNode(memberId);
         if (memberNode) {
-          saveNodePosition(memberId, memberNode.computedPosition.x, memberNode.computedPosition.y);
+          saveNodePosition(
+            memberId,
+            memberNode.computedPosition.x,
+            memberNode.computedPosition.y,
+          );
         }
       }
     }
@@ -151,11 +248,39 @@ const graphActions = {
         ? { source: parsed.id, target: handle.connectedId }
         : { source: handle.connectedId, target: parsed.id };
     const ids = nodeIdsForLink(props.graph, source, target);
-    await applyEdgeDisconnect(props.graph, { source: ids.source, target: ids.target }, handleApplyResult);
+    await applyEdgeDisconnect(
+      props.graph,
+      { source: ids.source, target: ids.target },
+      handleApplyResult,
+    );
   },
   async addEffectStage(deviceId: string) {
     contextMenu.value = null;
     await addEq5BandStage(deviceId);
+  },
+  bringNodeHere(nodeId: string, x: number, y: number) {
+    contextMenu.value = null;
+    const flowPosition = vueFlow.screenToFlowCoordinate({ x, y });
+    saveNodePosition(nodeId, flowPosition.x, flowPosition.y);
+    layoutVersion.value += 1;
+  },
+  async isolateEffectNode(nodeId: string) {
+    await toggleIsolation(nodeId, props.graph, built.value.edges);
+  },
+  isEffectIsolated(nodeId: string) {
+    return isolatedNodeId.value === nodeId;
+  },
+  toggleGroupExpansion(nodeId: string) {
+    toggleGroupExpansionState(nodeId);
+  },
+  isGroupExpanded(nodeId: string) {
+    return expandedGroupNodeIds.value.has(nodeId);
+  },
+  setHighlightedNode(entityId: string | null) {
+    highlightedNodeId.value = entityId;
+  },
+  isNodeHighlighted(entityId: string) {
+    return highlightedNodeId.value === entityId;
   },
 };
 
@@ -168,7 +293,35 @@ async function saveDeviceAlias(systemName: string, alias: string) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     handleApplyResult(
-      { success: false, message: `Couldn't rename "${systemName}": ${message}` },
+      {
+        success: false,
+        message: `Couldn't rename "${systemName}": ${message}`,
+      },
+      "",
+    );
+  }
+}
+
+async function removeProcessingNode(nodeId: string, label: string) {
+  const confirmed = await confirm(`Delete "${label}"?`, {
+    title: "Delete processing node",
+    confirmLabel: "Delete",
+    cancelLabel: "Cancel",
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const response = await invoke<{ success: boolean; message?: string }>(
+      "remove_processing_node",
+      { id: nodeId },
+    );
+    handleApplyResult(response, "Processing node removed");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    handleApplyResult(
+      { success: false, message: `Couldn't delete "${label}": ${message}` },
       "",
     );
   }
@@ -198,13 +351,39 @@ async function removeVirtualDevice(systemName: string, label: string) {
 
 function onContextMenuAction(action: "rename" | "delete") {
   const target = contextMenu.value;
-  if (!target || target.kind !== "node") {
+  if (!target || target.kind !== "node" || !target.systemName) {
     return;
   }
   if (action === "rename") {
     void graphActions.renameDevice(target.systemName, target.label);
   } else if (action === "delete") {
-    graphActions.deleteDevice(target.systemName, target.label);
+    if (isProcessingNodeSystemName(target.systemName)) {
+      graphActions.deleteProcessingNode(target.entityId, target.label);
+    } else {
+      graphActions.deleteDevice(target.systemName, target.label);
+    }
+  }
+}
+
+async function onCopyIdAction() {
+  const target = contextMenu.value;
+  contextMenu.value = null;
+  if (!target || target.kind !== "node") {
+    return;
+  }
+  try {
+    // `entityId` is `node-<pipewire global id>` (see pw_dump.rs::node_id) —
+    // the bare numeric id is what's actually needed to kill an orphaned
+    // node directly (e.g. `pw-cli destroy 58`), so strip the internal
+    // "node-" prefix rather than exposing our own RuntimeGraph id format.
+    await navigator.clipboard.writeText(target.entityId.replace(/^node-/, ""));
+    handleApplyResult({ success: true }, "ID copied to clipboard.");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    handleApplyResult(
+      { success: false, message: `Couldn't copy ID: ${message}` },
+      "",
+    );
   }
 }
 
@@ -213,9 +392,111 @@ function onPaneContextMenu(event: MouseEvent) {
   contextMenu.value = { kind: "pane", x: event.clientX, y: event.clientY };
 }
 
-function onAddNodeAction(type: "output" | "input") {
+async function onAddNodeAction(
+  type:
+    | "output"
+    | "input"
+    | "fan_out"
+    | "mixer"
+    | "eq5band"
+    | "delay"
+    | "limiter"
+    | "hpf"
+    | "reverb"
+    | "widener"
+    | "pan"
+    | "compressor",
+) {
   contextMenu.value = null;
+  if (isProcessingNodeType(type)) {
+    const defaultLabel = defaultLabelForProcessingNodeType(type);
+    // Node ids are derived from this label (`processing-{kind}-{slug}`), so
+    // creating a second node of the same kind needs a distinct name — a
+    // fixed default would collide with the first and be rejected outright.
+    const label = await prompt({
+      title: `Name this ${defaultLabel} node`,
+      defaultValue: defaultLabel,
+      confirmLabel: "Add",
+    });
+    if (!label?.trim()) return;
+    try {
+      await invoke("create_processing_node", {
+        label: label.trim(),
+        kind: { kind: type },
+      });
+      handleApplyResult({ success: true }, `${label.trim()} node added`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      handleApplyResult(
+        {
+          success: false,
+          message: `Couldn't add ${defaultLabel.toLowerCase()} node: ${message}`,
+        },
+        "",
+      );
+    }
+    return;
+  }
   openNewDeviceDialog(type);
+}
+
+async function onGroupOutputsAction() {
+  const target = contextMenu.value;
+  contextMenu.value = null;
+  if (!target || target.kind !== "multi-node") return;
+
+  const name = await prompt({
+    title: "Name this group",
+    defaultValue: "Output Group",
+    confirmLabel: "Create",
+  });
+  const trimmed = name?.trim();
+  if (!trimmed) return;
+
+  try {
+    await invoke("create_output_group", {
+      label: trimmed,
+      memberDeviceIds: target.memberDeviceIds,
+    });
+    handleApplyResult({ success: true }, `${trimmed} group created`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    handleApplyResult(
+      { success: false, message: `Couldn't create group: ${message}` },
+      "",
+    );
+  }
+}
+
+async function onAddStubNodeAction(stubKind: string, defaultLabel: string) {
+  contextMenu.value = null;
+  // Same node-id-from-label collision as the fan_out/mixer/eq5band case
+  // above — a second node of the same stub kind needs a distinct name too.
+  const label = await prompt({
+    title: `Name this ${defaultLabel} node`,
+    defaultValue: defaultLabel,
+    confirmLabel: "Add",
+  });
+  if (!label?.trim()) return;
+  try {
+    await invoke("create_processing_node", {
+      label: label.trim(),
+      kind: { kind: "stub", stub_kind: stubKind },
+    });
+    handleApplyResult({ success: true }, "Effect node added");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    handleApplyResult(
+      { success: false, message: `Couldn't add effect node: ${message}` },
+      "",
+    );
+  }
+}
+
+function onBringNodeHereAction(nodeId: string) {
+  const target = contextMenu.value;
+  if (!target || target.kind !== "pane") return;
+  graphActions.bringNodeHere(nodeId, target.x, target.y);
 }
 
 function onAddEffectAction(kind: string) {
@@ -248,6 +529,10 @@ const defaultEdgeOptions = {
 // layout, but nothing here depends on it, so the computed cache is stale).
 const layoutVersion = ref(0);
 const built = computed(() => {
+  // Deliberate reactive-dependency read with no other use — registers
+  // layoutVersion as a computed dependency so a drag-persisted layout
+  // change recomputes immediately (see comment above).
+  // eslint-disable-next-line @typescript-eslint/no-unused-expressions
   layoutVersion.value;
   return buildRoutingGraph(props.graph, groups.value);
 });
@@ -325,24 +610,46 @@ const dropSlotOverlayStyle = computed(() => {
     height: `${preview.height * viewport.zoom}px`,
   };
 });
-const edges = computed<Edge[]>(() =>
-  built.value.edges.map((edge) => ({
-    ...edge,
-    markerEnd: {
-      type: MarkerType.ArrowClosed,
-      color: edge.style?.stroke ?? "#7c5cff",
-      width: 18,
-      height: 18,
-    },
-  })) as Edge[],
+// Group nodes aren't individually addressable placement targets — they're
+// repositioned as a unit via their own drag handling, not "brought here"
+// like a stream/device node.
+const pickableNodes = computed(() =>
+  built.value.nodes
+    .filter((node) => node.type !== "groupNode")
+    .map((node) => ({ id: node.id, label: node.data.label })),
 );
 
-const legend = LEGEND_ENTRIES;
+const edges = computed<Edge[]>(
+  () =>
+    built.value.edges.map((edge) => ({
+      ...edge,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: edge.style?.stroke ?? "#7c5cff",
+        width: 18,
+        height: 18,
+      },
+    })) as Edge[],
+);
 
 watch(
   () => props.graph,
   () => {
     contextMenu.value = null;
+    // Isolate's bookkeeping only tracks which nodes it bypassed, not whether
+    // the isolated node itself still exists — if it was deleted mid-isolate,
+    // restore its siblings rather than leaving them bypassed forever.
+    if (isolatedNodeId.value) {
+      const parsed = parseGraphNodeId(isolatedNodeId.value);
+      const stillExists =
+        parsed?.kind === "processingNode" &&
+        (props.graph.processing_nodes ?? []).some(
+          (node) => node.id === parsed.id,
+        );
+      if (!stillExists) {
+        void clearIsolation();
+      }
+    }
   },
   { deep: true },
 );
@@ -370,12 +677,7 @@ watch(vueFlow.connectionClickStartHandle, (handle) => {
 });
 
 function isValidConnection(connection: Connection) {
-  // Vue Flow reuses this callback both for a live user drag (a bare Connection,
-  // no `id`) and to re-validate every already-persisted edge on each resync
-  // (which carries its own `id`). Only the former should require the target to
-  // be the open trailing slot.
-  const isExistingEdge = Boolean((connection as unknown as { id?: string }).id);
-  return canConnectPorts(connection.sourceHandle, connection.targetHandle, !isExistingEdge);
+  return resolveConnectionValidity(connection, edgeUpdatePending.value);
 }
 
 async function commitConnection(
@@ -430,7 +732,10 @@ function onPaneClick() {
 
 function onDocumentPointerDown(event: PointerEvent) {
   const target = event.target;
-  if (target instanceof Element && target.closest(".routing-graph-context-menu")) {
+  if (
+    target instanceof Element &&
+    target.closest(".routing-graph-context-menu")
+  ) {
     return;
   }
   contextMenu.value = null;
@@ -446,7 +751,10 @@ function groupMemberInputs(group: GraphGroup): GroupMemberInput[] {
       if (!memberNode) return null;
       return {
         id,
-        position: { x: memberNode.computedPosition.x, y: memberNode.computedPosition.y },
+        position: {
+          x: memberNode.computedPosition.x,
+          y: memberNode.computedPosition.y,
+        },
         width: memberNode.dimensions.width || 200,
         height: memberNode.dimensions.height || 80,
       };
@@ -480,88 +788,28 @@ function reflowAndSaveGroup(group: GraphGroup) {
   group.size = bounds.size;
 }
 
-/** Where a new member would land if inserted at `edge` of `group`, given its current members. */
-function computeSlotPosition(
-  group: GraphGroup,
-  axis: GroupLayoutAxis,
-  edge: GroupEdge,
-  nodeRect: GraphRect,
-): { x: number; y: number } {
-  const members = groupMemberInputs(group);
-  if (members.length === 0) {
-    return { x: group.position.x, y: group.position.y };
-  }
-  if (axis === "row") {
-    const top = Math.min(...members.map((member) => member.position.y));
-    if (edge === "left") {
-      const minX = Math.min(...members.map((member) => member.position.x));
-      return { x: minX - MEMBER_GAP - nodeRect.width, y: top };
-    }
-    const maxX = Math.max(...members.map((member) => member.position.x + member.width));
-    return { x: maxX + MEMBER_GAP, y: top };
-  }
-  const left = Math.min(...members.map((member) => member.position.x));
-  if (edge === "top") {
-    const minY = Math.min(...members.map((member) => member.position.y));
-    return { x: left, y: minY - MEMBER_GAP - nodeRect.height };
-  }
-  const maxY = Math.max(...members.map((member) => member.position.y + member.height));
-  return { x: left, y: maxY + MEMBER_GAP };
-}
-
-/** Finds which group (if any) a loose node dragged to `nodeRect` should join, and at which edge. */
-function findDropTarget(
-  nodeRect: GraphRect,
-): { group: GraphGroup; axis: GroupLayoutAxis; edge: GroupEdge } | null {
-  for (const group of groups.value) {
-    const groupRect = {
-      x: group.position.x,
-      y: group.position.y,
-      width: group.size.width,
-      height: group.size.height,
-    };
-    const edge = nearestGroupEdge(nodeRect, groupRect);
-    if (edge) {
-      const axis: GroupLayoutAxis = edge === "left" || edge === "right" ? "row" : "column";
-      return { group, axis, edge };
-    }
-  }
-  return null;
-}
-
 function commitDirectionalInsert(
   group: GraphGroup,
   axis: GroupLayoutAxis,
   edge: GroupEdge,
   node: { id: string; dimensions: { width: number; height: number } },
 ) {
-  const nodeRect = {
-    x: 0,
-    y: 0,
-    width: node.dimensions.width || 200,
-    height: node.dimensions.height || 80,
-  };
-  const slotPosition = computeSlotPosition(group, axis, edge, nodeRect);
-  const newMember: GroupMemberInput = {
-    id: node.id,
-    position: slotPosition,
-    width: nodeRect.width,
-    height: nodeRect.height,
-  };
-  const existingMembers = groupMemberInputs(group);
-  const prepend = edge === "left" || edge === "top";
-  const orderedMembers = prepend ? [newMember, ...existingMembers] : [...existingMembers, newMember];
-
-  const { positions, bounds } = reflowMembers(axis, orderedMembers);
-  for (const member of orderedMembers) {
-    const position = positions[member.id];
+  const plan = planDirectionalInsert(
+    groupMemberInputs(group),
+    group.position,
+    axis,
+    edge,
+    node,
+  );
+  for (const member of plan.orderedMembers) {
+    const position = plan.positions[member.id];
     saveNodePosition(member.id, position.x, position.y);
   }
 
-  group.memberIds = orderedMembers.map((member) => member.id);
+  group.memberIds = plan.orderedMembers.map((member) => member.id);
   group.layoutAxis = axis;
-  group.position = bounds.position;
-  group.size = bounds.size;
+  group.position = plan.bounds.position;
+  group.size = plan.bounds.size;
 }
 
 function onNodeDragStart(event: NodeDragEvent) {
@@ -584,7 +832,11 @@ function onNodeDrag(event: NodeDragEvent) {
   // (onNodeDragStop) already owns the "member being pulled out" case, and a
   // parented member's `position` is parent-relative, not absolute, so it
   // can't be fed through the same absolute-rect math below.
-  if (node.type === "groupNode" || node.type === "dropSlotNode" || node.parentNode) {
+  if (
+    node.type === "groupNode" ||
+    node.type === "dropSlotNode" ||
+    node.parentNode
+  ) {
     dropSlotPreview.value = null;
     return;
   }
@@ -599,13 +851,19 @@ function onNodeDrag(event: NodeDragEvent) {
     width: node.dimensions.width,
     height: node.dimensions.height,
   };
-  const target = findDropTarget(nodeRect);
+  const target = findDropTarget(nodeRect, groups.value);
   if (!target) {
     dropSlotPreview.value = null;
     return;
   }
 
-  const slotPosition = computeSlotPosition(target.group, target.axis, target.edge, nodeRect);
+  const slotPosition = computeSlotPosition(
+    groupMemberInputs(target.group),
+    target.group.position,
+    target.axis,
+    target.edge,
+    nodeRect,
+  );
   dropSlotPreview.value = {
     groupId: target.group.id,
     axis: target.axis,
@@ -618,7 +876,9 @@ function onNodeDrag(event: NodeDragEvent) {
 
 function onNodeDragStop(event: NodeDragEvent) {
   const node = event.node;
-  const idsToClear = event.nodes?.length ? event.nodes.map((n) => n.id) : [node.id];
+  const idsToClear = event.nodes?.length
+    ? event.nodes.map((n) => n.id)
+    : [node.id];
   const next = new Set(draggingNodeIds.value);
   for (const id of idsToClear) {
     next.delete(id);
@@ -629,7 +889,10 @@ function onNodeDragStop(event: NodeDragEvent) {
   if (node.type === "groupNode") {
     const group = groups.value.find((entry) => entry.id === node.id);
     if (group) {
-      group.position = { x: node.computedPosition.x, y: node.computedPosition.y };
+      group.position = {
+        x: node.computedPosition.x,
+        y: node.computedPosition.y,
+      };
       // Vue Flow already moved member nodes along with the group during the drag (they
       // track it live via parentNode). Persist each member's up-to-date absolute position
       // now, otherwise the next rebuild recomputes their offset from stale saved
@@ -637,7 +900,11 @@ function onNodeDragStop(event: NodeDragEvent) {
       for (const memberId of group.memberIds) {
         const memberNode = vueFlow.findNode(memberId);
         if (memberNode) {
-          saveNodePosition(memberId, memberNode.computedPosition.x, memberNode.computedPosition.y);
+          saveNodePosition(
+            memberId,
+            memberNode.computedPosition.x,
+            memberNode.computedPosition.y,
+          );
         }
       }
       layoutVersion.value += 1;
@@ -650,7 +917,11 @@ function onNodeDragStop(event: NodeDragEvent) {
   // during this drag (multi-select); fall back to just node for a single drag.
   const draggedNodes = event.nodes?.length ? event.nodes : [node];
   for (const draggedNode of draggedNodes) {
-    saveNodePosition(draggedNode.id, draggedNode.computedPosition.x, draggedNode.computedPosition.y);
+    saveNodePosition(
+      draggedNode.id,
+      draggedNode.computedPosition.x,
+      draggedNode.computedPosition.y,
+    );
   }
   layoutVersion.value += 1;
 
@@ -665,7 +936,9 @@ function onNodeDragStop(event: NodeDragEvent) {
     height: node.dimensions.height,
   };
 
-  const currentGroup = groups.value.find((entry) => entry.memberIds.includes(node.id));
+  const currentGroup = groups.value.find((entry) =>
+    entry.memberIds.includes(node.id),
+  );
   if (currentGroup) {
     const groupRect = {
       x: currentGroup.position.x,
@@ -674,9 +947,13 @@ function onNodeDragStop(event: NodeDragEvent) {
       height: currentGroup.size.height,
     };
     if (containmentRatio(nodeRect, groupRect) < DETACH_THRESHOLD) {
-      currentGroup.memberIds = currentGroup.memberIds.filter((id) => id !== node.id);
+      currentGroup.memberIds = currentGroup.memberIds.filter(
+        (id) => id !== node.id,
+      );
       if (currentGroup.memberIds.length === 0) {
-        groups.value = groups.value.filter((entry) => entry.id !== currentGroup.id);
+        groups.value = groups.value.filter(
+          (entry) => entry.id !== currentGroup.id,
+        );
       } else {
         reflowAndSaveGroup(currentGroup);
       }
@@ -688,7 +965,7 @@ function onNodeDragStop(event: NodeDragEvent) {
   // Node isn't in any group yet — a directional drop near an existing
   // group's edge (left/right/top/bottom) inserts it there, growing the
   // group and reflowing members into an aligned row/column.
-  const target = findDropTarget(nodeRect);
+  const target = findDropTarget(nodeRect, groups.value);
   if (target) {
     commitDirectionalInsert(target.group, target.axis, target.edge, node);
     persistGroups();
@@ -698,7 +975,10 @@ function onNodeDragStop(event: NodeDragEvent) {
 const MIN_GROUP_SELECTION = 2;
 
 function isTypingTarget(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && ["INPUT", "TEXTAREA"].includes(target.tagName);
+  return (
+    target instanceof HTMLElement &&
+    ["INPUT", "TEXTAREA"].includes(target.tagName)
+  );
 }
 
 async function onWindowKeydown(event: KeyboardEvent) {
@@ -708,7 +988,12 @@ async function onWindowKeydown(event: KeyboardEvent) {
     return;
   }
 
-  if (event.key.toLowerCase() !== "g" || event.metaKey || event.ctrlKey || event.altKey) {
+  if (
+    event.key.toLowerCase() !== "g" ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.altKey
+  ) {
     return;
   }
   if (isTypingTarget(event.target)) return;
@@ -741,31 +1026,44 @@ async function onWindowKeydown(event: KeyboardEvent) {
 }
 
 const knownNodeIds = ref<Set<string> | null>(null);
+// Tracks stream nodes' `streamIdentityKey` (app_name/executable/media_name,
+// not the PipeWire node id) across ticks, alongside `knownNodeIds` — a
+// stream's underlying node can be torn down and recreated with a new node id
+// for reasons unrelated to the user actually adding a new source (e.g.
+// Firefox recreating its audio node when a tab's playback pauses/resumes).
+// Without this, that reappearance reads as a brand-new node and triggers the
+// fitView re-center/zoom below, which visually reads as the graph "jumping".
+const knownStreamIdentityKeys = ref<Set<string> | null>(null);
 
 // Nodes carry a variable number of handles (one per live connection, plus a
 // trailing empty slot) that changes as routing changes. Vue Flow caches each
 // handle's rendered position and only recomputes it on an explicit nudge, so
 // without this, edges/arrows draw at stale coordinates until something else
 // (e.g. a window resize) forces a recalculation.
-watch(
-  nodes,
-  async (current) => {
-    await nextTick();
-    vueFlow.updateNodeInternals(current.map((node) => node.id));
+watch(nodes, async (current) => {
+  await nextTick();
+  vueFlow.updateNodeInternals(current.map((node) => node.id));
 
-    const currentIds = new Set(current.map((node) => node.id));
-    if (knownNodeIds.value === null) {
-      knownNodeIds.value = currentIds;
-      return;
-    }
+  const trackedNodes = current.map((node) => ({
+    id: node.id,
+    identityKey: (node.data as RoutingGraphNodeData)?.streamIdentityKey,
+  }));
+  const result = detectNewlyAddedNodes(
+    trackedNodes,
+    knownNodeIds.value,
+    knownStreamIdentityKeys.value,
+  );
+  knownNodeIds.value = result.nodeIds;
+  knownStreamIdentityKeys.value = result.identityKeys;
+  if (result.addedIds.length === 0) return;
 
-    const addedIds = [...currentIds].filter((id) => !knownNodeIds.value!.has(id));
-    knownNodeIds.value = currentIds;
-    if (addedIds.length === 0) return;
-
-    await vueFlow.fitView({ nodes: addedIds, padding: 0.35, duration: 400, maxZoom: 1 });
-  },
-);
+  await vueFlow.fitView({
+    nodes: result.addedIds,
+    padding: 0.35,
+    duration: 400,
+    maxZoom: 1,
+  });
+});
 
 onMounted(() => {
   localStorage.removeItem("pipe-deck-routing-reroutes");
@@ -781,30 +1079,35 @@ onUnmounted(() => {
 
 <template>
   <div class="routing-graph-shell">
-    <div class="routing-graph-live-region" aria-live="polite">{{ keyboardConnectMessage }}</div>
-    <div class="routing-graph-legend" aria-label="Connection color legend">
-      <span class="routing-graph-legend-title">Output connects to input</span>
-      <div class="routing-graph-legend-items">
-        <span v-for="entry in legend" :key="entry.key" class="routing-graph-legend-item">
-          <span class="routing-graph-legend-swatch" :style="{ background: entry.color }" />
-          {{ entry.label }}
-        </span>
-        <span class="routing-graph-legend-hint">
-          Drag wire ends off a port to disconnect · Shift+drag to select multiple nodes · Press G to group ·
-          Right-click empty space to add a node · Tab to a port and press Enter to connect it, Delete to
-          disconnect it, Escape to cancel
-        </span>
-      </div>
+    <div class="routing-graph-live-region" aria-live="polite">
+      {{ keyboardConnectMessage }}
     </div>
     <RoutingGraphContextMenu
       :target="contextMenu"
+      :nodes="pickableNodes"
       @rename="onContextMenuAction('rename')"
       @delete="onContextMenuAction('delete')"
+      @copy-id="onCopyIdAction"
       @add-node="onAddNodeAction"
+      @add-stub-node="onAddStubNodeAction"
       @add-effect="onAddEffectAction"
+      @bring-node-here="onBringNodeHereAction"
+      @group-outputs="onGroupOutputsAction"
       @close="contextMenu = null"
     />
-    <div class="routing-graph-canvas">
+    <div
+      class="routing-graph-canvas"
+      :class="{ 'routing-graph-canvas--idle': isIdle }"
+    >
+      <button
+        type="button"
+        class="routing-graph-help-btn"
+        aria-label="Routing graph help"
+        title="How to connect/disconnect, shortcuts, and the connection legend"
+        @click="openShortcutsModal()"
+      >
+        ?
+      </button>
       <VueFlow
         :nodes="nodes"
         :edges="edges"
@@ -826,10 +1129,101 @@ onUnmounted(() => {
         @pane-click="onPaneClick"
         @pane-context-menu="onPaneContextMenu"
       >
-        <Background pattern-color="rgba(255,255,255,0.04)" :gap="20" />
-        <Controls />
+        <Background
+          pattern-color="rgba(255,255,255,0.15)"
+          :gap="20"
+          :size="1.5"
+        />
+        <Controls>
+          <template #control-zoom-in>
+            <ControlButton
+              aria-label="Zoom in"
+              title="Zoom in"
+              @click="vueFlow.zoomIn()"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+                <path
+                  d="M32 18.133H18.133V32h-4.266V18.133H0v-4.266h13.867V0h4.266v13.867H32z"
+                />
+              </svg>
+            </ControlButton>
+          </template>
+          <template #control-zoom-out>
+            <ControlButton
+              aria-label="Zoom out"
+              title="Zoom out"
+              @click="vueFlow.zoomOut()"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 5">
+                <path d="M0 0h32v4.2H0z" />
+              </svg>
+            </ControlButton>
+          </template>
+          <template #control-fit-view>
+            <ControlButton
+              aria-label="Fit view"
+              title="Fit view to all nodes"
+              @click="vueFlow.fitView()"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 30">
+                <path
+                  d="M3.692 4.63c0-.53.4-.938.939-.938h5.215V0H4.708C2.13 0 0 2.054 0 4.63v5.216h3.692V4.631zM27.354 0h-5.2v3.692h5.17c.53 0 .984.4.984.939v5.215H32V4.631A4.624 4.624 0 0 0 27.354 0zm.954 24.83c0 .532-.4.94-.939.94h-5.215v3.768h5.215c2.577 0 4.631-2.13 4.631-4.707v-5.139h-3.692v5.139zm-23.677.94a.919.919 0 0 1-.939-.94v-5.138H0v5.139c0 2.577 2.13 4.707 4.708 4.707h5.138V25.77H4.631z"
+                />
+              </svg>
+            </ControlButton>
+          </template>
+          <template #control-interactive>
+            <ControlButton
+              :aria-label="
+                isInteractive
+                  ? 'Lock canvas (disable drag and select)'
+                  : 'Unlock canvas (enable drag and select)'
+              "
+              :title="isInteractive ? 'Lock canvas' : 'Unlock canvas'"
+              @click="vueFlow.setInteractive(!isInteractive)"
+            >
+              <svg
+                v-if="isInteractive"
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 25 32"
+              >
+                <path
+                  d="M21.333 10.667H19.81V7.619C19.81 3.429 16.38 0 12.19 0c-4.114 1.828-1.37 2.133.305 2.438 1.676.305 4.42 2.59 4.42 5.181v3.048H3.047A3.056 3.056 0 0 0 0 13.714v15.238A3.056 3.056 0 0 0 3.048 32h18.285a3.056 3.056 0 0 0 3.048-3.048V13.714a3.056 3.056 0 0 0-3.048-3.047zM12.19 24.533a3.056 3.056 0 0 1-3.047-3.047 3.056 3.056 0 0 1 3.047-3.048 3.056 3.056 0 0 1 3.048 3.048 3.056 3.056 0 0 1-3.048 3.047z"
+                />
+              </svg>
+              <svg
+                v-else
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 25 32"
+              >
+                <path
+                  d="M21.333 10.667H19.81V7.619C19.81 3.429 16.38 0 12.19 0 8 0 4.571 3.429 4.571 7.619v3.048H3.048A3.056 3.056 0 0 0 0 13.714v15.238A3.056 3.056 0 0 0 3.048 32h18.285a3.056 3.056 0 0 0 3.048-3.048V13.714a3.056 3.056 0 0 0-3.048-3.047zM12.19 24.533a3.056 3.056 0 0 1-3.047-3.047 3.056 3.056 0 0 1 3.047-3.048 3.056 3.056 0 0 1 3.048 3.048 3.056 3.056 0 0 1-3.048 3.047zm4.724-13.866H7.467V7.619c0-2.59 2.133-4.724 4.723-4.724 2.591 0 4.724 2.133 4.724 4.724v3.048z"
+                />
+              </svg>
+            </ControlButton>
+          </template>
+          <ControlButton
+            aria-label="Export routing graph as PNG"
+            :title="
+              exportingImage ? 'Exporting…' : 'Export routing graph as PNG'
+            "
+            :disabled="exportingImage"
+            @click="onExportImage"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+              <path
+                d="M16 2a1.5 1.5 0 0 1 1.5 1.5v14.379l3.94-3.94a1.5 1.5 0 1 1 2.12 2.122l-6.5 6.5a1.5 1.5 0 0 1-2.12 0l-6.5-6.5a1.5 1.5 0 1 1 2.12-2.122l3.94 3.94V3.5A1.5 1.5 0 0 1 16 2zM4 22a1.5 1.5 0 0 1 1.5 1.5V27a1.5 1.5 0 0 0 1.5 1.5h18a1.5 1.5 0 0 0 1.5-1.5v-3.5a1.5 1.5 0 0 1 3 0V27a4.5 4.5 0 0 1-4.5 4.5H7A4.5 4.5 0 0 1 2.5 27v-3.5A1.5 1.5 0 0 1 4 22z"
+              />
+            </svg>
+          </ControlButton>
+        </Controls>
       </VueFlow>
-      <div v-if="dropSlotOverlayStyle" class="routing-graph-drop-slot-overlay" :style="dropSlotOverlayStyle" />
+      <div
+        v-if="dropSlotOverlayStyle"
+        class="routing-graph-drop-slot-overlay"
+        :style="dropSlotOverlayStyle"
+      />
+      <LatencyPingPanel :graph="props.graph" :edges="built.edges" />
     </div>
   </div>
 </template>

@@ -8,7 +8,9 @@ pub async fn get_profile(
     state: State<'_, AppState>,
 ) -> Result<Profile, String> {
     let engine = state.engine.read().await;
-    engine.get_profile(&profile_id).map_err(|error| error.to_string())
+    engine
+        .get_profile(&profile_id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -20,6 +22,14 @@ pub async fn save_profile(
     let mut engine = state.engine.write().await;
     engine
         .save_profile(&profile_id, name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_profile(profile_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut engine = state.engine.write().await;
+    engine
+        .delete_profile(&profile_id)
         .map_err(|error| error.to_string())
 }
 

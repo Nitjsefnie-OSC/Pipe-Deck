@@ -1,18 +1,31 @@
-use crate::core::models::{DeviceDirection, DeviceKind, RuntimeGraph, StreamDirection};
-use crate::backend::BackendError;
 use crate::backend::linux::pactl::parse::{find_sink_input_index, find_source_output_index};
 use crate::backend::linux::pactl::run_pactl;
+use crate::backend::linux::pw_mixer_native as native;
+use crate::backend::BackendError;
+use crate::core::models::{DeviceDirection, DeviceKind, RuntimeGraph, StreamDirection};
 
 /// Moves a single sink-input (an app's playback stream) onto a different
 /// sink by raw name, bypassing `RuntimeGraph` lookup. Used to temporarily
 /// hold an in-use device's streams elsewhere while its underlying module is
 /// swapped out for an effects-hosted one, then move them back — see
 /// `core::engine::effects_ops::apply_effect_chain_structural`.
-pub fn move_sink_input_to_sink_name(sink_input_index: u32, target_sink_name: &str) -> Result<(), BackendError> {
-    run_pactl(&["move-sink-input", &sink_input_index.to_string(), target_sink_name]).map(|_| ())
+pub fn move_sink_input_to_sink_name(
+    sink_input_index: u32,
+    target_sink_name: &str,
+) -> Result<(), BackendError> {
+    run_pactl(&[
+        "move-sink-input",
+        &sink_input_index.to_string(),
+        target_sink_name,
+    ])
+    .map(|_| ())
 }
 
-pub fn set_device_volume(device_id: &str, graph: &RuntimeGraph, percent: u8) -> Result<(), BackendError> {
+pub fn set_device_volume(
+    device_id: &str,
+    graph: &RuntimeGraph,
+    percent: u8,
+) -> Result<(), BackendError> {
     let device = graph
         .devices
         .iter()
@@ -20,49 +33,70 @@ pub fn set_device_volume(device_id: &str, graph: &RuntimeGraph, percent: u8) -> 
         .ok_or_else(|| BackendError::Message(format!("device not found: {device_id}")))?;
 
     let percent = percent.min(100);
-    let volume_arg = format!("{percent}%");
+    let channels = device.channels.unwrap_or(2).max(1);
+
     match device.direction {
         DeviceDirection::Output | DeviceDirection::Duplex => {
+            let monitor_name =
+                uses_monitor_fan_out(device).then(|| monitor_source_name(&device.system_name));
+            if let Some(result) = native::set_device_volume(
+                &device.system_name,
+                percent,
+                channels,
+                monitor_name.as_deref(),
+            ) {
+                return result;
+            }
+            let volume_arg = format!("{percent}%");
             run_pactl(&["set-sink-volume", &device.system_name, &volume_arg])?;
-            if uses_monitor_fan_out(device) {
-                run_pactl(&[
-                    "set-source-volume",
-                    &monitor_source_name(&device.system_name),
-                    &volume_arg,
-                ])?;
+            if let Some(monitor_name) = monitor_name {
+                run_pactl(&["set-source-volume", &monitor_name, &volume_arg])?;
             }
         }
         DeviceDirection::Input => {
-            run_pactl(&[
-                "set-source-volume",
-                &device.system_name,
-                &volume_arg,
-            ])?;
+            if let Some(result) =
+                native::set_device_volume(&device.system_name, percent, channels, None)
+            {
+                return result;
+            }
+            let volume_arg = format!("{percent}%");
+            run_pactl(&["set-source-volume", &device.system_name, &volume_arg])?;
         }
     }
     Ok(())
 }
 
-pub fn set_device_mute(device_id: &str, graph: &RuntimeGraph, muted: bool) -> Result<(), BackendError> {
+pub fn set_device_mute(
+    device_id: &str,
+    graph: &RuntimeGraph,
+    muted: bool,
+) -> Result<(), BackendError> {
     let device = graph
         .devices
         .iter()
         .find(|device| device.id == device_id)
         .ok_or_else(|| BackendError::Message(format!("device not found: {device_id}")))?;
 
-    let flag = if muted { "1" } else { "0" };
     match device.direction {
         DeviceDirection::Output | DeviceDirection::Duplex => {
+            let monitor_name =
+                uses_monitor_fan_out(device).then(|| monitor_source_name(&device.system_name));
+            if let Some(result) =
+                native::set_device_mute(&device.system_name, muted, monitor_name.as_deref())
+            {
+                return result;
+            }
+            let flag = if muted { "1" } else { "0" };
             run_pactl(&["set-sink-mute", &device.system_name, flag])?;
-            if uses_monitor_fan_out(device) {
-                run_pactl(&[
-                    "set-source-mute",
-                    &monitor_source_name(&device.system_name),
-                    flag,
-                ])?;
+            if let Some(monitor_name) = monitor_name {
+                run_pactl(&["set-source-mute", &monitor_name, flag])?;
             }
         }
         DeviceDirection::Input => {
+            if let Some(result) = native::set_device_mute(&device.system_name, muted, None) {
+                return result;
+            }
+            let flag = if muted { "1" } else { "0" };
             run_pactl(&["set-source-mute", &device.system_name, flag])?;
         }
     }
@@ -88,11 +122,7 @@ pub fn set_stream_volume(
         }
         StreamDirection::Capture => {
             let index = find_source_output_index(graph, stream)?;
-            run_pactl(&[
-                "set-source-output-volume",
-                &index.to_string(),
-                &volume_arg,
-            ])?;
+            run_pactl(&["set-source-output-volume", &index.to_string(), &volume_arg])?;
         }
     }
     Ok(())
@@ -127,6 +157,9 @@ pub fn set_stream_mute(
 /// `RuntimeGraph` lookup. Used for per-mix-source feed sinks, which are
 /// intentionally hidden from the graph's device list.
 pub fn set_sink_volume_by_name(system_name: &str, percent: u8) -> Result<(), BackendError> {
+    if let Some(result) = native::set_device_volume(system_name, percent, 2, None) {
+        return result;
+    }
     let volume_arg = format!("{}%", percent.min(100));
     run_pactl(&["set-sink-volume", system_name, &volume_arg]).map(|_| ())
 }
@@ -134,6 +167,9 @@ pub fn set_sink_volume_by_name(system_name: &str, percent: u8) -> Result<(), Bac
 /// Reads the current volume of a sink by its raw system/module name. Used to
 /// reflect a per-mix-source feed sink's gain back into the runtime graph.
 pub fn sink_volume_percent(system_name: &str) -> Result<Option<u8>, BackendError> {
+    if let Some(result) = native::channel_volume_percent(system_name) {
+        return result;
+    }
     let output = run_pactl(&["list", "sinks"])?;
     let mut current_name = None;
 
@@ -156,12 +192,18 @@ pub fn sink_volume_percent(system_name: &str) -> Result<Option<u8>, BackendError
 /// Muting here never touches any `pw-link` connection: the feed sink stays
 /// wired exactly as it was, only its own mute flag changes.
 pub fn set_sink_mute_by_name(system_name: &str, muted: bool) -> Result<(), BackendError> {
+    if let Some(result) = native::set_device_mute(system_name, muted, None) {
+        return result;
+    }
     let flag = if muted { "1" } else { "0" };
     run_pactl(&["set-sink-mute", system_name, flag]).map(|_| ())
 }
 
 /// Reads the current mute state of a sink by its raw system/module name.
 pub fn sink_mute_state(system_name: &str) -> Result<Option<bool>, BackendError> {
+    if let Some(result) = native::mute_state(system_name) {
+        return result;
+    }
     let output = run_pactl(&["list", "sinks"])?;
     let mut current_name = None;
 

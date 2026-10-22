@@ -1,6 +1,7 @@
 use crate::core::models::{
-    AppConfig, DeviceAliasEntry, EffectChainConfig, PluginEntry, Preferences, ProfileIndexEntry,
-    Rule, RoutingRulesConfig, VirtualDeviceSpec,
+    AppConfig, DeviceAliasEntry, EffectChainConfig, Preferences, ProcessingNodePortSpec,
+    ProcessingNodeSpec, ProcessingNodeSpecKind, ProfileIndexEntry, RoutingRulesConfig, Rule,
+    VirtualDeviceSpec,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -20,6 +21,12 @@ pub struct ConfigStore {
 }
 
 const EFFECTS_PLUGIN_ID: &str = "pipe-deck-effects";
+
+impl Default for ConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ConfigStore {
     pub fn new() -> Self {
@@ -63,6 +70,7 @@ impl ConfigStore {
             routing_rules: RoutingRulesConfig::default(),
             rules: Vec::new(),
             virtual_devices: Vec::new(),
+            processing_nodes: Vec::new(),
             plugins: HashMap::new(),
         }
     }
@@ -87,8 +95,378 @@ impl ConfigStore {
 
         let contents = fs::read_to_string(&path)
             .map_err(|error| ConfigError::Read(format!("{path:?}: {error}")))?;
-        serde_yaml::from_str(&contents)
-            .map_err(|error| ConfigError::Read(format!("{path:?}: {error}")))
+        let mut config: AppConfig = serde_yaml::from_str(&contents)
+            .map_err(|error| ConfigError::Read(format!("{path:?}: {error}")))?;
+        if migrate_mix_sources_to_mixer_nodes(&mut config) {
+            // Best-effort: a failed write here just means this same
+            // migration re-runs (harmlessly, idempotently) on the next load
+            // instead of being durable yet.
+            let _ = self.save_config(&config);
+        }
+        Ok(config)
+    }
+
+    pub fn processing_nodes(&self) -> Vec<ProcessingNodeSpec> {
+        self.load_config()
+            .map(|config| config.processing_nodes)
+            .unwrap_or_default()
+    }
+
+    pub fn save_processing_nodes(&self, nodes: &[ProcessingNodeSpec]) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.processing_nodes = nodes.to_vec();
+        self.save_config(&config)
+    }
+
+    pub fn add_processing_node(&self, spec: ProcessingNodeSpec) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.processing_nodes.push(spec);
+        self.save_config(&config)
+    }
+
+    pub fn remove_processing_node(&self, id: &str) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.processing_nodes.retain(|node| node.id != id);
+        self.save_config(&config)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_processing_node_eq(
+        &self,
+        node_id: &str,
+        eq_sub: i32,
+        eq_bass: i32,
+        eq_mid: i32,
+        eq_treble: i32,
+        eq_air: i32,
+        output_gain: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Eq5Band { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Eq5Band {
+                eq_sub,
+                eq_bass,
+                eq_mid,
+                eq_treble,
+                eq_air,
+                output_gain,
+            };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_delay(
+        &self,
+        node_id: &str,
+        delay_ms: i32,
+        feedback_percent: i32,
+        feedforward_percent: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Delay { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Delay {
+                delay_ms,
+                feedback_percent,
+                feedforward_percent,
+            };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_limiter(
+        &self,
+        node_id: &str,
+        ceiling_db: i32,
+        floor_db: i32,
+        symmetric: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Limiter { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Limiter {
+                ceiling_db,
+                floor_db,
+                symmetric,
+            };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_hpf(
+        &self,
+        node_id: &str,
+        freq_hz: i32,
+        resonance_x10: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Hpf { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Hpf {
+                freq_hz,
+                resonance_x10,
+            };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_reverb(
+        &self,
+        node_id: &str,
+        mix_percent: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Reverb { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Reverb { mix_percent };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_widener(
+        &self,
+        node_id: &str,
+        width_percent: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Widener { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Widener { width_percent };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_pan(
+        &self,
+        node_id: &str,
+        balance_percent: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Pan { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Pan { balance_percent };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn update_processing_node_compressor(
+        &self,
+        node_id: &str,
+        threshold_db: i32,
+        ratio_x10: i32,
+        attack_ms: i32,
+        release_ms: i32,
+        makeup_gain_db: i32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let ProcessingNodeSpecKind::Compressor { .. } = &node.kind {
+            node.kind = ProcessingNodeSpecKind::Compressor {
+                threshold_db,
+                ratio_x10,
+                attack_ms,
+                release_ms,
+                makeup_gain_db,
+            };
+        }
+        self.save_config(&config)
+    }
+
+    pub fn set_processing_node_volume(
+        &self,
+        node_id: &str,
+        volume_percent: u8,
+        muted: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        match &node.kind {
+            ProcessingNodeSpecKind::FanOut { .. } => {
+                node.kind = ProcessingNodeSpecKind::FanOut {
+                    volume_percent,
+                    muted,
+                };
+            }
+            ProcessingNodeSpecKind::Group { .. } => {
+                node.kind = ProcessingNodeSpecKind::Group {
+                    volume_percent,
+                    muted,
+                };
+            }
+            _ => {}
+        }
+        self.save_config(&config)
+    }
+
+    pub fn set_processing_node_bypassed(
+        &self,
+        node_id: &str,
+        bypassed: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        node.bypassed = bypassed;
+        self.save_config(&config)
+    }
+
+    /// Persists `peer_system_name` at `port_index` on the given `direction`
+    /// for the named node — extending the port list if `port_index` is one
+    /// past the current end (a freshly grown port), overwriting in place
+    /// otherwise. A no-op (not an error) if the node itself was removed out
+    /// from under a still-in-flight connect call.
+    pub fn upsert_processing_node_port(
+        &self,
+        node_id: &str,
+        direction: crate::core::models::PortDirection,
+        port_index: u32,
+        peer_system_name: &str,
+        source_stream_identity: Option<crate::core::stream_identity::StreamIdentityKey>,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        let index = port_index as usize;
+        match direction {
+            crate::core::models::PortDirection::Input => {
+                let entry = ProcessingNodePortSpec {
+                    source_system_name: peer_system_name.to_string(),
+                    gain_percent: 100,
+                    muted: false,
+                    source_stream_identity,
+                };
+                if index < node.input_sources.len() {
+                    node.input_sources[index] = entry;
+                } else {
+                    node.input_sources.push(entry);
+                }
+            }
+            crate::core::models::PortDirection::Output => {
+                if index < node.output_targets.len() {
+                    node.output_targets[index] = peer_system_name.to_string();
+                } else {
+                    node.output_targets.push(peer_system_name.to_string());
+                }
+            }
+        }
+        self.save_config(&config)
+    }
+
+    pub fn set_processing_node_input_gain(
+        &self,
+        node_id: &str,
+        port_index: u32,
+        gain_percent: u8,
+        muted: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        if let Some(entry) = node.input_sources.get_mut(port_index as usize) {
+            entry.gain_percent = gain_percent;
+            entry.muted = muted;
+        }
+        self.save_config(&config)
+    }
+
+    pub fn remove_processing_node_port(
+        &self,
+        node_id: &str,
+        direction: crate::core::models::PortDirection,
+        port_index: u32,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        let Some(node) = config
+            .processing_nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        else {
+            return Ok(());
+        };
+        let index = port_index as usize;
+        match direction {
+            crate::core::models::PortDirection::Input => {
+                if index < node.input_sources.len() {
+                    node.input_sources.remove(index);
+                }
+            }
+            crate::core::models::PortDirection::Output => {
+                if index < node.output_targets.len() {
+                    node.output_targets.remove(index);
+                }
+            }
+        }
+        self.save_config(&config)
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<(), ConfigError> {
@@ -125,7 +503,10 @@ impl ConfigStore {
             .strip_prefix("pipe-deck-")
             .filter(|_| !system_name.starts_with("pipe-deck-feed-"))
         {
-            if let Some(entry) = config.virtual_devices.iter_mut().find(|entry| entry.slug == slug)
+            if let Some(entry) = config
+                .virtual_devices
+                .iter_mut()
+                .find(|entry| entry.slug == slug)
             {
                 entry.label = alias.to_string();
             }
@@ -145,15 +526,63 @@ impl ConfigStore {
         self.save_config(&config)
     }
 
+    /// Upserts by `board.id` — an id already present in
+    /// `soundboard_boards` is updated in place (rename or folder change),
+    /// otherwise the board is appended. Same upsert-by-id convention as
+    /// `save_rule`/`Rule.id`, with the id minted client-side.
+    pub fn save_soundboard_board(
+        &self,
+        board: crate::core::soundboard::SoundboardBoard,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        match config
+            .preferences
+            .soundboard_boards
+            .iter_mut()
+            .find(|existing| existing.id == board.id)
+        {
+            Some(existing) => *existing = board,
+            None => config.preferences.soundboard_boards.push(board),
+        }
+        self.save_config(&config)
+    }
+
+    pub fn delete_soundboard_board(&self, board_id: &str) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config
+            .preferences
+            .soundboard_boards
+            .retain(|board| board.id != board_id);
+        self.save_config(&config)
+    }
+
     pub fn set_sidebar_collapsed(&self, collapsed: bool) -> Result<(), ConfigError> {
         let mut config = self.load_config()?;
         config.preferences.sidebar_collapsed = collapsed;
         self.save_config(&config)
     }
 
+    pub fn set_onboarding_dismissed(&self, dismissed: bool) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.preferences.onboarding_dismissed = dismissed;
+        self.save_config(&config)
+    }
+
     pub fn set_theme_mode(&self, mode: &str) -> Result<(), ConfigError> {
         let mut config = self.load_config()?;
         config.preferences.theme_mode = mode.to_string();
+        self.save_config(&config)
+    }
+
+    pub fn set_close_behavior(&self, behavior: &str) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.preferences.close_behavior = Some(behavior.to_string());
+        self.save_config(&config)
+    }
+
+    pub fn set_update_channel(&self, channel: &str) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.preferences.update_channel = channel.to_string();
         self.save_config(&config)
     }
 
@@ -166,6 +595,12 @@ impl ConfigStore {
     pub fn set_light_scheme(&self, id: &str) -> Result<(), ConfigError> {
         let mut config = self.load_config()?;
         config.preferences.light_scheme = id.to_string();
+        self.save_config(&config)
+    }
+
+    pub fn set_notice_duration_ms(&self, ms: u32) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.preferences.notice_duration_ms = ms;
         self.save_config(&config)
     }
 
@@ -204,13 +639,9 @@ impl ConfigStore {
         let slug = virtual_system_name
             .strip_prefix("pipe-deck-")
             .unwrap_or(virtual_system_name);
-        let Some(spec) = config
-            .virtual_devices
-            .iter_mut()
-            .find(|entry| {
-                entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
-            })
-        else {
+        let Some(spec) = config.virtual_devices.iter_mut().find(|entry| {
+            entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
+        }) else {
             return Err(ConfigError::Read(format!(
                 "virtual device not found: {virtual_system_name}"
             )));
@@ -231,13 +662,9 @@ impl ConfigStore {
         let slug = virtual_system_name
             .strip_prefix("pipe-deck-")
             .unwrap_or(virtual_system_name);
-        let Some(spec) = config
-            .virtual_devices
-            .iter_mut()
-            .find(|entry| {
-                entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
-            })
-        else {
+        let Some(spec) = config.virtual_devices.iter_mut().find(|entry| {
+            entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
+        }) else {
             return Err(ConfigError::Read(format!(
                 "virtual device not found: {virtual_system_name}"
             )));
@@ -264,13 +691,9 @@ impl ConfigStore {
         let slug = virtual_system_name
             .strip_prefix("pipe-deck-")
             .unwrap_or(virtual_system_name);
-        let Some(spec) = config
-            .virtual_devices
-            .iter_mut()
-            .find(|entry| {
-                entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
-            })
-        else {
+        let Some(spec) = config.virtual_devices.iter_mut().find(|entry| {
+            entry.slug == slug || format!("pipe-deck-{}", entry.slug) == virtual_system_name
+        }) else {
             return Err(ConfigError::Read(format!(
                 "virtual device not found: {virtual_system_name}"
             )));
@@ -325,11 +748,12 @@ impl ConfigStore {
         fs::create_dir_all(self.config_dir.join("profiles"))
             .map_err(|error| ConfigError::Write(format!("{error}")))?;
         // Mirrors profiles/ — a directory the user can browse to and drop a plugin into
-        // (see docs/project/Plugins.md quick start), same idea as themes/ for custom color schemes.
+        // (see docs/developers/Plugins.md quick start), same idea as themes/ for custom color schemes.
         fs::create_dir_all(self.config_dir.join("plugins"))
             .map_err(|error| ConfigError::Write(format!("{error}")))?;
 
-        let profile_store = crate::config::profile_store::ProfileStore::new(self.config_dir.clone());
+        let profile_store =
+            crate::config::profile_store::ProfileStore::new(self.config_dir.clone());
         profile_store
             .ensure_default_profile()
             .map_err(|error| ConfigError::Write(error.to_string()))?;
@@ -343,11 +767,21 @@ impl ConfigStore {
 
     pub fn add_profile_to_index(&self, entry: ProfileIndexEntry) -> Result<(), ConfigError> {
         let mut config = self.load_config()?;
-        if let Some(existing) = config.profile_index.iter_mut().find(|item| item.id == entry.id) {
+        if let Some(existing) = config
+            .profile_index
+            .iter_mut()
+            .find(|item| item.id == entry.id)
+        {
             *existing = entry;
         } else {
             config.profile_index.push(entry);
         }
+        self.save_config(&config)
+    }
+
+    pub fn remove_profile_from_index(&self, profile_id: &str) -> Result<(), ConfigError> {
+        let mut config = self.load_config()?;
+        config.profile_index.retain(|entry| entry.id != profile_id);
         self.save_config(&config)
     }
 
@@ -372,7 +806,9 @@ impl ConfigStore {
         } else {
             config.rules.push(rule);
         }
-        config.rules.sort_by(|left, right| right.priority.cmp(&left.priority));
+        config
+            .rules
+            .sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         self.save_config(&config)
     }
 
@@ -438,7 +874,7 @@ impl ConfigStore {
         let plugin = config
             .plugins
             .entry(EFFECTS_PLUGIN_ID.to_string())
-            .or_insert_with(PluginEntry::default);
+            .or_default();
         let mut plugin_config = if plugin.config.is_object() {
             plugin.config.as_object().cloned().unwrap_or_default()
         } else {
@@ -446,10 +882,95 @@ impl ConfigStore {
         };
         plugin_config.insert(
             "chains".into(),
-            serde_json::to_value(chains).unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            serde_json::to_value(chains)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         );
         plugin.config = serde_json::Value::Object(plugin_config);
     }
+}
+
+/// PD-032: mic-mix is retired in favor of the generic Mixer processing-node
+/// kind. Any virtual input device with `mix_sources` still configured the
+/// old way, and no `Mixer` node already feeding it, gets an equivalent
+/// `ProcessingNodeSpec::Mixer` synthesized here — same pattern as
+/// `EffectChainConfig`'s legacy flat-`eq_*`-fields migration, except this
+/// one also clears the source `mix_sources` it migrated from, so the
+/// rewrite is durable once `load_config` saves it back rather than
+/// re-running against stale data forever. Returns whether anything changed,
+/// so the caller only writes to disk when there was something to migrate.
+/// Idempotent either way: skips any target that already has a Mixer node.
+fn migrate_mix_sources_to_mixer_nodes(config: &mut AppConfig) -> bool {
+    let already_migrated: std::collections::HashSet<String> = config
+        .processing_nodes
+        .iter()
+        .filter(|node| matches!(node.kind, ProcessingNodeSpecKind::Mixer))
+        .flat_map(|node| node.output_targets.iter().cloned())
+        .collect();
+
+    let mut synthesized = Vec::new();
+    let mut migrated_specs = Vec::new();
+    for spec in &config.virtual_devices {
+        if spec.direction != crate::core::models::DeviceDirection::Input
+            || spec.mix_sources.is_empty()
+        {
+            continue;
+        }
+        let target_system_name = format!("pipe-deck-{}", spec.slug);
+        if already_migrated.contains(&target_system_name) {
+            continue;
+        }
+        synthesized.push(ProcessingNodeSpec {
+            id: format!("processing-mixer-{}", spec.slug),
+            slug: format!("mixer-{}", spec.slug),
+            label: format!("{} Mixer", spec.label),
+            created_at: spec.created_at.clone(),
+            kind: ProcessingNodeSpecKind::Mixer,
+            input_sources: spec
+                .mix_sources
+                .iter()
+                .map(|source| ProcessingNodePortSpec {
+                    source_system_name: source.system_name.clone(),
+                    gain_percent: source.volume_percent,
+                    muted: source.muted,
+                    source_stream_identity: None,
+                })
+                .collect(),
+            output_targets: vec![target_system_name],
+            bypassed: false,
+        });
+        migrated_specs.push(spec.id.clone());
+    }
+
+    if synthesized.is_empty() {
+        return false;
+    }
+
+    for spec in &mut config.virtual_devices {
+        if migrated_specs.contains(&spec.id) {
+            spec.mix_sources.clear();
+        }
+    }
+    config.processing_nodes.extend(synthesized);
+    true
+}
+
+/// Serializes any test (in this file or elsewhere in the crate) that mutates
+/// the process-wide `PIPE_DECK_CONFIG_DIR` env var via `std::env::set_var`.
+/// `cargo test`'s default parallel runner races concurrent `set_var`/
+/// `remove_var` calls to the same env var across threads, which manifests as
+/// sporadic failures in whichever test happened to read a config dir another
+/// thread was mid-swap on. A `static` declared *inside* a `#[test]` fn only
+/// guards re-entrant calls to that one function (which can't happen — each
+/// test runs once) and provides no cross-test exclusion at all, which is
+/// what let this race through despite every affected test already having its
+/// own (uselessly scoped) lock. This one is crate-level so every caller
+/// shares the same `Mutex`.
+#[cfg(test)]
+pub(crate) fn lock_config_dir_env() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -457,15 +978,11 @@ mod tests {
     use super::*;
     use crate::core::models::{EffectChainConfig, VirtualDeviceSpec};
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
 
     fn with_temp_config<F: FnOnce(&ConfigStore)>(run: F) {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "pipe-deck-config-test-{}",
-            std::process::id()
-        ));
+        let _guard = super::lock_config_dir_env();
+        let temp_dir =
+            std::env::temp_dir().join(format!("pipe-deck-config-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
         let store = ConfigStore::new();
@@ -475,11 +992,45 @@ mod tests {
     }
 
     #[test]
+    fn remove_profile_from_index_drops_only_the_matching_entry() {
+        with_temp_config(|store| {
+            store.ensure_layout().unwrap();
+            let mut config = ConfigStore::default_config();
+            config.profile_index.push(ProfileIndexEntry {
+                id: "gaming".into(),
+                name: "Gaming".into(),
+                file: "profiles/gaming.yaml".into(),
+            });
+            store.save_config(&config).unwrap();
+
+            store.remove_profile_from_index("gaming").unwrap();
+
+            let config = store.load_config().unwrap();
+            assert_eq!(config.profile_index.len(), 1);
+            assert_eq!(config.profile_index[0].id, "default");
+        });
+    }
+
+    #[test]
     fn ensure_layout_creates_a_browsable_plugins_directory() {
         with_temp_config(|store| {
             store.ensure_layout().unwrap();
             assert!(store.config_dir().join("plugins").is_dir());
             assert!(store.config_dir().join("profiles").is_dir());
+        });
+    }
+
+    #[test]
+    fn config_without_version_field_defaults_to_one() {
+        with_temp_config(|store| {
+            fs::create_dir_all(store.config_dir()).unwrap();
+            fs::write(
+                store.config_dir().join("config.yaml"),
+                "preferences:\n  show_system_streams: false\nprofile_index: []\n",
+            )
+            .unwrap();
+            let config = store.load_config().unwrap();
+            assert_eq!(config.version, 1);
         });
     }
 
@@ -511,6 +1062,8 @@ mod tests {
             assert_eq!(config.preferences.theme_mode, "dark");
             assert_eq!(config.preferences.dark_scheme, "midnight-deck");
             assert_eq!(config.preferences.light_scheme, "paper-deck");
+            assert_eq!(config.preferences.notice_duration_ms, 5000);
+            assert_eq!(config.preferences.update_channel, "latest");
         });
     }
 
@@ -521,11 +1074,130 @@ mod tests {
             store.set_theme_mode("system").unwrap();
             store.set_dark_scheme("copper-dusk").unwrap();
             store.set_light_scheme("meadow-light").unwrap();
+            store.set_notice_duration_ms(8000).unwrap();
 
             let preferences = store.preferences();
             assert_eq!(preferences.theme_mode, "system");
             assert_eq!(preferences.dark_scheme, "copper-dusk");
             assert_eq!(preferences.light_scheme, "meadow-light");
+            assert_eq!(preferences.notice_duration_ms, 8000);
+        });
+    }
+
+    #[test]
+    fn update_channel_setter_round_trips_and_defaults_to_latest() {
+        with_temp_config(|store| {
+            store.ensure_layout().unwrap();
+            assert_eq!(store.preferences().update_channel, "latest");
+
+            store.set_update_channel("prerelease").unwrap();
+            assert_eq!(store.preferences().update_channel, "prerelease");
+
+            store.set_update_channel("latest").unwrap();
+            assert_eq!(store.preferences().update_channel, "latest");
+        });
+    }
+
+    #[test]
+    fn soundboard_board_save_upserts_by_id_and_delete_removes_it() {
+        use crate::core::soundboard::SoundboardBoard;
+
+        with_temp_config(|store| {
+            store.ensure_layout().unwrap();
+            assert!(store.preferences().soundboard_boards.is_empty());
+
+            let sfx = SoundboardBoard {
+                id: "board-1".into(),
+                name: "SFX".into(),
+                folder: "/home/user/SFX".into(),
+                target_system_name: None,
+                target_volume_percent: 100,
+                monitor_system_name: None,
+                monitor_volume_percent: 100,
+                exclusive_playback: true,
+            };
+            store.save_soundboard_board(sfx.clone()).unwrap();
+            assert_eq!(store.preferences().soundboard_boards, vec![sfx.clone()]);
+
+            let music = SoundboardBoard {
+                id: "board-2".into(),
+                name: "Music".into(),
+                folder: "/home/user/Music".into(),
+                target_system_name: None,
+                target_volume_percent: 100,
+                monitor_system_name: None,
+                monitor_volume_percent: 100,
+                exclusive_playback: true,
+            };
+            store.save_soundboard_board(music.clone()).unwrap();
+            assert_eq!(
+                store.preferences().soundboard_boards,
+                vec![sfx.clone(), music.clone()]
+            );
+
+            let renamed_sfx = SoundboardBoard {
+                id: "board-1".into(),
+                name: "Sound Effects".into(),
+                folder: "/home/user/SFX".into(),
+                target_system_name: None,
+                target_volume_percent: 100,
+                monitor_system_name: None,
+                monitor_volume_percent: 100,
+                exclusive_playback: true,
+            };
+            store.save_soundboard_board(renamed_sfx.clone()).unwrap();
+            assert_eq!(
+                store.preferences().soundboard_boards,
+                vec![renamed_sfx, music.clone()]
+            );
+
+            store.delete_soundboard_board("board-1").unwrap();
+            assert_eq!(store.preferences().soundboard_boards, vec![music]);
+        });
+    }
+
+    #[test]
+    fn soundboard_board_destinations_round_trip_via_board_save() {
+        use crate::core::soundboard::SoundboardBoard;
+
+        with_temp_config(|store| {
+            store.ensure_layout().unwrap();
+
+            let board = SoundboardBoard {
+                id: "board-1".into(),
+                name: "SFX".into(),
+                folder: "/home/user/SFX".into(),
+                target_system_name: Some("pipe-deck-stream-mic".to_string()),
+                target_volume_percent: 100,
+                monitor_system_name: Some("alsa_output.pci-hdmi".to_string()),
+                monitor_volume_percent: 40,
+                exclusive_playback: true,
+            };
+            store.save_soundboard_board(board).unwrap();
+
+            let reloaded = store.preferences().soundboard_boards;
+            assert_eq!(
+                reloaded[0].target_system_name,
+                Some("pipe-deck-stream-mic".to_string())
+            );
+            assert_eq!(
+                reloaded[0].monitor_system_name,
+                Some("alsa_output.pci-hdmi".to_string())
+            );
+            assert_eq!(reloaded[0].monitor_volume_percent, 40);
+
+            let mut updated = reloaded[0].clone();
+            updated.target_system_name = None;
+            updated.monitor_volume_percent = 25;
+            store.save_soundboard_board(updated).unwrap();
+
+            let reloaded = store.preferences().soundboard_boards;
+            assert_eq!(reloaded[0].target_system_name, None);
+            assert_eq!(
+                reloaded[0].monitor_system_name,
+                Some("alsa_output.pci-hdmi".to_string())
+            );
+            assert_eq!(reloaded[0].monitor_volume_percent, 25);
         });
     }
 
@@ -552,8 +1224,14 @@ mod tests {
     }
 
     #[test]
-    fn mix_source_volume_round_trip_persists() {
-        use crate::core::models::MixSourceSpec;
+    fn set_virtual_mic_mix_sources_migrates_into_a_mixer_node_on_next_load() {
+        // `set_virtual_mic_mix_sources` itself is now only reachable via
+        // `enable_stream_mic_passthrough`'s internal use of the same
+        // per-pair-feed-sink mechanism (PD-032 retired the rest of the old
+        // mic-mix authoring surface) — its raw write still round-trips, but
+        // the *next* load durably migrates it into an equivalent Mixer node,
+        // same as any other legacy `mix_sources`.
+        use crate::core::models::{MixSourceSpec, ProcessingNodeSpecKind};
 
         with_temp_config(|store| {
             store.ensure_layout().unwrap();
@@ -569,32 +1247,125 @@ mod tests {
             store.add_virtual_device(spec).unwrap();
 
             let sources = vec![
-                MixSourceSpec { system_name: "alsa_input.headset".into(), volume_percent: 60, muted: false },
-                MixSourceSpec { system_name: "alsa_input.webcam".into(), volume_percent: 100, muted: true },
+                MixSourceSpec {
+                    system_name: "alsa_input.headset".into(),
+                    volume_percent: 60,
+                    muted: false,
+                },
+                MixSourceSpec {
+                    system_name: "alsa_input.webcam".into(),
+                    volume_percent: 100,
+                    muted: true,
+                },
             ];
             store
                 .set_virtual_mic_mix_sources("pipe-deck-mic", &sources)
                 .expect("save mix sources");
 
+            let nodes = store.processing_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(matches!(nodes[0].kind, ProcessingNodeSpecKind::Mixer));
+            assert_eq!(nodes[0].input_sources.len(), 2);
+            assert!(store.virtual_devices()[0].mix_sources.is_empty());
+        });
+    }
+
+    #[test]
+    fn legacy_mix_sources_migrates_to_an_equivalent_mixer_node_on_load() {
+        use crate::core::models::{MixSourceSpec, ProcessingNodeSpecKind};
+
+        with_temp_config(|store| {
+            let spec = VirtualDeviceSpec {
+                id: "virtual-mic".into(),
+                slug: "mic".into(),
+                label: "Mic".into(),
+                direction: crate::core::models::DeviceDirection::Input,
+                created_at: "2026-07-09T10:00:00Z".into(),
+                multi: false,
+                mix_sources: vec![
+                    MixSourceSpec {
+                        system_name: "alsa_input.headset".into(),
+                        volume_percent: 60,
+                        muted: false,
+                    },
+                    MixSourceSpec {
+                        system_name: "alsa_input.webcam".into(),
+                        volume_percent: 100,
+                        muted: true,
+                    },
+                ],
+            };
+            store.add_virtual_device(spec).unwrap();
+
+            let nodes = store.processing_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(matches!(nodes[0].kind, ProcessingNodeSpecKind::Mixer));
+            assert_eq!(nodes[0].output_targets, vec!["pipe-deck-mic".to_string()]);
+            assert_eq!(nodes[0].input_sources.len(), 2);
+            assert_eq!(
+                nodes[0].input_sources[0].source_system_name,
+                "alsa_input.headset"
+            );
+            assert_eq!(nodes[0].input_sources[0].gain_percent, 60);
+            assert!(!nodes[0].input_sources[0].muted);
+            assert_eq!(
+                nodes[0].input_sources[1].source_system_name,
+                "alsa_input.webcam"
+            );
+            assert!(nodes[0].input_sources[1].muted);
+
+            // Migration is durable — the legacy field is cleared and the
+            // clearing is persisted, so re-loading doesn't duplicate the
+            // synthesized node or find anything left to migrate again.
             let loaded = store.virtual_devices();
-            assert_eq!(loaded[0].mix_sources, sources);
+            assert!(loaded[0].mix_sources.is_empty());
+            assert_eq!(store.processing_nodes().len(), 1);
         });
     }
 
     #[test]
     fn legacy_mix_sources_shape_deserializes_at_unity_gain() {
+        // Deliberately `direction: output` here, not `input` — an `input`
+        // device with non-empty `mix_sources` would immediately migrate into
+        // a Mixer node and clear the field (see
+        // `legacy_mix_sources_migrates_to_an_equivalent_mixer_node_on_load`),
+        // which this test isn't after: it's isolating the legacy
+        // bare-`Vec<String>`-to-`MixSourceSpec` deserialization shape itself
+        // from that higher-level migration behavior.
         with_temp_config(|store| {
             fs::create_dir_all(store.config_dir()).unwrap();
             fs::write(
                 store.config_dir().join("config.yaml"),
-                "version: 1\nprofile_index: []\nvirtual_devices:\n  - id: virtual-mic\n    slug: mic\n    label: Mic\n    direction: input\n    created_at: '2026-07-09T10:00:00Z'\n    mix_sources:\n      - alsa_input.headset\n",
+                "version: 1\nprofile_index: []\nvirtual_devices:\n  - id: virtual-mic\n    slug: mic\n    label: Mic\n    direction: output\n    created_at: '2026-07-09T10:00:00Z'\n    mix_sources:\n      - alsa_input.headset\n",
             )
             .unwrap();
             let config = store.load_config().unwrap();
             assert_eq!(
                 config.virtual_devices[0].mix_sources,
-                vec![crate::core::models::MixSourceSpec::unity("alsa_input.headset")]
+                vec![crate::core::models::MixSourceSpec::unity(
+                    "alsa_input.headset"
+                )]
             );
+        });
+    }
+
+    #[test]
+    fn legacy_virtual_device_config_with_a_role_key_still_loads() {
+        // `virtual_role` (VirtualRole::Bus, #287) was removed outright, not
+        // migrated — a plain virtual device can no longer route onward or
+        // host effects at all (dedicated processing nodes replace both).
+        // Config written before this change may still have the now-unknown
+        // `virtual_role: bus` key on disk; it must be silently ignored
+        // rather than failing to deserialize.
+        with_temp_config(|store| {
+            fs::create_dir_all(store.config_dir()).unwrap();
+            fs::write(
+                store.config_dir().join("config.yaml"),
+                "version: 1\nprofile_index: []\nvirtual_devices:\n  - id: virtual-game-mix\n    slug: game-mix\n    label: Game Mix\n    direction: output\n    created_at: '2026-07-09T10:00:00Z'\n    multi: false\n    virtual_role: bus\n",
+            )
+            .unwrap();
+            let config = store.load_config().unwrap();
+            assert_eq!(config.virtual_devices[0].id, "virtual-game-mix");
         });
     }
 
@@ -622,6 +1393,7 @@ mod tests {
                 limiter: crate::core::models::DynamicsStage::default(),
                 noise_gate: crate::core::models::DynamicsStage::default(),
                 bypassed: false,
+                live: true,
             };
             store
                 .set_effect_chain("virtual-game", &chain)
@@ -668,5 +1440,4 @@ mod tests {
             assert_eq!(eq.output_gain, -3);
         });
     }
-
 }

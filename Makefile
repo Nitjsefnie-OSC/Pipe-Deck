@@ -1,9 +1,10 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: help install start dev dev-frontend build build-daemon build-daemon-dev build-cli build-frontend build-rust check test test-unit test-e2e clean preview flatpak smoke release
+.PHONY: help install start start-mock dev dev-mock dev-frontend build build-daemon build-daemon-dev build-cli build-frontend build-rust check check-target-dependencies lint-rust test test-unit test-e2e test-appimage-postprocess clean preview smoke screenshots demo simulate-claim-check release release-checks release-skip-tests
 
 NPM ?= npm
 CARGO ?= cargo
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TAURI_DIR := src-tauri
 HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
 export CARGO_TARGET_DIR := $(abspath $(TAURI_DIR)/target)
@@ -22,9 +23,15 @@ install: ## Install frontend dependencies
 
 start: dev ## Run the desktop app in development mode
 
+start-mock: dev-mock ## Run the desktop app in development mode against the mock backend
+
 dev: ## Run the desktop app in development mode (Tauri + Vite)
 	rm -rf node_modules/.vite
 	$(NPM) run tauri dev
+
+dev-mock: ## Run the desktop app in development mode against the mock backend (PIPE_DECK_USE_MOCK=1)
+	rm -rf node_modules/.vite
+	PIPE_DECK_USE_MOCK=1 $(NPM) run tauri dev
 
 dev-frontend: ## Run only the Vite frontend dev server
 	rm -rf node_modules/.vite
@@ -49,6 +56,20 @@ build-cli: build-daemon-dev ## Build pipe-deck CLI binary (debug)
 
 build: build-daemon ## Build production desktop bundles (.deb, .rpm, AppImage, binary)
 	$(NPM) run tauri build
+	@appimage=$$(ls $(CARGO_TARGET_DIR)/release/bundle/appimage/*.AppImage 2>/dev/null | head -n1); \
+	if [ -z "$$appimage" ]; then \
+		exit 0; \
+	fi; \
+	if ! command -v unsquashfs >/dev/null || ! command -v mksquashfs >/dev/null; then \
+		echo "squashfs-tools not installed; skipping AppImage host-library fix for issues #349/#299 (see scripts/fix-appimage-glib.sh) — install squashfs-tools to patch local builds too"; \
+		exit 0; \
+	fi; \
+	bash scripts/fix-appimage-glib.sh "$$appimage" || exit $$?; \
+	if [ -n "$$TAURI_SIGNING_PRIVATE_KEY" ] || [ -n "$$TAURI_SIGNING_PRIVATE_KEY_PATH" ]; then \
+		$(NPM) exec tauri signer sign "$$appimage"; \
+	else \
+		echo "TAURI_SIGNING_PRIVATE_KEY not set; skipping updater re-sign of patched AppImage (dev build)"; \
+	fi
 
 build-frontend: ## Type-check and build the Vue frontend
 	$(NPM) run build
@@ -56,10 +77,18 @@ build-frontend: ## Type-check and build the Vue frontend
 build-rust: build-daemon-dev build-cli ## Compile the Rust backend (debug)
 	$(CARGO) build --manifest-path $(TAURI_DIR)/Cargo.toml
 
-check: build-daemon-dev build-cli ## Run frontend type-check, frontend unit tests, and Rust checks without producing bundles
+check-target-dependencies: ## Verify target-filtered Cargo dependency invariants
+	python3 $(MAKEFILE_DIR)scripts/test_check_target_dependencies.py
+	python3 $(MAKEFILE_DIR)scripts/check-target-dependencies.py
+
+check: test-appimage-postprocess check-target-dependencies build-daemon-dev build-cli lint-rust ## Run frontend type-check, frontend unit tests, packaging tests, and Rust checks without producing bundles
 	$(NPM) run build
 	$(NPM) run test:unit
 	$(CARGO) check --manifest-path $(TAURI_DIR)/Cargo.toml
+
+lint-rust: ## Run cargo fmt --check and cargo clippy across all Rust targets (lib, bins, tests) with warnings denied
+	$(CARGO) fmt --manifest-path $(TAURI_DIR)/Cargo.toml --all -- --check
+	$(CARGO) clippy --manifest-path $(TAURI_DIR)/Cargo.toml --all-targets -- -D warnings
 
 test: build-daemon-dev build-cli ## Run Rust tests
 	$(CARGO) test --manifest-path $(TAURI_DIR)/Cargo.toml
@@ -70,6 +99,9 @@ test-unit: ## Run frontend Vitest unit tests (src/**/*.spec.ts)
 test-e2e: ## Run frontend Playwright component tests (src/e2e/, needs `npx playwright install chromium` once)
 	$(NPM) run test:e2e
 
+test-appimage-postprocess: ## Test AppImage host-library post-processing with local fixtures
+	bash scripts/tests/fix-appimage-glib.test.sh
+
 preview: ## Preview the built frontend assets
 	$(NPM) run preview
 
@@ -77,14 +109,23 @@ clean: ## Remove build artifacts
 	rm -rf dist node_modules/.vite
 	$(CARGO) clean --manifest-path $(TAURI_DIR)/Cargo.toml
 
-flatpak: ## Build Flatpak package locally
-	flatpak-builder --force-clean flatpak/build flatpak/com.pipedeck.PipeDeck.yml
-
 smoke: ## Run install and compile smoke checks
 	bash scripts/smoke-install.sh
 
+screenshots: build-cli ## Refresh docs/images/*.png from the live frontend (scripts/screenshot-app.mjs)
+	$(NPM) run screenshots
+
+demo: ## Run/capture a named demo scenario (SCENARIO=<name> [MODE=dev|screenshot]; see scripts/demo-runner.sh)
+	bash scripts/demo-runner.sh
+
+simulate-claim-check: ## Dry-run the claim-check CI gate locally (ARGS='--pr 454' or ARGS='--title ... --author ... --body ...')
+	node scripts/simulate-claim-check.mjs $(ARGS)
+
+release-checks: ## Run the pre-release validation gate (type-check, frontend tests, cargo check, cargo test) standalone
+	bash scripts/release-checks.sh
+
 .PHONY: release
-## Update version files, commit, then create a release tag.
+## Run pre-release checks, then update version files, commit, and create a release tag.
 ##
 ## Usage:
 ##   make release VER=0.2.0 TITLE="Some release title"
@@ -92,9 +133,19 @@ smoke: ## Run install and compile smoke checks
 ## - Tag format:
 ##   - If TITLE is provided: v<VER>-<TITLE_SLUG>
 ##   - If TITLE is empty:    v<VER>
+## - Runs scripts/release-checks.sh first; aborts with no changes made if it fails.
 ## - Bumps package.json, Cargo.toml, tauri.conf.json, and AppStream metainfo.
 release:
 	@set -euo pipefail; \
+	if [ "$(SKIP_CHECKS)" = "1" ]; then \
+		echo "release: skipping pre-release checks (SKIP_CHECKS=1) — only use this if you already ran and passed them"; \
+	else \
+		echo "release: running pre-release checks (scripts/release-checks.sh)"; \
+		if ! bash scripts/release-checks.sh; then \
+			echo "release: pre-release checks failed — nothing was changed, fix and re-run 'make release'"; \
+			exit 1; \
+		fi; \
+	fi; \
 	ver="$(strip $(VER))"; \
 	current_ver="$$(node -p 'require("./package.json").version' 2>/dev/null || true)"; \
 	if [ -z "$$current_ver" ]; then \
@@ -154,3 +205,9 @@ release:
 	git tag -a "$$tag_name" -m "$$tag_name"; \
 	echo "release done: $$tag_name"; \
 	echo "Next: git push origin main --tags"
+
+.PHONY: release-skip-tests
+## Same as 'release', but skips scripts/release-checks.sh.
+## Only use this when you already ran the checks (or are otherwise highly confident they pass) and don't want to re-run/wait on them.
+release-skip-tests: SKIP_CHECKS=1
+release-skip-tests: release

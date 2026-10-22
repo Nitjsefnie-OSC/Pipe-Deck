@@ -23,7 +23,7 @@ Define the user experience structure and interaction behavior that makes Linux a
 - Component/view styles use a root class namespace (for example `.mixer-strip`) with nested selectors.
 - Theme tokens are defined as CSS custom properties in `src/styles/_variables.scss`. That file's `:root` block is the static pre-JS/failure-mode fallback only — the active color scheme overrides these same custom properties at runtime via `src/stores/theme.ts`. See [Theming](../specs/Theming.md) for the scheme system.
 
-See `docs/Contributing.md` for the contributor-facing layout and rules.
+See [Contributing](../../.github/CONTRIBUTING.md) for the contributor-facing layout and rules.
 
 ## UX Goal
 
@@ -67,6 +67,18 @@ Users should understand current audio state quickly and complete common routing 
 - Each application stream shows a collapsible **route explanation** panel: matched rule, match reasons, skipped candidates, and manual-override status.
 - **Change route** in the panel focuses the stream's target dropdown.
 
+### Recover an Off-Screen Node
+
+- Right-click empty canvas → **Bring node here…** → pick a node from the list of every node currently on the board → the picked node relocates to the click point.
+- Recovers a node dragged (or auto-laid-out) far outside the visible canvas, which otherwise has no other way to be located.
+
+### Measure Latency Between Two Nodes (issue #223)
+
+- Collapsible panel docked bottom-right of the routing graph canvas, collapsed by default so it stays out of the way until needed.
+- Source/Target dropdowns list every device, stream, and processing node currently on the graph. **Measure** finds the signal path between them (following actual connection direction, through processing nodes if the path crosses one) and reports a per-hop breakdown plus a total.
+- The figure is **theoretical/buffering latency** derived from PipeWire's own scheduling data (`pw-top`'s QUANT/RATE per node), not a real measured round-trip — the panel's hint text says so explicitly. A hop with no current reading (node not actively running) shows "no data" instead of a fabricated total.
+- No path between the two picked nodes surfaces as a plain "No signal path between these two nodes" message rather than an error.
+
 ## Dashboard Layout
 
 The default dashboard uses a four-column routing matrix:
@@ -78,12 +90,29 @@ The default dashboard uses a four-column routing matrix:
 
 Connection lines draw between linked nodes. Authored policies are managed in the **Rules** view; dashboard dropdown changes also persist lightweight `routing_rules` at lower priority.
 
+## First-Run Onboarding Checklist (issue #5)
+
+A dismissible, non-blocking panel docked bottom-right of the app shell (mounted globally in `App.vue`, not scoped to a single view) — never a modal or multi-step wizard that blocks app use. Shown when `preferences.onboarding_dismissed` is false/unset.
+
+Lists three items, each read live from current app state rather than a static flag, so completing a step outside the checklist (e.g. the system tray) is reflected immediately:
+
+- **PipeWire detected** — derived from whether the runtime graph loaded any devices without error. Links out to the PipeWire prerequisites section of `docs/developers/Getting_Started.md`.
+- **Default output set** — derived from `RuntimeGraph.default_output_system_name`. Links to the **Sources** view.
+- **Profile created (optional)** — derived from whether any saved profile exists. Links to the **Profiles** view.
+
+A single close control dismisses the whole checklist as one unit (no per-item "never show again") and persists `onboarding_dismissed: true` so it never reappears.
+
 ## Rules View (Phase 3)
 
-- Full-width table of authored rules (name, conditions, target, status, actions).
+Componentized under `src/components/rules/` (issue #277/#116 UX pass): `RuleListItem.vue` (one table row), `RuleConditionEditor.vue` (one condition row, reused inside the modal), and `RuleFormModal.vue` (the full create/edit dialog) — `Rules.vue` itself is the thin orchestrator (data loading, save/delete/toggle/reorder, search filtering).
+
+- Full-width table of authored rules (name, conditions, target, live-match status, inline enable toggle, actions), sorted and displayed in priority order (highest first).
+- A search box above the table filters by rule name, condition value, or target device name.
+- Each row has an inline `ToggleSwitch` (reused from `components/ToggleSwitch.vue`) for enable/disable, and ▲/▼ priority-reorder buttons that swap the `priority` value with the adjacent rule and persist both — no drag-and-drop.
+- A **Live match** badge per row ("Matching N now" / "No live match") is computed from `simulate_rules` results (`RouteExplanation.matched_rule_key === rule.name`), refreshed after every rule mutation and on load — a rule that never matches anything currently live is now visibly distinguishable from one that does, which is what makes the seen-set fix (PD-030) worth having a UI for.
 - **+ New Rule** opens a centered modal for name, priority, target selection, and conditions.
 - **Edit** reopens the same modal for rename, condition, and target changes.
-- **Simulate** runs a dry-run preview without applying routes.
+- **Simulate** runs a dry-run preview without applying routes; its results also feed the per-row live-match badges above.
 - Collapsible identity reference table helps fill condition values from active streams.
 
 ## Settings View (Phase 4)
@@ -91,7 +120,6 @@ Connection lines draw between linked nodes. Authored policies are managed in the
 - **Restore on startup:** Off/On toggle — recreate virtual devices and reapply routes when the app opens (default on).
 - **Background restore:** Off/On toggle — install and enable `pipe-deck-daemon` user systemd service for login-time restore (default off).
 - **Background service status:** enabled state, last run, devices restored, and last error from `daemon.json`.
-- Flatpak installs: background restore may be unavailable; in-app restore remains supported.
 
 ## Route Explanation Labels
 
@@ -102,30 +130,38 @@ Connection lines draw between linked nodes. Authored policies are managed in the
 | Session manual override | `Manual choice this session` |
 | No match | `No matching auto-route rule` |
 
+A stream whose `action_status` is `blocked`, `skipped_manual_override`, or `target_unavailable` also gets a colored dot badge directly on its node in the Routing graph (not just inside the collapsible route-explanation panel), so a routing failure is visible without opening it — `blocked`/`skipped_manual_override` render as `--status-warning`, `target_unavailable` as the more severe `--status-danger`. The badge's tooltip reuses this same label table.
+
 ## Progressive Disclosure
 
 - Default mode: simplified labels, guided actions, safe defaults.
 - Advanced mode: detailed graph, explicit node/link controls, deeper diagnostics.
 
-## Virtual Devices as Busses
+## Virtual Devices
 
-A virtual output/input is presented to the user as a **bus**, not merely "another sink/source you create": something that groups sounds, can carry an effect chain (see "Effects as Attachments" below), and feeds onward to another bus or a final physical output — the same mental model as a submix on a mixing desk (see "Bus"/"Submix" in `Audio_Terminology.md`). Concretely:
+Virtual output devices are a single, uniform kind now (PD-033, issue #293 — this supersedes PD-031's Bus/terminal-Output split described in earlier versions of this section). Virtual inputs are a separate, unaffected kind. Concretely:
 
-- **Virtual outputs can chain into other virtual outputs** (e.g. a "Game Audio" submix feeding a "Master Mix" bus), not just into a physical output or a virtual mic. The Routing graph's `targetsForVirtualSink` allows this.
-- **Virtual inputs stay leaves.** A virtual input (virtual mic) merges sources via `mix_sources`, but is never itself a routing source — this asymmetry is intentional, not an oversight: a virtual mic's job is to be the thing apps *consume*, not something that feeds further downstream.
-- Under the hood both kinds are still the same `module-null-sink` primitive, differing only in exposed `media.class` (PD-020/PD-024) — the bus framing is a UI/mental-model choice, not a new data type. `DeviceKind`/`DeviceDirection` are unchanged.
+- **A virtual output device is a true dead end**, symmetric with a physical output: apps/streams play into it, but it cannot route onward to anything, cannot host a device-attached effect, and renders with no output pin in the Routing graph — nothing can be dragged out of it. Combining multiple sources or fanning one signal out to several destinations is now exclusively the job of a dedicated processing node (see "Processing Nodes" below) — a Mixer node's or Fan-Out node's own output is what routes onward, not a plain device.
+- **Virtual inputs stay leaves.** A virtual input (virtual mic) merges sources via `mix_sources`, but is never itself a routing source — this asymmetry is intentional, not an oversight: a virtual mic's job is to be the thing apps *consume*, not something that feeds further downstream. It can, however, still be fed by a Mixer node's output the same way any other destination can.
+- **Creation is a two-way choice**: the "Create virtual device" dialog and the Routing graph's right-click "Add node" menu offer Output (virtual) and Input. Building a mix or a fan-out means adding a Mixer/Fan-Out processing node instead of choosing a device role.
+- Under the hood, a virtual output is still the same `module-null-sink` primitive PipeWire always exposed with a monitor/output port — Pipe Deck's own permission layer (backend rejection plus the frontend never rendering the handle) is what makes it a dead end, not removing the underlying port. It does **not** change how the node is exposed to the rest of the system: another app can still pick it directly as a playback destination via PipeWire's own device list (tracked separately, issue #288).
+- **A virtual sink's monitor port fanned out to real device(s) renders as a distinct edge style** (issue #27): solid + dimmed rather than the animated dashed line every direct app/stream route gets, so a multi-output monitor path reads as a secondary tap on the signal rather than the primary route. This applies regardless of whether the fan-out was built via a Fan-out/Group processing node or exists as a raw PipeWire link outside Pipe Deck's own routing actions.
 
-## Effects as Attachments
+## Processing Nodes
 
-Effects (PD-020, PD-024, PD-025) are presented to the user as **attachments** on a node, not as separate objects in the graph and not as a settings page you configure ahead of time. The mental model: pick a node, attach an effect to it, adjust it in place, detach it when you don't want it anymore — the same shape as attaching a file to a message, not provisioning infrastructure.
+Mixer, Fan-out, 5-Band EQ, and a growing family of other effect kinds (PD-032, issue #293) are **dedicated, independently-wired graph nodes** — not attachments on an existing node. This section supersedes the "Effects as Attachments" framing this repo shipped with previously: that section's central rule, "an attachment never becomes its own node — if it ever does, that's a bug," is deliberately reversed here. See PD-032 for the full rationale, including why this doesn't reintroduce the per-connection failure mode PD-020 was written to avoid.
+
+The mental model: a processing node is a first-class citizen of the routing graph, exactly like a device or a stream — you drop it onto the canvas, wire a source into its input, wire its output onward, and adjust its own parameters in place on the node itself. Nothing about "does this node exist" is implicit or hidden inside another node's disclosure panel.
 
 Concretely, this means:
 
-- **Attach where you are.** The primary attach point is a right-click on the node itself (Routing graph) or a per-channel disclosure (Mixer) — never a separate "effects setup" step you have to complete before the node does anything. `Effects.vue` remains as a flat-list alternative for users who'd rather not hunt across the graph, but it drives the same underlying attachments, not a separate configuration path.
-- **Attaching is immediate, not provisional.** There's no "enable" step after attaching — the deliberate act of attaching an effect is itself confirmation enough (PD-025). A one-time toast informs, it doesn't gate.
-- **Detaching is a single action, fully reversible, with nothing left behind.** No orphaned config, no separate "disable" vs "remove" distinction to reason about.
-- **An attachment never becomes its own node.** The underlying mechanism may create additional PipeWire plumbing (e.g. the `effect_output.*`/`effect_input.*` swap-by-identity nodes), but that's implementation detail — it must never surface as a second visible node the user has to route around. If it ever does, that's a bug (see the `effect_output.pipe-deck-mixer` graph-visibility fix logged alongside PD-025).
-- **Volume is not an attachment.** It's the node's own permanent, pinned property (PD-020) — attachments render below it, addable/removable/reorderable among themselves, never displacing Volume.
+- **Adding a node is the primary entry point**, via the Routing graph's right-click "Add node" menu (mirroring how a virtual Output/Input is already added) — never a separate "effects setup" page you have to complete before anything routes. Mixer, Fan-out/Group, 5-Band EQ, Delay, Limiter, High-Pass Filter, Reverb, Stereo Widener, Pan, and Compressor are all fully functional real DSP; every other effect kind (e.g. Noise Suppression, De-esser, Pitch Shift) ships as a visibly-labeled **"Not implemented yet"** pass-through stub node — addable and wireable now, with real DSP landing per-kind in follow-up tickets. Compressor (issue #86) is the one exception to every other kind's builtin-filter-chain backing: PipeWire ships no builtin envelope-following dynamics primitive, so it's genuinely hand-written DSP (`dsp::CompressorProcessor`) hosted via the portable real-time host (`pipewire::native_dsp_host`, issue #74) instead — see PD-051/PD-052.
+- **Wiring is drag-and-drop, like any other node.** A Mixer's input count grows with each connection (one gain slider per connected source); a Fan-out's output count grows the same way. Both reject a would-be second single-slot connection (or an ambiguous removal) with a clear error rather than silently guessing — see PD-032's "ambiguous relink is rejected, never guessed" rule.
+- **Adding a node is immediate, not provisional.** There's no separate "enable" step after adding — the deliberate act of adding the node (and, for a growable port, the deliberate act of connecting to it) is itself confirmation enough, the same PD-025 reasoning this framing inherits.
+- **Removing a node is a single action.** The ambiguous-relink guard above only ever applies to a kind's *non-growable* side — a Fan-out/Group node's growable output side removes cleanly regardless of how many members are connected, since there's nothing to relink there, only disconnect (PD-035). A Mixer's growable input side (or any kind's non-growable side) still requires disconnecting down to at most one connection first. Once removable, nothing is left behind — no orphaned PipeWire object, no orphaned persisted config.
+- **A Group node is a gesture-driven Fan-out variant, presented as a terminal output (issue #80, PD-035).** Ctrl-click/Cmd-click (vue-flow's multi-selection key — Shift is reserved for marquee/box-select) 2+ existing output-direction devices (hardware or virtual) already on the canvas, then right-click → "Group Selected Outputs" — wires a new node to every selected device's output in one atomic action, instead of Fan-out's connection-by-connection build-up. Functionally identical to Fan-out under the hood (one input, growable multi-target output), but presented differently: a Group node has no output pin at all, only its single input — the same as a plain output device, since a Group is meant to read as "one destination with 1-many real outputs behind it," not a general-purpose routing building block. Grouping a device does not remove or restrict it from being wired elsewhere — it remains fully independently routable as a normal target, and the real device node itself shows no trace of group membership. A Group draws no edges to its members at all; instead, members show as an inline, collapsible name list on the Group node itself, each row highlighting that member's real node on hover and offering a one-click "remove from group." A "+" button in the node's header (next to Delete) opens a picker of every eligible output not already a member, for adding to an existing group. Removing a Group's last remaining member deletes the group node itself — a Group with zero members is meaningless, unlike Fan-out where a temporary 0-output state can be a normal mid-edit step.
+- **A plain device/stream's own Volume is still not a processing node.** It remains the node's own permanent, pinned property (`set_device_volume`/`set_stream_volume`, unchanged since PD-020) — a Mixer/EQ node's *own* parameters (per-input gain, EQ bands) live on the processing node itself, not layered onto some other node's Volume row.
+- **Device-attached effects are now virtual-input (mic) only.** PD-033 retired device-attached effects on virtual output devices along with `VirtualRole::Bus` — the dedicated EQ5Band node is the only way to get EQ on an output-side signal now. The swap-by-identity attach/detach flow (`Device.effect_state`/`EffectChainConfig`) continues to work unchanged for virtual input devices. The pre-existing mic-mix mechanism (`Device.mix_sources`) is the one piece PD-032 explicitly generalizes into the Mixer Node — see PD-032 for its migration story.
 
 ## Usability Requirements
 
@@ -144,8 +180,7 @@ Concretely, this means:
 
 - Reference asset: `docs/assets/mockups/InitialMockup.png`
 - Visual language is dark-first with high-contrast accents and compact control density.
-- Primary navigation model: Dashboard, Routing, Mixer, Sources, Effects, Profiles, Settings.
-- **North-star navigation:** Routing, Mixer, and Sources appear in the sidebar before their dedicated views ship. They stay visible but disabled so the product direction is obvious; enable each item when its view reaches acceptance criteria (see `docs/Roadmap.md` Phase 6–8).
+- Primary navigation model: Dashboard, Profiles, Rules, Routing, Mixer, Sources, Effects, Settings — all shipped and enabled (`src/App.vue`'s `navItems`). Earlier drafts of this doc described some of these as disabled "north-star" placeholders; that pattern is retired now that every primary view has shipped.
 
 ### Candidate Color Schemes
 

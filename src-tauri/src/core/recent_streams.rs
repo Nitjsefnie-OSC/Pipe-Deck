@@ -71,12 +71,13 @@ impl RecentStreamCache {
                 system_name: entry.system_name.clone(),
                 direction: entry.direction.clone(),
                 current_target: None,
-                current_targets: Vec::new(),
                 media_name: entry.media_name.clone(),
                 is_system: entry.is_system,
                 volume_percent: None,
                 muted: None,
                 route_explanation: None,
+                sample_rate: None,
+                channels: None,
             })
             .collect()
     }
@@ -96,7 +97,8 @@ impl RecentStreamCache {
             .collect();
         ranked.sort_by_key(|(_, seen)| std::cmp::Reverse(*seen));
         ranked.truncate(MAX_ENTRIES);
-        let keep: std::collections::HashSet<String> = ranked.into_iter().map(|(key, _)| key).collect();
+        let keep: std::collections::HashSet<String> =
+            ranked.into_iter().map(|(key, _)| key).collect();
         self.entries.retain(|key, _| keep.contains(key));
     }
 }
@@ -157,12 +159,13 @@ mod tests {
             system_name: None,
             direction: StreamDirection::Playback,
             current_target: None,
-            current_targets: Vec::new(),
             media_name: None,
             is_system: false,
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         }
     }
 

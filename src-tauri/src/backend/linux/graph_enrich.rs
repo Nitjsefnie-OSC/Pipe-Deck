@@ -1,13 +1,15 @@
-use crate::config::ConfigStore;
-use crate::core::models::{Device, DeviceDirection, DeviceKind, RuntimeGraph, Stream, StreamDirection};
 use crate::backend::linux::pactl;
 use crate::backend::linux::stream_match::{
     is_system_stream_name, resolve_capture_target_device_id, resolve_playback_target_device_id,
     stream_matches_pactl_capture_identity, stream_matches_pactl_input,
     stream_matches_pactl_source_output,
 };
+use crate::config::ConfigStore;
+use crate::core::models::{
+    Device, DeviceDirection, DeviceKind, RuntimeGraph, Stream, StreamDirection,
+};
+use crate::sysproc;
 use std::collections::HashMap;
-use std::process::Command;
 
 pub fn finalize_graph(graph: &mut RuntimeGraph) {
     apply_device_aliases(&mut graph.devices);
@@ -18,76 +20,6 @@ pub fn finalize_graph(graph: &mut RuntimeGraph) {
 pub fn enrich_graph_from_pactl(graph: &mut RuntimeGraph) {
     merge_pactl_playback_streams(graph);
     merge_pactl_capture_streams(graph);
-    apply_pactl_playback_targets(graph);
-    apply_pactl_capture_targets(graph);
-}
-
-pub fn apply_pactl_playback_targets(graph: &mut RuntimeGraph) {
-    let sink_names = pactl::load_sink_index_names();
-    let mut updates: Vec<(String, String)> = Vec::new();
-
-    for input in pactl::list_sink_inputs() {
-        let Some(sink_index) = input.sink_index else {
-            continue;
-        };
-        let Some(sink_name) = sink_names.get(&sink_index) else {
-            continue;
-        };
-        let Some(target_id) = resolve_playback_target_device_id(graph, sink_name) else {
-            continue;
-        };
-        let Some(stream_id) = graph
-            .streams
-            .iter()
-            .find(|stream| stream_matches_pactl_input(stream, &input))
-            .map(|stream| stream.id.clone())
-        else {
-            continue;
-        };
-        updates.push((stream_id, target_id));
-    }
-
-    for (stream_id, target_id) in updates {
-        let Some(stream) = graph.streams.iter_mut().find(|stream| stream.id == stream_id) else {
-            continue;
-        };
-        stream.current_target = Some(target_id);
-        stream.current_targets.clear();
-    }
-}
-
-pub fn apply_pactl_capture_targets(graph: &mut RuntimeGraph) {
-    let source_names = pactl::load_source_index_names();
-    let mut updates: Vec<(String, String)> = Vec::new();
-
-    for output in pactl::list_source_outputs() {
-        let Some(source_index) = output.source_index else {
-            continue;
-        };
-        let Some(source_name) = source_names.get(&source_index) else {
-            continue;
-        };
-        let Some(target_id) = resolve_capture_target_device_id(graph, source_name) else {
-            continue;
-        };
-        let Some(stream_id) = graph
-            .streams
-            .iter()
-            .find(|stream| stream_matches_pactl_source_output(stream, &output))
-            .map(|stream| stream.id.clone())
-        else {
-            continue;
-        };
-        updates.push((stream_id, target_id));
-    }
-
-    for (stream_id, target_id) in updates {
-        let Some(stream) = graph.streams.iter_mut().find(|stream| stream.id == stream_id) else {
-            continue;
-        };
-        stream.current_target = Some(target_id);
-        stream.current_targets.clear();
-    }
 }
 
 /// Refresh volume/mute from pactl. Virtual pipe-deck devices are merged after pw-dump
@@ -105,6 +37,31 @@ pub(in crate::backend) fn apply_device_aliases(devices: &mut [Device]) {
     }
 }
 
+/// Device/stream volume and mute are deliberately still `pactl`-based
+/// (#432, Gap 1's remaining piece) — spiked replacing this with
+/// `pw_mixer_native::channel_volume_percent`/`mute_state` and found no real
+/// win, for two independent reasons:
+///
+/// - A virtual output's Pulse-compat `{name}.monitor` source (folded into
+///   `apply_pactl_levels`'s device-level reading below) is not a real
+///   PipeWire node at all — confirmed live via `pw-dump`, no node with that
+///   name ever appears — it's bookkeeping `pipewire-pulse` itself
+///   maintains, invisible to the raw PipeWire graph `pw_mixer_native.rs`
+///   talks to. This is the exact same wall `pw_mixer_native::set_device_volume`/
+///   `set_device_mute`'s own `monitor_system_name` resolution already hits
+///   (a `None` node id for `.monitor` bails the whole write to the CLI
+///   path) — every virtual output, this app's primary object, would still
+///   need the `pactl` fallback regardless.
+/// - A stream's volume/mute (`apply_pactl_stream_levels` below, plus the
+///   assignment inside `merge_pactl_playback_streams`/
+///   `merge_pactl_capture_streams`) is read from the *same*
+///   `pactl::list_sink_inputs`/`list_source_outputs` call already required
+///   for stream identity matching — the shell-out already happens
+///   regardless of this function, so a native per-stream `query_props`
+///   round trip would only add N native round trips per refresh, not
+///   remove any existing `pactl` call.
+///
+/// See PD-050 for the fuller writeup.
 #[derive(Default)]
 struct PactlEndpoint {
     volume_percent: Option<u8>,
@@ -148,7 +105,9 @@ fn apply_pactl_levels(devices: &mut [Device]) {
 
     for device in devices {
         let levels = match device.direction {
-            DeviceDirection::Output | DeviceDirection::Duplex => sink_levels.get(&device.system_name),
+            DeviceDirection::Output | DeviceDirection::Duplex => {
+                sink_levels.get(&device.system_name)
+            }
             DeviceDirection::Input => source_levels.get(&device.system_name),
         };
 
@@ -179,7 +138,7 @@ fn apply_pactl_levels(devices: &mut [Device]) {
 }
 
 fn load_pactl_endpoints(kind: &str) -> HashMap<String, PactlEndpoint> {
-    let output = match Command::new("pactl").args(["list", kind]).output() {
+    let output = match sysproc::command("pactl").args(["list", kind]).output() {
         Ok(output) if output.status.success() => output,
         _ => return HashMap::new(),
     };
@@ -192,12 +151,12 @@ fn load_pactl_endpoints(kind: &str) -> HashMap<String, PactlEndpoint> {
     for line in text.lines() {
         let line = line.trim();
 
-        if line.starts_with("Name:") {
+        if let Some(stripped) = line.strip_prefix("Name:") {
             if let Some(name) = current_name.take() {
                 endpoints.insert(name, current);
                 current = PactlEndpoint::default();
             }
-            current_name = Some(line["Name:".len()..].trim().to_string());
+            current_name = Some(stripped.trim().to_string());
             continue;
         }
 
@@ -256,12 +215,13 @@ fn merge_pactl_playback_streams(graph: &mut RuntimeGraph) {
                 .sink_index
                 .and_then(|index| sink_names.get(&index).cloned())
                 .and_then(|sink_name| resolve_playback_target_device_id(graph, &sink_name)),
-            current_targets: Vec::new(),
             media_name: input.media_name.clone(),
             is_system: is_system_stream_name(&input.application_name, &input.node_name),
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         });
     }
 }
@@ -285,7 +245,6 @@ fn merge_pactl_capture_streams(graph: &mut RuntimeGraph) {
             }
             if let Some(target_id) = target_id {
                 stream.current_target = Some(target_id);
-                stream.current_targets.clear();
             }
             // Same fix as merge_pactl_playback_streams: this source-output
             // already corresponds to a stream pw-dump discovered directly,
@@ -303,12 +262,13 @@ fn merge_pactl_capture_streams(graph: &mut RuntimeGraph) {
             system_name: output.node_name.clone(),
             direction: StreamDirection::Capture,
             current_target: target_id,
-            current_targets: Vec::new(),
             media_name: output.media_name.clone(),
             is_system: is_system_stream_name(&output.application_name, &output.node_name),
             volume_percent: None,
             muted: None,
             route_explanation: None,
+            sample_rate: None,
+            channels: None,
         });
     }
 }

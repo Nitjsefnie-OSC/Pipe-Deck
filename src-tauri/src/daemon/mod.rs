@@ -1,15 +1,26 @@
 use crate::config::ConfigStore;
 use crate::core::models::DaemonStatus;
 use crate::core::restore::{self, RestoreError};
+use crate::sysproc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+pub mod ipc;
+mod systemd;
+
 const SERVICE_NAME: &str = "pipe-deck-daemon.service";
+/// Bumped whenever `packaging/pipe-deck-daemon.service` changes in a way that
+/// requires reinstalling an already-installed unit rather than just
+/// overwriting the file in place (e.g. the `Type=oneshot` -> `Type=notify`
+/// change for issue #148 — systemd doesn't pick that up from a plain
+/// `daemon-reload` on a unit that's already active under the old type).
+/// Matches the `# pipe-deck-daemon-unit-version: N` comment at the top of the
+/// bundled unit file.
+const CURRENT_UNIT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStateFile {
@@ -92,14 +103,13 @@ pub fn run() -> i32 {
     for attempt in 0..5 {
         match restore::restore_session(backend.as_ref()) {
             Ok(result) => {
-                devices_restored =
-                    (result.created.len() + result.adopted.len()) as u32;
+                devices_restored = (result.created.len() + result.adopted.len()) as u32;
                 if result.errors.is_empty() {
                     if let Err(error) = restore::apply_persisted_routes(backend.as_ref()) {
                         last_error = Some(error.to_string());
                     } else {
-                        write_status(pid, &started, None, devices_restored);
-                        return 0;
+                        last_error = None;
+                        break;
                     }
                 } else {
                     last_error = Some(result.errors.join("; "));
@@ -115,13 +125,394 @@ pub fn run() -> i32 {
         }
     }
 
-    write_status(
-        pid,
-        &started,
-        last_error.as_deref(),
-        devices_restored,
-    );
+    write_status(pid, &started, last_error.as_deref(), devices_restored);
+
+    // Native-effects hosting (issue #148): the daemon should come up for
+    // effects hosting regardless of whether restore succeeded — restore
+    // failures don't block a user from attaching a live effect chain. This
+    // only returns if the socket bind itself fails.
+    serve_native_effects();
     0
+}
+
+/// Entry point for a GUI-spawned, ephemeral daemon instance (issue #148) —
+/// used when the user hasn't enabled restore-on-login, so no persistent
+/// systemd-managed daemon is already running, but native effects transport
+/// is still wanted for this GUI session. Selected by the
+/// `PIPE_DECK_DAEMON_EPHEMERAL=1` env var in `bin/pipe-deck-daemon.rs`,
+/// entirely separate from the `background_restore` config flag `run()`
+/// checks — this process was spawned directly by the GUI as a plain child,
+/// not installed/enabled via systemd, and has nothing to do with that
+/// setting.
+///
+/// Skips the virtual-device/routing restore-session retry loop entirely:
+/// unlike a fresh login, the GUI is already up and already has its own
+/// up-to-date view of devices/routing, so there's nothing stale to restore
+/// here — this process exists purely to host native effects for as long as
+/// the GUI that spawned it is alive. Its own crash-safety (getting killed if
+/// the GUI dies, including a crash) is the spawning side's job
+/// (`ensure_ephemeral_daemon`'s `PR_SET_PDEATHSIG`), not this function's.
+pub fn run_ephemeral() -> i32 {
+    serve_native_effects();
+    0
+}
+
+/// Enters the daemon's long-running phase: notifies `systemd` (`Type=notify`)
+/// that startup is complete, then blocks forever serving native-effects IPC
+/// requests (`ipc::server::run`).
+fn serve_native_effects() {
+    // Pays `native_host`'s one-time PipeWire connection setup cost now,
+    // before the socket accepts a single request — otherwise it's paid
+    // lazily inside whichever `LoadChain`/etc. IPC request happens to be
+    // first, which can take long enough on a cold process to blow through
+    // the client's `REQUEST_TIMEOUT` (see `native_host::warm_up`'s doc
+    // comment). The reconcile calls below already do this incidentally when
+    // there's something persisted to reload, but a fresh profile with
+    // nothing configured yet skips both, so this can't be dropped in favor
+    // of relying on them.
+    // A failure here (issue #437) no longer panics — it's logged and the
+    // daemon keeps starting; the same error surfaces to whichever
+    // LoadChain/etc. IPC request first tries to use the connection instead.
+    if let Err(error) = crate::pipewire::native_host::warm_up() {
+        eprintln!("native effects host failed to start: {error}");
+    }
+    if let Err(error) = crate::pipewire::native_dsp_host::warm_up() {
+        eprintln!("native DSP host failed to start: {error}");
+    }
+    reconcile_live_effects_state();
+    reconcile_live_processing_nodes();
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+    let _ = ipc::server::run();
+}
+
+/// Re-derives live-effects state after a daemon (re)start — a native
+/// in-memory connection doesn't survive the daemon dying the way a conf.d
+/// file did, so whatever chains were loaded before a crash/restart are
+/// already gone (they belonged to the dead connection) by the time this
+/// runs. Reloads anything that's persisted as active but not currently
+/// loaded, straight through `native_host`, before the socket starts
+/// accepting requests.
+///
+/// Deliberately does **not** re-establish downstream routing (fan-out
+/// targets, mic-mix feeders) for the reloaded `effect_output.*`/
+/// `effect_input.*` nodes — that's `backend::linux::graph_routing`'s job,
+/// and it already runs generically on every GUI graph refresh, keyed off
+/// persisted routing intent, with no idea (or need to know) how a node came
+/// to exist. So a reloaded chain's audio processing comes back immediately;
+/// its downstream links come back on the GUI's next refresh, not
+/// instantaneously. See the PD-027 addendum.
+///
+/// No `CoreEngine`/`RuntimeGraph` involved on purpose — same
+/// `&dyn AudioBackend` + `ConfigStore` shape `core::restore` already uses
+/// daemon-side for virtual-device/routing restore. Resolving "which
+/// persisted chain belongs to which live device" doesn't need graph state:
+/// for a `pipe-deck-*` virtual device, `Device.id` is always exactly
+/// `format!("virtual-{}", system_name.trim_start_matches("pipe-deck-"))`
+/// (`backend::linux::virtual_devices`), and `list_virtual_devices()` already
+/// returns that `device_id` paired with `system_name`/`direction` directly.
+fn reconcile_live_effects_state() {
+    let Ok(chains) = ConfigStore::new().effect_chains() else {
+        return;
+    };
+    if chains.is_empty() {
+        return;
+    }
+
+    let backend = crate::backend::create_backend();
+    for info in backend.list_virtual_devices() {
+        let Some(config) = chains.get(&info.device_id) else {
+            continue;
+        };
+        if !config.is_active()
+            || crate::pipewire::native_host::is_loaded(&info.system_name)
+            || crate::pipewire::native_dsp_host::is_loaded(&info.system_name)
+        {
+            continue;
+        }
+
+        let is_input = info.direction == crate::core::models::DeviceDirection::Input;
+        // Same dispatch as `backend::linux::live::LinuxPipeWireBackend::load_effect_chain`
+        // — a portable-DSP-capable chain must come back on the same
+        // transport after a crash/restart, not silently switch to the
+        // builtin-module path just because this is the recovery caller.
+        if is_input && crate::pipewire::native_dsp_host::supports(config) {
+            let _ =
+                crate::pipewire::native_dsp_host::load_chain(&info.system_name, is_input, config);
+        } else {
+            let _ = crate::pipewire::native_host::load_chain(&info.system_name, is_input, config);
+        }
+    }
+}
+
+/// `reconcile_live_effects_state`'s counterpart for processing nodes
+/// (PD-032/#293) — a gap that mechanism never covered, since it was written
+/// before processing nodes existed and only ever looked at
+/// `ConfigStore::effect_chains()` (the older device-attached mechanism).
+/// Without this, an `Eq5Band` processing node's `libpipewire-module-filter-chain`
+/// instance — owned by `native_host`'s own connection the same way a
+/// device-attached chain's is — never comes back after the daemon
+/// dies/restarts: the node still exists in the persisted graph (so the UI
+/// keeps showing it, including its now-stale port connections) and
+/// `is_processing_node_loaded` correctly reports `false`, but nothing ever
+/// calls `native_host::load_chain` again to recreate it. Every subsequent
+/// `set_param` (an EQ slider drag) then genuinely has no live node to find —
+/// not a bug in the lookup itself, just nothing to look up.
+///
+/// Only `Eq5Band` needs this: `Mixer`/`FanOut` are plain `pactl`-created null
+/// sinks, owned by the system PipeWire session itself (a short-lived `pactl`
+/// subprocess issues the load, then exits), not by this daemon's own
+/// `native_host` connection — they survive a daemon restart fine on their
+/// own. `Stub` kinds have no backing PipeWire object at all.
+fn reconcile_live_processing_nodes() {
+    let specs = ConfigStore::new().processing_nodes();
+    if specs.is_empty() {
+        return;
+    }
+
+    let backend = crate::backend::create_backend();
+    for spec in specs {
+        // Only DSP-backed kinds are loaded through `native_host` at all —
+        // Mixer/Fan-out are plain `pactl` null-sinks owned by the system
+        // PipeWire session itself, which survive a daemon restart on their
+        // own and need no reconciliation here. A new DSP-backed kind
+        // (issue #313's Delay) MUST get its own arm here, or a persisted
+        // node silently stops working after every daemon restart — nothing
+        // else in this codebase reloads it.
+        let (system_name, config, via_dsp_host) = match &spec.kind {
+            crate::core::models::ProcessingNodeSpecKind::Compressor {
+                threshold_db,
+                ratio_x10,
+                attack_ms,
+                release_ms,
+                makeup_gain_db,
+            } => (
+                format!("pipe-deck-proc-compressor-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Compressor {
+                        id: "compressor".into(),
+                        threshold_db: *threshold_db,
+                        ratio_x10: *ratio_x10,
+                        attack_ms: *attack_ms,
+                        release_ms: *release_ms,
+                        makeup_gain_db: *makeup_gain_db,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                true,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Eq5Band {
+                eq_sub,
+                eq_bass,
+                eq_mid,
+                eq_treble,
+                eq_air,
+                output_gain,
+            } => (
+                format!("pipe-deck-proc-eq5band-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Eq5Band {
+                        id: "eq".into(),
+                        eq_sub: *eq_sub,
+                        eq_bass: *eq_bass,
+                        eq_mid: *eq_mid,
+                        eq_treble: *eq_treble,
+                        eq_air: *eq_air,
+                        output_gain: *output_gain,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Delay {
+                delay_ms,
+                feedback_percent,
+                feedforward_percent,
+            } => (
+                format!("pipe-deck-proc-delay-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Delay {
+                        id: "delay".into(),
+                        delay_ms: *delay_ms,
+                        feedback_percent: *feedback_percent,
+                        feedforward_percent: *feedforward_percent,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Limiter {
+                ceiling_db,
+                floor_db,
+                symmetric,
+            } => (
+                format!("pipe-deck-proc-limiter-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Limiter {
+                        id: "limiter".into(),
+                        ceiling_db: *ceiling_db,
+                        floor_db: *floor_db,
+                        symmetric: *symmetric,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Hpf {
+                freq_hz,
+                resonance_x10,
+            } => (
+                format!("pipe-deck-proc-hpf-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Hpf {
+                        id: "hpf".into(),
+                        freq_hz: *freq_hz,
+                        resonance_x10: *resonance_x10,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Reverb { mix_percent } => (
+                format!("pipe-deck-proc-reverb-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Reverb {
+                        id: "reverb".into(),
+                        mix_percent: *mix_percent,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Widener { width_percent } => (
+                format!("pipe-deck-proc-widener-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Widener {
+                        id: "widener".into(),
+                        width_percent: *width_percent,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            crate::core::models::ProcessingNodeSpecKind::Pan { balance_percent } => (
+                format!("pipe-deck-proc-pan-{}", spec.slug),
+                crate::core::models::EffectChainConfig {
+                    stages: vec![crate::core::models::EffectStage::Pan {
+                        id: "pan".into(),
+                        balance_percent: *balance_percent,
+                    }],
+                    bypassed: spec.bypassed,
+                    ..Default::default()
+                },
+                false,
+            ),
+            _ => continue,
+        };
+
+        if via_dsp_host {
+            // Compressor (issue #86) — no builtin-module fallback exists,
+            // routes exclusively through the portable DSP host. No
+            // `is_loaded` pre-check the builtin-module kinds below need
+            // (`native_dsp_host::load_chain` already unloads-then-reloads
+            // idempotently), and no `set_processing_node_volume` nudge
+            // either — this is a plain client `pw::stream`, not a
+            // `pactl`-visible sink (see `native_dsp_host`'s own "Scope/known
+            // limitation" doc section).
+            let _ = crate::pipewire::native_dsp_host::load_chain(&system_name, false, &config);
+            continue;
+        }
+
+        if crate::pipewire::native_host::is_loaded(&system_name) {
+            continue;
+        }
+
+        if crate::pipewire::native_host::load_chain(&system_name, false, &config).is_err() {
+            continue;
+        }
+        // Mirrors `backend::linux::live::load_processing_node`'s DSP-kind
+        // arms: a brand-new filter-chain sink has never had its volume set
+        // by anyone, and comes up muted/zero-volume by whatever default
+        // WirePlumber applies otherwise (issue #303).
+        let _ = backend.set_processing_node_volume(&system_name, 100, false);
+    }
+}
+
+/// GUI-managed handle to a spawned ephemeral daemon child (issue #148),
+/// stored as Tauri state so the run-event loop can kill it on `RunEvent::Exit`
+/// — belt-and-suspenders for a clean quit, on top of `PR_SET_PDEATHSIG`'s
+/// kernel-level guarantee for the crash case (see `ensure_ephemeral_daemon`).
+/// `None` when nothing was spawned (either a persistent daemon already
+/// answered a ping or spawning failed) — `kill_ephemeral_daemon` is a safe
+/// no-op either way.
+pub struct EphemeralDaemonHandle(pub std::sync::Mutex<Option<std::process::Child>>);
+
+/// Spawns a lightweight instance of the daemon binary as a plain child
+/// process of the GUI, for users who haven't enabled restore-on-login (so no
+/// persistent systemd daemon is already running) but still want native
+/// effects transport for this session. Ping-first: if anything (typically
+/// the persistent daemon) already answers the socket, does nothing — the
+/// GUI never needs to know or care which one it's actually talking to.
+///
+/// Crash-safety: `PR_SET_PDEATHSIG` makes the kernel send `SIGKILL` to the
+/// child the moment *this* process dies, for any reason — a clean quit, a
+/// crash, an external `kill -9`, an OOM-kill. This is the load-bearing
+/// guarantee; nothing that depends on Rust code actually running during
+/// shutdown (a `Drop` impl, a `RunEvent::Exit` handler) can cover a crash,
+/// since no code runs in a process that's already dead. `RunEvent::Exit`
+/// (wired up in `lib.rs`) still kills the child explicitly too, but only as
+/// a faster/cleaner path for the ordinary quit case — `PR_SET_PDEATHSIG` is
+/// what makes the *lingering-process* guarantee actually hold.
+///
+/// Deliberately does not unload any effect chains before the child dies —
+/// same as the persistent daemon, its native PipeWire connection dies with
+/// the process either way, and for a user who hasn't opted into persistence,
+/// effects *not* surviving the app closing is the intended behavior, not a
+/// gap (confirmed against the underlying product question this addresses).
+pub fn ensure_ephemeral_daemon() -> Option<std::process::Child> {
+    if ipc::client::NativeHostClient::ping() {
+        return None;
+    }
+
+    let path = daemon_binary_path()?;
+    let mut command = sysproc::command(path);
+    command.env("PIPE_DECK_DAEMON_EPHEMERAL", "1");
+
+    // SAFETY: the closure only calls `libc::prctl`, an async-signal-safe
+    // syscall — the one operation `pre_exec` closures are documented to be
+    // sound for (arbitrary Rust runtime/allocator use between fork and exec
+    // is what's actually unsound here, and this closure does neither).
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            // FFI call with no preconditions beyond the signal number being
+            // valid, which `libc::SIGKILL` guarantees — sound under the
+            // same `pre_exec` safety contract as the outer block.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    command.spawn().ok()
+}
+
+/// Kills a previously spawned ephemeral daemon, if any. Safe to call even if
+/// nothing was ever spawned (persistent daemon was already running, or
+/// spawning failed) — a no-op in either case.
+pub fn kill_ephemeral_daemon(handle: &EphemeralDaemonHandle) {
+    if let Ok(mut guard) = handle.0.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub fn daemon_binary_path() -> Option<PathBuf> {
@@ -130,9 +521,7 @@ pub fn daemon_binary_path() -> Option<PathBuf> {
     }
 
     if let Ok(current) = std::env::current_exe() {
-        let sibling = current
-            .parent()
-            .map(|dir| dir.join("pipe-deck-daemon"));
+        let sibling = current.parent().map(|dir| dir.join("pipe-deck-daemon"));
         if let Some(path) = sibling {
             if path.exists() {
                 return Some(path);
@@ -167,40 +556,82 @@ pub fn bundled_service_unit() -> String {
     include_str!("../../packaging/pipe-deck-daemon.service").to_string()
 }
 
+/// Parses the `# pipe-deck-daemon-unit-version: N` marker from an installed
+/// unit file's contents, if present. `None` covers both "file doesn't exist"
+/// and "predates the marker entirely" (the original `Type=oneshot` unit) —
+/// both cases need the same reinstall treatment below.
+fn installed_unit_version(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("# pipe-deck-daemon-unit-version:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
 pub fn install_user_service_unit() -> Result<(), String> {
-    let daemon_path = daemon_binary_path()
-        .ok_or_else(|| "pipe-deck-daemon binary not found".to_string())?;
+    let daemon_path =
+        daemon_binary_path().ok_or_else(|| "pipe-deck-daemon binary not found".to_string())?;
     let unit_dir = user_systemd_dir();
     fs::create_dir_all(&unit_dir).map_err(|error| error.to_string())?;
+
+    let unit_path = unit_dir.join(SERVICE_NAME);
+    // The `Type=oneshot` -> `Type=notify` change (issue #148) isn't something
+    // systemd picks up from a plain overwrite + `daemon-reload` on a unit
+    // that's already active under the old type — stop the old unit first so
+    // the new one starts clean under its new `Type=`.
+    if let Ok(existing) = fs::read_to_string(&unit_path) {
+        let needs_reinstall =
+            installed_unit_version(&existing).is_none_or(|version| version < CURRENT_UNIT_VERSION);
+        if needs_reinstall {
+            let _ = systemd::disable_and_stop(SERVICE_NAME);
+        }
+    }
 
     let unit = bundled_service_unit().replace(
         "ExecStart=/usr/bin/pipe-deck-daemon",
         &format!("ExecStart={}", daemon_path.display()),
     );
-    fs::write(unit_dir.join(SERVICE_NAME), unit).map_err(|error| error.to_string())?;
-    run_systemctl(&["daemon-reload"])?;
+    fs::write(&unit_path, unit).map_err(|error| error.to_string())?;
+    systemd::reload()?;
     Ok(())
 }
 
 pub fn enable_background_service() -> Result<(), String> {
     install_user_service_unit()?;
-    run_systemctl(&["enable", "--now", SERVICE_NAME])?;
+    systemd::enable_and_start(SERVICE_NAME)?;
     ConfigStore::new()
         .set_background_restore(true)
         .map_err(|error| error.to_string())
 }
 
 pub fn disable_background_service() -> Result<(), String> {
-    let _ = run_systemctl(&["disable", "--now", SERVICE_NAME]);
+    let _ = systemd::disable_and_stop(SERVICE_NAME);
     ConfigStore::new()
         .set_background_restore(false)
         .map_err(|error| error.to_string())
 }
 
+/// Full teardown of the background-restore unit: disables/stops it (like
+/// `disable_background_service`) and additionally deletes the unit file
+/// itself, which that function deliberately leaves in place. Meant for
+/// package uninstall/purge (`pipe-deck-cli cleanup`), not the Settings
+/// toggle — a user turning background restore back on later should still
+/// find a working unit without needing to reinstall the package.
+/// Returns the removed unit path, or `None` if there was nothing to remove.
+pub fn uninstall_user_service_unit() -> Result<Option<PathBuf>, String> {
+    let unit_path = user_systemd_dir().join(SERVICE_NAME);
+    if !unit_path.exists() {
+        return Ok(None);
+    }
+    let _ = systemd::disable_and_stop(SERVICE_NAME);
+    fs::remove_file(&unit_path).map_err(|error| error.to_string())?;
+    let _ = systemd::reload();
+    Ok(Some(unit_path))
+}
+
 pub fn get_status() -> DaemonStatus {
-    let state = read_status();
     let enabled = is_service_enabled();
     let running = is_service_running();
+    let state = stale_state_filter(enabled, read_status());
 
     DaemonStatus {
         running,
@@ -212,27 +643,630 @@ pub fn get_status() -> DaemonStatus {
     }
 }
 
+/// A disabled service can't run again on its own, so a `last_error` (or
+/// `last_run`) left over from a previous enabled period is stale, not
+/// current status — surfacing it as a persistent error in Settings ->
+/// Background regardless of `enabled` was reported as a bug (#120): once the
+/// service is disabled, `daemon.json` is never rewritten, so whatever it
+/// last recorded (e.g. a one-off misconfigured `PIPE_DECK_CONFIG_DIR` during
+/// manual testing) stuck around forever.
+fn stale_state_filter(enabled: bool, state: Option<DaemonStateFile>) -> Option<DaemonStateFile> {
+    if enabled {
+        state
+    } else {
+        None
+    }
+}
+
 fn is_service_enabled() -> bool {
-    run_systemctl(&["is-enabled", SERVICE_NAME])
-        .map(|output| output.trim() == "enabled")
-        .unwrap_or(false)
+    systemd::is_enabled(SERVICE_NAME)
 }
 
 fn is_service_running() -> bool {
-    run_systemctl(&["is-active", SERVICE_NAME])
-        .map(|output| output.trim() == "active")
-        .unwrap_or(false)
+    systemd::is_active(SERVICE_NAME)
 }
 
-fn run_systemctl(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_state(last_error: Option<&str>) -> DaemonStateFile {
+        DaemonStateFile {
+            pid: 1234,
+            last_run: "2026-07-20T14:23:45Z".into(),
+            last_error: last_error.map(str::to_string),
+            devices_restored: 0,
+        }
+    }
+
+    #[test]
+    fn disabled_service_hides_stale_state() {
+        let state = sample_state(Some("failed to read config: missing field `version`"));
+        assert!(stale_state_filter(false, Some(state)).is_none());
+    }
+
+    #[test]
+    fn enabled_service_surfaces_its_recorded_state() {
+        let state = sample_state(Some("boom"));
+        let result = stale_state_filter(true, Some(state)).expect("state preserved when enabled");
+        assert_eq!(result.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn no_recorded_state_stays_none_regardless_of_enabled() {
+        assert!(stale_state_filter(true, None).is_none());
+        assert!(stale_state_filter(false, None).is_none());
+    }
+
+    #[test]
+    fn uninstall_user_service_unit_is_a_no_op_when_no_unit_file_exists() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-uninstall-unit-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("create temp XDG_CONFIG_HOME");
+        let previous = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &temp_dir);
+
+        let result = uninstall_user_service_unit();
+
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    // `install_writes_unit_file_when_absent_and_reloads_daemon`,
+    // `install_on_reinstall_disables_before_reloading`,
+    // `enable_background_service_installs_then_enables`,
+    // `disable_background_service_runs_disable_now`, and
+    // `uninstall_when_unit_exists_disables_deletes_and_reloads` used to live
+    // here, asserting on a fake `systemctl` binary's recorded invocations
+    // (#425 retired the `run_systemctl` shellout these existed to intercept —
+    // there is no longer a `systemctl` process to fake). Every one of them
+    // ultimately called into `enable_and_start(SERVICE_NAME)`/
+    // `disable_and_stop(SERVICE_NAME)`, i.e. the *real* `pipe-deck-daemon.service`
+    // unit name — running them for real against `zbus`/D-Bus (rather than a
+    // faked binary) would enable/disable/stop whatever real background-restore
+    // service happens to be installed on the machine running the test suite,
+    // the exact hazard `FakeSystemctl`'s own doc comment cited PR #256 for.
+    // `daemon::systemd::live_tests` covers the actual D-Bus call surface this
+    // introduced instead, against a disposable, uniquely-named unit that's
+    // never `SERVICE_NAME` — see that module for the real live coverage.
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! `#[ignore]`d on purpose: hits a *real* PipeWire session, same
+    //! convention as `core::engine::effects_ops::live_tests` and
+    //! `daemon::ipc::client::live_tests`. Only run via
+    //! `cargo test --lib -- --ignored
+    //! reconcile_live_effects_state_reloads_a_persisted_chain_after_a_simulated_crash`.
+    //! Exercises a disposable `Recovery Test Bus` virtual output this
+    //! test creates and removes itself.
+    use super::*;
+    use crate::backend::linux::pactl;
+    use crate::config::store::lock_config_dir_env;
+    use crate::core::engine::CoreEngine;
+    use crate::core::models::{EffectChainConfig, EffectStage};
+
+    #[test]
+    #[ignore]
+    fn reconcile_live_effects_state_reloads_a_persisted_chain_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir =
+            std::env::temp_dir().join(format!("pipe-deck-recovery-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let mut engine = CoreEngine::new();
+        engine.refresh_graph().expect("initial graph refresh");
+        let created = engine
+            .create_virtual_output("Recovery Test Bus")
+            .expect("create disposable test device");
+
+        let cleanup = |engine: &mut CoreEngine| {
+            let _ = crate::pipewire::native_host::unload_chain(&created.system_name);
+            let _ = engine.remove_virtual_device(&created.system_name);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+
+        // Persist an active chain for this device, exactly as a real Apply
+        // would via `set_effect_chain`, but *without* loading it through
+        // `native_host` — simulating "the daemon crashed, so nothing is
+        // actually loaded right now even though config says it should be".
+        let config = EffectChainConfig {
+            stages: vec![EffectStage::Eq5Band {
+                id: "eq".to_string(),
+                eq_bass: 4,
+                eq_sub: 0,
+                eq_mid: 0,
+                eq_treble: 0,
+                eq_air: 0,
+                output_gain: 0,
+            }],
+            ..Default::default()
+        };
+        if let Err(error) = ConfigStore::new().set_effect_chain(&created.device_id, &config) {
+            cleanup(&mut engine);
+            panic!("failed to persist effect chain: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&created.system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_effects_state();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&created.system_name);
+        let sink_live = pactl::sink_exists(&created.system_name).unwrap_or(false);
+        cleanup(&mut engine);
+
+        assert!(
+            loaded,
+            "reconcile_live_effects_state did not reload the persisted chain"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the chain"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s counterpart for an `Eq5Band`
+    /// processing node — `reconcile_live_effects_state` above only ever
+    /// covered the older device-attached mechanism, so an Eq5Band node's
+    /// filter-chain instance never came back after a daemon crash/restart
+    /// (issue #303: every EQ slider drag against a node in this state failed
+    /// with "no live PipeWire node found", not because the lookup was
+    /// broken, but because there was genuinely nothing live to find).
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_eq5band_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        // Persist the spec directly via `ConfigStore`, exactly as
+        // `reconcile_live_effects_state_reloads_a_persisted_chain_after_a_simulated_crash`
+        // does above — deliberately *not* through `CoreEngine::create_processing_node`,
+        // which would load it live via the GUI-side `NativeHostClient` (a
+        // socket call to whatever real daemon process happens to be
+        // running, if any). `reconcile_live_processing_nodes` itself calls
+        // `native_host` in-process directly (it *is* daemon-owned code), so
+        // this test needs no running daemon at all — only a persisted spec
+        // that says "should be active" while nothing is actually loaded,
+        // simulating "the daemon crashed".
+        let spec_id = "processing-eq5band-recovery-test-eq".to_string();
+        let system_name = "pipe-deck-proc-eq5band-recovery-test-eq".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-eq".to_string(),
+            label: "Recovery Test EQ".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Eq5Band {
+                eq_sub: 0,
+                eq_bass: 4,
+                eq_mid: 0,
+                eq_treble: 0,
+                eq_air: 0,
+                output_gain: 0,
+            },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Eq5Band node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s Delay counterpart (issue #313) —
+    /// same reasoning as the Eq5Band test above: without a matching arm in
+    /// `reconcile_live_processing_nodes`, a persisted Delay node would
+    /// silently stop working after every daemon restart.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_delay_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-delay-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-delay-recovery-test-delay".to_string();
+        let system_name = "pipe-deck-proc-delay-recovery-test-delay".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-delay".to_string(),
+            label: "Recovery Test Delay".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Delay {
+                delay_ms: 300,
+                feedback_percent: 25,
+                feedforward_percent: 0,
+            },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Delay node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s Limiter counterpart (issue #311)
+    /// — same reasoning as the Delay/Eq5Band tests above.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_limiter_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-limiter-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-limiter-recovery-test-limiter".to_string();
+        let system_name = "pipe-deck-proc-limiter-recovery-test-limiter".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-limiter".to_string(),
+            label: "Recovery Test Limiter".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Limiter {
+                ceiling_db: -6,
+                floor_db: -6,
+                symmetric: true,
+            },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Limiter node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s HPF counterpart (issue #312) —
+    /// same reasoning as the Delay/Limiter/Eq5Band tests above.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_hpf_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-hpf-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-hpf-recovery-test-hpf".to_string();
+        let system_name = "pipe-deck-proc-hpf-recovery-test-hpf".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-hpf".to_string(),
+            label: "Recovery Test HPF".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Hpf {
+                freq_hz: 150,
+                resonance_x10: 7,
+            },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted HPF node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s Reverb counterpart (issue #327) —
+    /// same reasoning as the Delay/Limiter/Eq5Band tests above.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_reverb_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-reverb-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-reverb-recovery-test-reverb".to_string();
+        let system_name = "pipe-deck-proc-reverb-recovery-test-reverb".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-reverb".to_string(),
+            label: "Recovery Test Reverb".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Reverb { mix_percent: 35 },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Reverb node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s Widener counterpart (issue #314)
+    /// — same reasoning as the Delay/Limiter/Eq5Band tests above.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_widener_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-widener-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-widener-recovery-test-widener".to_string();
+        let system_name = "pipe-deck-proc-widener-recovery-test-widener".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-widener".to_string(),
+            label: "Recovery Test Widener".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Widener { width_percent: 150 },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Widener node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
+    }
+
+    /// `reconcile_live_processing_nodes`'s Pan counterpart (issue #16) —
+    /// same reasoning as the Delay/Limiter/Eq5Band tests above.
+    #[test]
+    #[ignore]
+    fn reconcile_live_processing_nodes_reloads_a_persisted_pan_node_after_a_simulated_crash() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let _guard = lock_config_dir_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-proc-node-pan-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &temp_dir);
+
+        let spec_id = "processing-pan-recovery-test-pan".to_string();
+        let system_name = "pipe-deck-proc-pan-recovery-test-pan".to_string();
+        let spec = crate::core::models::ProcessingNodeSpec {
+            id: spec_id.clone(),
+            slug: "recovery-test-pan".to_string(),
+            label: "Recovery Test Pan".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            kind: crate::core::models::ProcessingNodeSpecKind::Pan {
+                balance_percent: 40,
+            },
+            input_sources: Vec::new(),
+            output_targets: Vec::new(),
+            bypassed: false,
+        };
+        let cleanup = || {
+            let _ = crate::pipewire::native_host::unload_chain(&system_name);
+            let _ = ConfigStore::new().remove_processing_node(&spec_id);
+            std::env::remove_var("PIPE_DECK_CONFIG_DIR");
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+        if let Err(error) = ConfigStore::new().add_processing_node(spec) {
+            cleanup();
+            panic!("failed to persist processing node spec: {error}");
+        }
+
+        assert!(
+            !crate::pipewire::native_host::is_loaded(&system_name),
+            "precondition: nothing should be loaded before reconciliation runs"
+        );
+
+        reconcile_live_processing_nodes();
+
+        let loaded = crate::pipewire::native_host::is_loaded(&system_name);
+        let sink_live = pactl::sink_exists(&system_name).unwrap_or(false);
+        cleanup();
+
+        assert!(
+            loaded,
+            "reconcile_live_processing_nodes did not reload the persisted Pan node"
+        );
+        assert!(
+            sink_live,
+            "effects sink did not appear after reconciliation reloaded the node"
+        );
     }
 }

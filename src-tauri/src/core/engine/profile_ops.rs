@@ -1,16 +1,13 @@
+use crate::config::profile_store::{import_profile_archive, ProfileStore};
 use crate::config::ConfigStore;
-use crate::core::models::{
-    ApplyResult, Profile, ProfileIndexEntry, RoutingDrift,
-};
+use crate::core::models::{ApplyResult, Profile, ProfileIndexEntry, RoutingDrift};
 use crate::core::profile::{capture_profile_from_graph, update_profile_timestamp};
 use crate::core::profile_drift::compare_profile_to_graph;
+use crate::core::restore;
 use crate::core::routing::{
     apply_profile_routing, apply_profile_volumes, capture_routing_snapshot,
     restore_routing_snapshot,
 };
-use crate::config::profile_store::{import_profile_archive, ProfileStore};
-use crate::core::restore;
-use crate::pipewire::filter_chain;
 use std::path::Path;
 
 use super::mock::{apply_mock_profile, apply_mock_profile_volumes, apply_mock_snapshot};
@@ -112,6 +109,41 @@ impl CoreEngine {
         Ok(profile)
     }
 
+    pub fn delete_profile(&mut self, profile_id: &str) -> Result<(), EngineError> {
+        let store = ConfigStore::new();
+        let config = store
+            .load_config()
+            .map_err(|error| EngineError::Config(error.to_string()))?;
+
+        if config.active_profile.as_deref() == Some(profile_id) {
+            return Err(EngineError::InvalidInput(
+                "cannot delete the active profile; swap to another profile first".into(),
+            ));
+        }
+        if config.profile_index.len() <= 1 {
+            return Err(EngineError::InvalidInput(
+                "cannot delete the last remaining profile".into(),
+            ));
+        }
+
+        let entry = config
+            .profile_index
+            .iter()
+            .find(|entry| entry.id == profile_id)
+            .cloned()
+            .ok_or_else(|| EngineError::Profile(format!("profile not found: {profile_id}")))?;
+
+        let profile_store = ProfileStore::new(store.config_dir().clone());
+        profile_store
+            .delete_profile_file(&entry)
+            .map_err(|error| EngineError::Profile(error.to_string()))?;
+        store
+            .remove_profile_from_index(profile_id)
+            .map_err(|error| EngineError::Config(error.to_string()))?;
+
+        Ok(())
+    }
+
     pub fn save_profile_as(
         &mut self,
         profile_id: &str,
@@ -144,7 +176,10 @@ impl CoreEngine {
         Ok(entry)
     }
 
-    pub fn import_profile_archive(&self, source_path: &str) -> Result<ProfileIndexEntry, EngineError> {
+    pub fn import_profile_archive(
+        &self,
+        source_path: &str,
+    ) -> Result<ProfileIndexEntry, EngineError> {
         let store = ConfigStore::new();
         let profiles_dir = store.config_dir().join("profiles");
         let entry = import_profile_archive(Path::new(source_path), &profiles_dir)
@@ -175,7 +210,6 @@ impl CoreEngine {
     pub fn swap_profile(&mut self, profile_id: &str) -> Result<ApplyResult, EngineError> {
         self.clear_last_error();
         self.manual_overrides.clear();
-        self.device_manual_overrides.clear();
         let store = ConfigStore::new();
         let config = store
             .load_config()
@@ -188,11 +222,9 @@ impl CoreEngine {
         let snapshot = capture_routing_snapshot(&self.graph);
 
         if self.graph.data_source != "mock" {
-            let restore_result = restore::restore_profile_virtual_devices(
-                self.adapter.as_ref(),
-                &profile,
-            )
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
+            let restore_result =
+                restore::restore_profile_virtual_devices(self.adapter.as_ref(), &profile)
+                    .map_err(|error| EngineError::Adapter(error.to_string()))?;
             if !restore_result.errors.is_empty() {
                 let message = restore_result.errors.join("; ");
                 self.last_error = Some(message.clone());
@@ -230,7 +262,8 @@ impl CoreEngine {
         }
 
         if self.graph.data_source != "mock" {
-            if let Err(error) = apply_profile_volumes(&self.graph, &profile) {
+            if let Err(error) = apply_profile_volumes(self.adapter.as_ref(), &self.graph, &profile)
+            {
                 let message = error.to_string();
                 self.last_error = Some(message.clone());
                 let _ = restore_routing_snapshot(&self.graph, &snapshot);
@@ -246,9 +279,6 @@ impl CoreEngine {
 
         if self.graph.data_source != "mock" {
             let active = self.active_effect_chains(&profile.effect_state);
-            if let Err(error) = filter_chain::sync_all_effects(&active, &[]) {
-                self.last_error = Some(error.to_string());
-            }
             // Only re-enables live processing for devices that were already
             // live before the swap — see `reapply_previously_live_effect_chains`.
             self.reapply_previously_live_effect_chains(&active);

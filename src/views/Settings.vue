@@ -4,17 +4,44 @@ import { invoke } from "@tauri-apps/api/core";
 import ToggleSwitch from "../components/ToggleSwitch.vue";
 import SegmentedControl from "../components/SegmentedControl.vue";
 import PluginDetailModal from "../components/PluginDetailModal.vue";
-import { useApplyResult } from "../stores/notices";
+import { useApplyResult, useNoticeSettings } from "../stores/notices";
 import { useUpdateStatus } from "../stores/updateStatus";
-import { useTheme } from "../stores/theme";
+import {
+  DEFAULT_DARK_SCHEME_ID,
+  DEFAULT_LIGHT_SCHEME_ID,
+  DEFAULT_THEME_MODE,
+  useTheme,
+} from "../stores/theme";
 import { useDaemonStatus } from "../stores/daemonStatus";
-import type { CapabilityInfo, PluginDiscoveryIssue, PluginStatus } from "../types/graph";
+import type {
+  CapabilityInfo,
+  PluginDiscoveryIssue,
+  PluginStatus,
+} from "../types/graph";
 import type { ThemeMode } from "../types/theme";
+import { isAlwaysOnPlugin } from "../utils/plugins";
 
 const THEME_MODE_OPTIONS = [
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
   { value: "system", label: "Follow system" },
+];
+
+const UPDATE_CHANNEL_OPTIONS = [
+  { value: "latest", label: "Latest" },
+  { value: "prerelease", label: "Pre-release" },
+];
+
+const NOTICE_DURATION_OPTIONS = [
+  { value: "3000", label: "3s" },
+  { value: "5000", label: "5s" },
+  { value: "8000", label: "8s" },
+  { value: "0", label: "Until dismissed" },
+];
+
+const CLOSE_BEHAVIOR_OPTIONS = [
+  { value: "minimize", label: "Minimize to background" },
+  { value: "quit", label: "Quit the app" },
 ];
 
 type SettingsTab = "general" | "background" | "plugins" | "about";
@@ -30,13 +57,16 @@ const activeTab = ref<SettingsTab>("general");
 const restoreOnStartup = ref(true);
 const backgroundRestore = ref(false);
 const autoApplyRules = ref(true);
+const closeBehavior = ref<string>("minimize");
 const { daemonStatus, refreshDaemonStatus, lastRunText } = useDaemonStatus();
 const plugins = ref<PluginStatus[]>([]);
 const capabilityMetadata = ref<CapabilityInfo[]>([]);
 const discoveryErrors = ref<PluginDiscoveryIssue[]>([]);
 const selectedPluginId = ref<string | null>(null);
 const selectedPlugin = computed(
-  () => plugins.value.find((plugin) => plugin.id === selectedPluginId.value) ?? null,
+  () =>
+    plugins.value.find((plugin) => plugin.id === selectedPluginId.value) ??
+    null,
 );
 const busy = ref(false);
 
@@ -63,14 +93,24 @@ const sortedPlugins = computed(() => {
   });
 });
 const { handleApplyResult } = useApplyResult();
-const configPaths = ref<{ configDir: string; profilesDir: string; pluginsDir: string } | null>(null);
+const configPaths = ref<{
+  configDir: string;
+  profilesDir: string;
+  pluginsDir: string;
+} | null>(null);
 const {
   appInfo,
   updateResult,
   checkingUpdates,
+  installingUpdate,
+  installProgress,
+  installComplete,
   updateStatus,
   updateStatusText,
+  updateChannel,
   ensureAppInfo,
+  ensureUpdateChannel,
+  setUpdateChannel,
   checkForUpdatesNow,
   installUpdateNow,
 } = useUpdateStatus();
@@ -83,13 +123,26 @@ const {
   setMode: setThemeMode,
   setDarkScheme,
   setLightScheme,
+  resetToDefaults: resetThemeToDefaults,
 } = useTheme();
+const { noticeDurationMs, setNoticeDuration } = useNoticeSettings();
 
-const darkSchemes = computed(() => schemes.value.filter((scheme) => scheme.kind === "dark"));
-const lightSchemes = computed(() => schemes.value.filter((scheme) => scheme.kind === "light"));
+const darkSchemes = computed(() =>
+  schemes.value.filter((scheme) => scheme.kind === "dark"),
+);
+const lightSchemes = computed(() =>
+  schemes.value.filter((scheme) => scheme.kind === "light"),
+);
+const isDefaultTheme = computed(
+  () =>
+    themeMode.value === DEFAULT_THEME_MODE &&
+    darkSchemeId.value === DEFAULT_DARK_SCHEME_ID &&
+    lightSchemeId.value === DEFAULT_LIGHT_SCHEME_ID,
+);
 
 const BMC_URL = "https://www.buymeacoffee.com/lunarvagabond";
-const BMC_BUTTON_SRC = "https://cdn.buymeacoffee.com/buttons/v2/default-violet.png";
+const BMC_BUTTON_SRC =
+  "https://cdn.buymeacoffee.com/buttons/v2/default-violet.png";
 const GITHUB_REPO = "https://github.com/LunarVagabond/Pipe-Deck";
 
 async function openExternal(event: MouseEvent, url: string) {
@@ -98,28 +151,21 @@ async function openExternal(event: MouseEvent, url: string) {
     await invoke("open_url", { url });
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   }
 }
 
-const updateStatusClass = computed(() => `update-status-dot--${updateStatus.value}`);
+const updateStatusClass = computed(
+  () => `update-status-dot--${updateStatus.value}`,
+);
 
-const backgroundRestoreHint = computed(() => {
-  if (appInfo.value?.backgroundRestoreSupported) {
-    return "Installs a user systemd unit for restore at login.";
-  }
-  return `Not supported in the Flatpak build. Install via ${nativeInstallHint.value} for login restore.`;
-});
-
-const nativeInstallHint = computed(() => {
-  const kind = appInfo.value?.installKind;
-  if (kind === "deb") return ".deb";
-  if (kind === "rpm") return ".rpm";
-  if (kind === "app_image") return "AppImage";
-  return ".deb, .rpm, or AppImage";
-});
+const backgroundRestoreHint =
+  "Installs a user systemd unit for restore at login.";
 
 async function loadSettings() {
   const config = await invoke<{
@@ -127,16 +173,19 @@ async function loadSettings() {
       restore_on_startup?: boolean;
       background_restore?: boolean;
       auto_apply_rules?: boolean;
+      close_behavior?: string;
     };
   }>("get_config");
   restoreOnStartup.value = config.preferences?.restore_on_startup ?? true;
   backgroundRestore.value = config.preferences?.background_restore ?? false;
   autoApplyRules.value = config.preferences?.auto_apply_rules ?? true;
+  closeBehavior.value = config.preferences?.close_behavior ?? "minimize";
   await refreshDaemonStatus();
   plugins.value = await invoke("list_plugins");
   capabilityMetadata.value = await invoke("list_plugin_capability_metadata");
   discoveryErrors.value = await invoke("list_plugin_discovery_errors");
   await ensureAppInfo();
+  await ensureUpdateChannel();
   configPaths.value = await invoke("get_config_paths");
 }
 
@@ -146,9 +195,33 @@ async function copyPath(path: string) {
     handleApplyResult({ success: true }, "Path copied to clipboard.");
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
+  }
+}
+
+const diagnosticsBusy = ref(false);
+
+async function copyDiagnostics() {
+  diagnosticsBusy.value = true;
+  try {
+    const bundle = await invoke<string>("get_diagnostics_bundle");
+    await navigator.clipboard.writeText(bundle);
+    handleApplyResult({ success: true }, "Diagnostics copied to clipboard.");
+  } catch (error) {
+    handleApplyResult(
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
+      "",
+    );
+  } finally {
+    diagnosticsBusy.value = false;
   }
 }
 
@@ -156,13 +229,32 @@ async function runUpdateCheck() {
   await checkForUpdatesNow();
 }
 
+const installButtonLabel = computed(() => {
+  if (installingUpdate.value) {
+    return installProgress.value != null
+      ? `Installing… ${installProgress.value}%`
+      : "Installing…";
+  }
+  return updateResult.value?.canAutoInstall ? "Install update" : "Get update";
+});
+
 async function applyUpdate() {
+  const autoInstall = updateResult.value?.canAutoInstall ?? false;
   try {
     await installUpdateNow();
-    handleApplyResult({ success: true }, "Update started");
+    handleApplyResult(
+      { success: true },
+      autoInstall
+        ? "Update installed — relaunch Pipe Deck to finish."
+        : "Opening the releases page…",
+      autoInstall ? 0 : undefined,
+    );
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   }
@@ -177,7 +269,10 @@ async function setRestoreOnStartup(enabled: boolean) {
   } catch (error) {
     restoreOnStartup.value = !enabled;
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -194,7 +289,31 @@ async function setAutoApplyRules(enabled: boolean) {
   } catch (error) {
     autoApplyRules.value = !enabled;
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
+      "",
+    );
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function setCloseBehavior(behavior: string) {
+  const previous = closeBehavior.value;
+  closeBehavior.value = behavior;
+  busy.value = true;
+  try {
+    await invoke("set_close_behavior", { behavior, applyNow: false });
+    handleApplyResult({ success: true }, "Close button preference saved");
+  } catch (error) {
+    closeBehavior.value = previous;
+    handleApplyResult(
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -217,7 +336,10 @@ async function setBackgroundRestore(enabled: boolean) {
   } catch (error) {
     backgroundRestore.value = !enabled;
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -233,7 +355,10 @@ async function rescanPlugins() {
     handleApplyResult({ success: true }, "Plugin directories rescanned");
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -246,10 +371,16 @@ async function togglePlugin(plugin: PluginStatus, enabled: boolean) {
   try {
     await invoke("set_plugin_enabled", { pluginId: plugin.id, enabled });
     await loadSettings();
-    handleApplyResult({ success: true }, `${plugin.name} ${enabled ? "enabled" : "disabled"}`);
+    handleApplyResult(
+      { success: true },
+      `${plugin.name} ${enabled ? "enabled" : "disabled"}`,
+    );
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -257,7 +388,11 @@ async function togglePlugin(plugin: PluginStatus, enabled: boolean) {
   }
 }
 
-async function toggleCapability(plugin: PluginStatus, capability: string, granted: boolean) {
+async function toggleCapability(
+  plugin: PluginStatus,
+  capability: string,
+  granted: boolean,
+) {
   const next = new Set(plugin.granted_capabilities);
   if (granted) {
     next.add(capability);
@@ -274,7 +409,10 @@ async function toggleCapability(plugin: PluginStatus, capability: string, grante
     handleApplyResult({ success: true }, "Plugin capabilities updated");
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   } finally {
@@ -328,14 +466,18 @@ onMounted(() => {
       aria-labelledby="settings-tab-general"
     >
       <p class="settings-panel-lead">
-        Control how Pipe Deck restores your routing and applies rules when apps start.
+        Control how Pipe Deck restores your routing and applies rules when apps
+        start.
       </p>
 
       <div class="settings-row">
         <div>
-          <p class="settings-row-label">Restore virtual devices when the app opens</p>
+          <p class="settings-row-label">
+            Restore virtual devices when the app opens
+          </p>
           <p class="settings-row-hint">
-            Re-creates saved virtual devices and routing from your active profile on launch.
+            Re-creates saved virtual devices and routing from your active
+            profile on launch.
           </p>
         </div>
         <ToggleSwitch
@@ -347,10 +489,12 @@ onMounted(() => {
 
       <div class="settings-row">
         <div>
-          <p class="settings-row-label">Auto-apply rules when new apps appear</p>
+          <p class="settings-row-label">
+            Auto-apply rules when new apps appear
+          </p>
           <p class="settings-row-hint">
-            Matching rules route new streams automatically. Manual changes override rules until you
-            click Apply rules.
+            Matching rules route new streams automatically. Manual changes
+            override rules until you click Apply rules.
           </p>
         </div>
         <ToggleSwitch
@@ -382,13 +526,19 @@ onMounted(() => {
           <p class="settings-row-hint">Used when the app is in Dark mode.</p>
         </div>
         <div class="scheme-select-group">
-          <span v-if="resolvedKind === 'dark'" class="scheme-active-badge">Active</span>
+          <span v-if="resolvedKind === 'dark'" class="scheme-active-badge"
+            >Active</span
+          >
           <select
             class="scheme-select"
             :value="darkSchemeId"
             @change="setDarkScheme(($event.target as HTMLSelectElement).value)"
           >
-            <option v-for="scheme in darkSchemes" :key="scheme.id" :value="scheme.id">
+            <option
+              v-for="scheme in darkSchemes"
+              :key="scheme.id"
+              :value="scheme.id"
+            >
               {{ scheme.name }}
             </option>
           </select>
@@ -401,25 +551,86 @@ onMounted(() => {
           <p class="settings-row-hint">Used when the app is in Light mode.</p>
         </div>
         <div class="scheme-select-group">
-          <span v-if="resolvedKind === 'light'" class="scheme-active-badge">Active</span>
+          <span v-if="resolvedKind === 'light'" class="scheme-active-badge"
+            >Active</span
+          >
           <select
             class="scheme-select"
             :value="lightSchemeId"
             @change="setLightScheme(($event.target as HTMLSelectElement).value)"
           >
-            <option v-for="scheme in lightSchemes" :key="scheme.id" :value="scheme.id">
+            <option
+              v-for="scheme in lightSchemes"
+              :key="scheme.id"
+              :value="scheme.id"
+            >
               {{ scheme.name }}
             </option>
           </select>
         </div>
       </div>
 
+      <div class="settings-row settings-row--static">
+        <div>
+          <p class="settings-row-label">Default appearance</p>
+          <p class="settings-row-hint">
+            Restore Follow system, Midnight Deck, and Paper Deck.
+          </p>
+        </div>
+        <button
+          type="button"
+          class="settings-action-btn"
+          :disabled="isDefaultTheme"
+          @click="resetThemeToDefaults"
+        >
+          Reset to default
+        </button>
+      </div>
+
       <p class="settings-row-hint">
         Want to design your own? Drop a YAML file in
         <code>~/.config/pipe-deck/themes/</code> — see the
-        <a href="https://github.com/LunarVagabond/Pipe-Deck/blob/main/docs/specs/Theming.md" target="_blank" rel="noreferrer">Theming docs</a>
+        <a
+          href="https://github.com/LunarVagabond/Pipe-Deck/blob/main/docs/specs/Theming.md"
+          target="_blank"
+          rel="noreferrer"
+          >Theming docs</a
+        >
         for the schema.
       </p>
+
+      <p class="settings-subheading">Notices</p>
+
+      <div class="settings-row">
+        <div>
+          <p class="settings-row-label">Notice duration</p>
+          <p class="settings-row-hint">
+            How long a toast notice (route applied, profile saved, errors, ...)
+            stays on screen before dismissing itself.
+          </p>
+        </div>
+        <SegmentedControl
+          :model-value="String(noticeDurationMs)"
+          :options="NOTICE_DURATION_OPTIONS"
+          @update:model-value="(value) => setNoticeDuration(Number(value))"
+        />
+      </div>
+
+      <p class="settings-subheading">Window</p>
+
+      <div class="settings-row">
+        <div>
+          <p class="settings-row-label">When closing the window</p>
+          <p class="settings-row-hint">
+            Choose what happens when you click the window's close button.
+          </p>
+        </div>
+        <SegmentedControl
+          :model-value="closeBehavior"
+          :options="CLOSE_BEHAVIOR_OPTIONS"
+          @update:model-value="setCloseBehavior"
+        />
+      </div>
     </div>
 
     <div
@@ -429,12 +640,15 @@ onMounted(() => {
       aria-labelledby="settings-tab-background"
     >
       <p class="settings-panel-lead">
-        Run restore at login via a user systemd service, even when the app is closed.
+        Run restore at login via a user systemd service, even when the app is
+        closed.
       </p>
 
-      <div v-if="appInfo?.backgroundRestoreSupported" class="settings-row">
+      <div class="settings-row">
         <div>
-          <p class="settings-row-label">Restore at login via background service</p>
+          <p class="settings-row-label">
+            Restore at login via background service
+          </p>
           <p class="settings-row-hint">
             {{ backgroundRestoreHint }}
           </p>
@@ -444,16 +658,6 @@ onMounted(() => {
           :disabled="busy"
           @update:model-value="setBackgroundRestore"
         />
-      </div>
-
-      <div v-else class="settings-row settings-row--static">
-        <div>
-          <p class="settings-row-label">Restore at login via background service</p>
-          <p class="settings-row-hint">
-            {{ backgroundRestoreHint }}
-          </p>
-        </div>
-        <span class="settings-unsupported-pill">Not supported</span>
       </div>
 
       <div class="settings-status-section">
@@ -492,7 +696,12 @@ onMounted(() => {
         <p class="settings-panel-lead">
           Enable extensions and grant the capabilities each plugin requests.
         </p>
-        <button type="button" class="settings-action-btn" :disabled="busy" @click="rescanPlugins">
+        <button
+          type="button"
+          class="settings-action-btn"
+          :disabled="busy"
+          @click="rescanPlugins"
+        >
           Rescan plugin directories
         </button>
       </div>
@@ -501,7 +710,8 @@ onMounted(() => {
         <div>
           <p class="settings-row-label">Plugin directory</p>
           <p class="settings-row-hint">
-            {{ configPaths?.pluginsDir ?? "…" }} — drop a plugin folder here, then Rescan.
+            {{ configPaths?.pluginsDir ?? "…" }} — drop a plugin folder here,
+            then Rescan.
           </p>
         </div>
         <button
@@ -514,14 +724,18 @@ onMounted(() => {
         </button>
       </div>
 
-      <p v-if="plugins.length === 0 && discoveryErrors.length === 0" class="settings-hint">
+      <p
+        v-if="plugins.length === 0 && discoveryErrors.length === 0"
+        class="settings-hint"
+      >
         No plugins discovered.
       </p>
 
       <div v-if="discoveryErrors.length > 0" class="plugin-discovery-warning">
         <p class="plugin-discovery-warning-label">
           {{ discoveryErrors.length }}
-          plugin director{{ discoveryErrors.length === 1 ? "y" : "ies" }} failed to load
+          plugin director{{ discoveryErrors.length === 1 ? "y" : "ies" }} failed
+          to load
         </p>
         <ul>
           <li v-for="issue in discoveryErrors" :key="issue.path">
@@ -542,27 +756,57 @@ onMounted(() => {
             <tr>
               <th
                 class="plugins-sortable-th"
-                :aria-sort="pluginSortKey === 'name' ? (pluginSortDir === 'asc' ? 'ascending' : 'descending') : 'none'"
+                :aria-sort="
+                  pluginSortKey === 'name'
+                    ? pluginSortDir === 'asc'
+                      ? 'ascending'
+                      : 'descending'
+                    : 'none'
+                "
                 @click="setPluginSort('name')"
               >
                 Name
-                <span v-if="pluginSortKey === 'name'" class="plugins-sort-arrow">{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span>
+                <span
+                  v-if="pluginSortKey === 'name'"
+                  class="plugins-sort-arrow"
+                  >{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span
+                >
               </th>
               <th
                 class="plugins-sortable-th"
-                :aria-sort="pluginSortKey === 'developer' ? (pluginSortDir === 'asc' ? 'ascending' : 'descending') : 'none'"
+                :aria-sort="
+                  pluginSortKey === 'developer'
+                    ? pluginSortDir === 'asc'
+                      ? 'ascending'
+                      : 'descending'
+                    : 'none'
+                "
                 @click="setPluginSort('developer')"
               >
                 Developer
-                <span v-if="pluginSortKey === 'developer'" class="plugins-sort-arrow">{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span>
+                <span
+                  v-if="pluginSortKey === 'developer'"
+                  class="plugins-sort-arrow"
+                  >{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span
+                >
               </th>
               <th
                 class="plugins-sortable-th"
-                :aria-sort="pluginSortKey === 'repo' ? (pluginSortDir === 'asc' ? 'ascending' : 'descending') : 'none'"
+                :aria-sort="
+                  pluginSortKey === 'repo'
+                    ? pluginSortDir === 'asc'
+                      ? 'ascending'
+                      : 'descending'
+                    : 'none'
+                "
                 @click="setPluginSort('repo')"
               >
                 Repo
-                <span v-if="pluginSortKey === 'repo'" class="plugins-sort-arrow">{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span>
+                <span
+                  v-if="pluginSortKey === 'repo'"
+                  class="plugins-sort-arrow"
+                  >{{ pluginSortDir === "asc" ? "▲" : "▼" }}</span
+                >
               </th>
               <th>Enabled</th>
             </tr>
@@ -576,8 +820,16 @@ onMounted(() => {
             >
               <td>
                 <strong>{{ plugin.name }}</strong>
-                <span class="plugin-meta">v{{ plugin.version }} · {{ plugin.runtime_status }}</span>
-                <span v-if="plugin.disabled_reason" class="plugin-meta plugin-crash-loop-badge">
+                <span class="plugin-meta"
+                  >v{{ plugin.version }} · {{ plugin.runtime_status }}</span
+                >
+                <span v-if="isAlwaysOnPlugin(plugin.id)" class="plugin-meta">
+                  Always on — see the Effects tab
+                </span>
+                <span
+                  v-if="plugin.disabled_reason"
+                  class="plugin-meta plugin-crash-loop-badge"
+                >
                   {{ plugin.disabled_reason }}
                 </span>
               </td>
@@ -594,12 +846,22 @@ onMounted(() => {
                 </a>
                 <span v-else>—</span>
               </td>
-              <td class="plugins-toggle-cell" @click.stop>
+              <td
+                class="plugins-toggle-cell"
+                @click.stop
+                :title="
+                  isAlwaysOnPlugin(plugin.id)
+                    ? 'Effects are always available and can\'t be disabled here.'
+                    : undefined
+                "
+              >
                 <ToggleSwitch
                   :model-value="plugin.enabled"
-                  :disabled="busy"
+                  :disabled="busy || isAlwaysOnPlugin(plugin.id)"
                   :show-state-labels="false"
-                  @update:model-value="(enabled) => togglePlugin(plugin, enabled)"
+                  @update:model-value="
+                    (enabled) => togglePlugin(plugin, enabled)
+                  "
                 />
               </td>
             </tr>
@@ -614,10 +876,15 @@ onMounted(() => {
         :busy="busy"
         @close="closePluginDetail"
         @toggle-enabled="(enabled) => togglePlugin(selectedPlugin!, enabled)"
-        @toggle-capability="(capability, granted) => toggleCapability(selectedPlugin!, capability, granted)"
+        @toggle-capability="
+          (capability, granted) =>
+            toggleCapability(selectedPlugin!, capability, granted)
+        "
       />
 
-      <p class="settings-footnote">Audit log: ~/.local/state/pipe-deck/plugin-audit.jsonl</p>
+      <p class="settings-footnote">
+        Audit log: ~/.local/state/pipe-deck/plugin-audit.jsonl
+      </p>
     </div>
 
     <div
@@ -627,8 +894,8 @@ onMounted(() => {
       aria-labelledby="settings-tab-about"
     >
       <p class="settings-panel-lead">
-        Version info and update checks. Pipe Deck will eventually check once at startup unless
-        dismissed.
+        Version info and update checks. Pipe Deck will eventually check once at
+        startup unless dismissed.
       </p>
 
       <div class="settings-row settings-row--static">
@@ -636,9 +903,29 @@ onMounted(() => {
           <p class="settings-row-label">Installed version</p>
           <p class="settings-row-hint">
             {{ appInfo?.buildRevision ?? "…" }}
-            <template v-if="appInfo?.installLabel"> · {{ appInfo.installLabel }}</template>
+            <template v-if="appInfo?.installLabel">
+              · {{ appInfo.installLabel }}</template
+            >
           </p>
         </div>
+      </div>
+
+      <div class="settings-row settings-row--static">
+        <div>
+          <p class="settings-row-label">Copy diagnostics</p>
+          <p class="settings-row-hint">
+            Version, PipeWire version, and a fresh graph snapshot — paste this
+            into a bug report.
+          </p>
+        </div>
+        <button
+          type="button"
+          class="settings-action-btn"
+          :disabled="diagnosticsBusy"
+          @click="copyDiagnostics"
+        >
+          Copy
+        </button>
       </div>
 
       <div class="settings-row settings-row--static">
@@ -674,7 +961,9 @@ onMounted(() => {
       <div class="settings-row settings-row--static">
         <div>
           <p class="settings-row-label">Contribute</p>
-          <p class="settings-row-hint">Pipe Deck is open source — issues and PRs are welcome.</p>
+          <p class="settings-row-hint">
+            Pipe Deck is open source — issues and PRs are welcome.
+          </p>
         </div>
         <a
           class="settings-action-btn"
@@ -688,7 +977,9 @@ onMounted(() => {
       <div class="settings-row settings-support-row">
         <div>
           <p class="settings-row-label">Support Pipe Deck</p>
-          <p class="settings-row-hint">Enjoying the app? Consider chipping in.</p>
+          <p class="settings-row-hint">
+            Enjoying the app? Consider chipping in.
+          </p>
         </div>
         <a
           class="settings-bmc"
@@ -696,25 +987,69 @@ onMounted(() => {
           aria-label="Buy me a coffee"
           @click="openExternal($event, BMC_URL)"
         >
-          <img :src="BMC_BUTTON_SRC" alt="Buy me a coffee" width="162" height="45" />
+          <img
+            :src="BMC_BUTTON_SRC"
+            alt="Buy me a coffee"
+            width="162"
+            height="45"
+          />
         </a>
+      </div>
+
+      <div class="settings-row">
+        <div>
+          <p class="settings-row-label">Update channel</p>
+          <p class="settings-row-hint">
+            Pre-release opts into the newest tagged GitHub release regardless of
+            prerelease status. AppImage one-click installs still auto-update
+            from the Latest channel only — Pre-release downloads open the
+            release page instead.
+          </p>
+        </div>
+        <SegmentedControl
+          :model-value="updateChannel"
+          :options="UPDATE_CHANNEL_OPTIONS"
+          @update:model-value="
+            (value) => setUpdateChannel(value as 'latest' | 'prerelease')
+          "
+        />
       </div>
 
       <div class="settings-row">
         <div class="settings-update-copy">
           <p class="settings-row-label settings-update-label">
-            <span class="update-status-dot" :class="updateStatusClass" aria-hidden="true" />
+            <span
+              class="update-status-dot"
+              :class="updateStatusClass"
+              aria-hidden="true"
+            />
             Check for updates
           </p>
           <p class="settings-row-hint">
-            <template v-if="updateStatus === 'checking'">Checking GitHub releases…</template>
+            <template v-if="installComplete">
+              Update installed — relaunch Pipe Deck to finish.
+            </template>
+            <template v-else-if="installingUpdate">
+              Downloading and installing{{
+                installProgress != null ? ` (${installProgress}%)` : ""
+              }}…
+            </template>
+            <template v-else-if="updateStatus === 'checking'"
+              >Checking GitHub releases…</template
+            >
             <template v-else-if="updateResult?.latestVersion">
-              {{ updateStatusText }} —
-              latest is v{{ updateResult.latestVersion }}
-              <template v-if="updateResult?.error">({{ updateResult.error }})</template>
+              {{ updateStatusText }} — latest is v{{
+                updateResult.latestVersion
+              }}
+              <template v-if="updateResult?.error"
+                >({{ updateResult.error }})</template
+              >
             </template>
             <template v-else>
-              {{ updateResult?.error ?? "Run a check to compare with the latest release." }}
+              {{
+                updateResult?.error ??
+                "Run a check to compare with the latest release."
+              }}
             </template>
           </p>
         </div>
@@ -722,7 +1057,7 @@ onMounted(() => {
           <button
             type="button"
             class="settings-action-btn"
-            :disabled="checkingUpdates || !appInfo"
+            :disabled="checkingUpdates || installingUpdate || !appInfo"
             @click="runUpdateCheck"
           >
             {{ checkingUpdates ? "Checking…" : "Check now" }}
@@ -730,13 +1065,16 @@ onMounted(() => {
           <button
             v-if="
               updateResult &&
-              (updateStatus === 'outdated' || updateStatus === 'severely_outdated')
+              !installComplete &&
+              (updateStatus === 'outdated' ||
+                updateStatus === 'severely_outdated')
             "
             type="button"
             class="settings-action-btn settings-action-btn--primary"
+            :disabled="installingUpdate"
             @click="applyUpdate"
           >
-            {{ updateResult.canAutoInstall ? "Install update" : "Get update" }}
+            {{ installButtonLabel }}
           </button>
         </div>
       </div>

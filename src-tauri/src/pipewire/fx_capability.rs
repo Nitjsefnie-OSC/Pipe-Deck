@@ -13,6 +13,18 @@ pub struct FxCapabilities {
     pub builtin_eq: bool,
     /// The `linear` builtin plugin (Mult/Add), used for a master trim stage.
     pub builtin_gain: bool,
+    /// The `delay` builtin plugin (issue #313) — same module, so probed
+    /// identically to `builtin_eq`/`builtin_gain`; named separately for
+    /// doc clarity about what specifically is being gated.
+    pub builtin_delay: bool,
+    /// The `clamp` builtin plugin (issue #311) — a hard-ceiling brick-wall
+    /// clamp, probed identically to `builtin_eq`/`builtin_delay`. Distinct
+    /// from `builtin_limiter` below: this gates the new `Clamp`-backed
+    /// Limiter processing node, not a real dynamics limiter.
+    pub builtin_clamp: bool,
+    /// The `convolver` builtin plugin (issue #327) — same module, probed
+    /// identically to `builtin_eq`/`builtin_delay`/`builtin_clamp`.
+    pub builtin_convolver: bool,
     /// Verified against `man 7 libpipewire-module-filter-chain`: the builtin
     /// set is mixer/copy/bq_*/param_eq/convolver/delay/invert/clamp/linear/
     /// sine/ramp — there is no builtin dynamics (limiter/compressor/gate)
@@ -49,6 +61,9 @@ pub fn probe_capabilities() -> FxCapabilities {
     FxCapabilities {
         builtin_eq: module_present,
         builtin_gain: module_present,
+        builtin_delay: module_present,
+        builtin_clamp: module_present,
+        builtin_convolver: module_present,
         builtin_limiter: false,
         ladspa_noise_gate: find_ladspa_plugin(NOISE_GATE_LADSPA_CANDIDATES),
     }
@@ -61,9 +76,14 @@ fn filter_chain_module_present() -> bool {
 }
 
 fn find_ladspa_plugin(candidates: &[&str]) -> Option<String> {
-    let mut search_dirs: Vec<String> = LADSPA_SEARCH_DIRS.iter().map(|dir| dir.to_string()).collect();
+    let mut search_dirs: Vec<String> = LADSPA_SEARCH_DIRS
+        .iter()
+        .map(|dir| dir.to_string())
+        .collect();
     if let Ok(path_var) = std::env::var("LADSPA_PATH") {
-        search_dirs.extend(std::env::split_paths(&path_var).map(|path| path.to_string_lossy().to_string()));
+        search_dirs.extend(
+            std::env::split_paths(&path_var).map(|path| path.to_string_lossy().to_string()),
+        );
     }
 
     for dir in &search_dirs {
@@ -102,7 +122,8 @@ mod tests {
     #[test]
     fn find_ladspa_plugin_honors_ladspa_path_env_override() {
         let _guard = env_lock().lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("pipe-deck-ladspa-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pipe-deck-ladspa-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let plugin_path = dir.join("fake_gate.so");
         std::fs::write(&plugin_path, b"not a real plugin").unwrap();

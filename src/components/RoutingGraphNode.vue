@@ -1,10 +1,25 @@
 <script setup lang="ts">
-import { computed, inject } from "vue";
-import { Handle, Position, useNodeId } from "@vue-flow/core";
+import { computed, inject, ref } from "vue";
+import { Handle, Position, useNodeId, useVueFlow } from "@vue-flow/core";
+import { invoke } from "@tauri-apps/api/core";
 import NodeCardHeader from "./NodeCardHeader.vue";
 import NodeTypeIcon from "./NodeTypeIcon.vue";
 import RoutingGraphNodeEffects from "./RoutingGraphNodeEffects.vue";
-import type { RoutingGraphHandle, RoutingGraphNodeData } from "./routing-graph/buildGraph";
+import RoutingGraphNodeMixer from "./RoutingGraphNodeMixer.vue";
+import RoutingGraphNodeEq5Band from "./RoutingGraphNodeEq5Band.vue";
+import RoutingGraphNodeDelay from "./RoutingGraphNodeDelay.vue";
+import RoutingGraphNodeLimiter from "./RoutingGraphNodeLimiter.vue";
+import RoutingGraphNodeHpf from "./RoutingGraphNodeHpf.vue";
+import RoutingGraphNodeReverb from "./RoutingGraphNodeReverb.vue";
+import RoutingGraphNodeWidener from "./RoutingGraphNodeWidener.vue";
+import RoutingGraphNodePan from "./RoutingGraphNodePan.vue";
+import RoutingGraphNodeCompressor from "./RoutingGraphNodeCompressor.vue";
+import RoutingGraphNodeFanOut from "./RoutingGraphNodeFanOut.vue";
+import RoutingGraphNodeGroup from "./RoutingGraphNodeGroup.vue";
+import type {
+  RoutingGraphHandle,
+  RoutingGraphNodeData,
+} from "./routing-graph/buildGraph";
 import { useMixerControls } from "../composables/useMixerControls";
 import { useEffectChain } from "../composables/useEffectChain";
 import { routingGraphActionsKey } from "../composables/routingGraphContext";
@@ -15,8 +30,13 @@ const props = defineProps<{
 
 const actions = inject(routingGraphActionsKey, null);
 const nodeId = useNodeId();
-const { pendingVolumes, clampVolume, scheduleChannelVolume, toggleChannelMute } =
-  useMixerControls();
+const vueFlow = useVueFlow();
+const {
+  pendingVolumes,
+  clampVolume,
+  scheduleChannelVolume,
+  toggleChannelMute,
+} = useMixerControls();
 const { chainFor } = useEffectChain();
 
 function existingStageKindsFor(deviceId: string): string[] {
@@ -34,11 +54,92 @@ const effectsState = computed<"none" | "live" | "bypassed">(() => {
 
 const hasEffectStages = computed(() => effectsState.value !== "none");
 
-const effectsBadgeTitle = computed(() =>
-  effectsState.value === "live" ? "Effects live" : effectsState.value === "bypassed" ? "Effects bypassed" : "",
+// `nodeClass` is CSS-class-shaped (e.g. "processing-node processing-node--mixer",
+// for the multi-class `:class` binding below) — not a single `NodeTypeIcon`
+// kind, so a processing node always fell through to the generic dot
+// fallback. Icon lookup uses the node's own `kind.kind` slug instead for
+// that case; every other node kind's `nodeClass` was already a single word
+// matching `NodeTypeIcon`'s expected values. `iconOverride` (issue #226)
+// covers the remaining case where the icon should differ from `nodeClass`
+// without touching it — a Bluetooth device keeps its `output`/`input`
+// border-color class but shows the distinct Bluetooth icon.
+const iconKind = computed(
+  () =>
+    props.data.processingNodeKind?.kind ??
+    props.data.iconOverride ??
+    props.data.nodeClass,
 );
 
-const inHandles = computed(() => props.data.handles.filter((handle) => handle.position === "left"));
+const effectsBadgeTitle = computed(() =>
+  effectsState.value === "live"
+    ? "Effects live"
+    : effectsState.value === "bypassed"
+      ? "Effects bypassed"
+      : "",
+);
+
+/** DSP-backed processing node kinds (Eq5Band/Delay/Limiter/Hpf) each expose a
+ * `reset()` method (see their own `defineExpose`) — Reset and the DSP info
+ * hint both render once, here in the node's header (top-right, next to
+ * Delete), rather than duplicated per-kind in each child's own template. */
+const eq5bandRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const delayRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const limiterRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const hpfRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const reverbRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const widenerRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const panRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+const compressorRef = ref<{ reset: () => void | Promise<void> } | null>(null);
+
+/** Informational only — not an error/fault indicator. Rendered as a plain
+ * (i) hint, not a warning triangle, since none of these describe something
+ * currently wrong with the user's config. */
+const DSP_INFO_TEXT: Partial<Record<string, string>> = {
+  eq5band:
+    "Boosting bands can push the signal above full scale — any resulting clipping happens at the output (hardware/sink), not here, and sounds like harsh digital distortion. Real dynamics processing (to catch this smoothly) is tracked in issue #86.",
+  delay:
+    "High Feedback can build up into a resonant loop that eventually clips — a real limiter/compressor stage after this would catch it smoothly; tracked in issue #86.",
+  limiter:
+    "Hard brick-wall clamp — no envelope smoothing or lookahead, unlike a real limiter. Aggressive settings will sound harsh/distorted. Real dynamics processing is tracked in issue #86.",
+  hpf: "A high Resonance value creates a sharp peak right at the cutoff frequency, which can ring or self-oscillate on some material. Lower it if the filtered signal sounds harsh or whistling.",
+  widener:
+    "High Width settings can push the side signal loud enough to clip when summed back to mono (e.g. on a phone speaker or older Bluetooth receiver). Real dynamics processing (to catch this smoothly) is tracked in issue #86.",
+};
+const dspInfoText = computed(
+  () => DSP_INFO_TEXT[props.data.processingNodeKind?.kind ?? ""],
+);
+
+function onResetClick() {
+  void (
+    eq5bandRef.value ??
+    delayRef.value ??
+    limiterRef.value ??
+    hpfRef.value ??
+    reverbRef.value ??
+    widenerRef.value ??
+    panRef.value ??
+    compressorRef.value
+  )?.reset();
+}
+
+// Issue #80 follow-up: adding a member to an existing Group is a picker,
+// not drag-to-connect (Group has no output pins at all — see
+// nodePorts.ts::handlesForProcessingNode) — lists every terminal output
+// device not already a member (buildGraph.ts's groupAvailableDevices).
+const addMemberPickerOpen = ref(false);
+
+async function onAddMember(deviceId: string) {
+  addMemberPickerOpen.value = false;
+  await invoke("connect_processing_node_port", {
+    nodeId: props.data.entityId,
+    direction: "output",
+    peerId: deviceId,
+  });
+}
+
+const inHandles = computed(() =>
+  props.data.handles.filter((handle) => handle.position === "left"),
+);
 const outHandles = computed(() =>
   props.data.handles.filter((handle) => handle.position === "right"),
 );
@@ -61,7 +162,9 @@ function handleAriaLabel(handle: RoutingGraphHandle): string {
   if (handle.empty) {
     return `${props.data.label} ${direction} port, not connected`;
   }
-  const other = handle.connectedId ? actions?.labelForEntity(handle.connectedId) : undefined;
+  const other = handle.connectedId
+    ? actions?.labelForEntity(handle.connectedId)
+    : undefined;
   return `${props.data.label} ${direction} port, connected to ${other ?? "another device"}`;
 }
 
@@ -83,19 +186,49 @@ function onHandleKeydown(event: KeyboardEvent, handle: RoutingGraphHandle) {
   }
 }
 
+/** Grouping only applies to terminal outputs (hardware or plain virtual
+ * outputs) — deliberately excludes the "routing"-column virtual-sink/bus
+ * kind (`nodeKind === "virtualSink"`) and inputs, since #80 is scoped to
+ * grouping real outputs, not chaining a group behind an existing bus. */
+function isGroupableOutputNode(candidate: {
+  data?: RoutingGraphNodeData;
+}): boolean {
+  return candidate.data?.nodeKind === "output";
+}
+
 function onContextMenu(event: MouseEvent) {
-  if (!props.data.systemName || (!props.data.editable && !props.data.deletable)) {
-    return;
-  }
   event.preventDefault();
   event.stopPropagation();
-  const deviceId = props.data.channelType === "device" ? props.data.entityId : undefined;
+
+  // A right-click landing on 2+ currently multi-selected output devices
+  // offers "Group Selected Outputs" (issue #80) instead of the normal
+  // single-node menu — shift-click/marquee-select the outputs first, then
+  // right-click any of them (or elsewhere on the canvas among them).
+  const selectedOutputs = vueFlow.getSelectedNodes.value.filter(
+    isGroupableOutputNode,
+  );
+  if (selectedOutputs.length >= 2) {
+    actions?.openMenu({
+      kind: "multi-node",
+      x: event.clientX,
+      y: event.clientY,
+      memberDeviceIds: selectedOutputs.map(
+        (candidate) => candidate.data!.entityId,
+      ),
+      memberLabels: selectedOutputs.map((candidate) => candidate.data!.label),
+    });
+    return;
+  }
+
+  const deviceId =
+    props.data.channelType === "device" ? props.data.entityId : undefined;
   actions?.openMenu({
     kind: "node",
     x: event.clientX,
     y: event.clientY,
     label: props.data.label,
     systemName: props.data.systemName,
+    entityId: props.data.entityId,
     editable: Boolean(props.data.editable),
     deletable: Boolean(props.data.deletable),
     deviceId,
@@ -110,6 +243,16 @@ function onRename(alias: string) {
 }
 
 function onDelete() {
+  // PD-032: a processing node has no device-alias identity — it goes
+  // through remove_processing_node by RuntimeGraph id, not deleteDevice's
+  // system_name-keyed path (which would silently hit the wrong backend
+  // command for it — see NodeCardHeader's inline delete button, the one
+  // entry point that isn't gated through the right-click context menu's
+  // own pipe-deck-proc- routing check).
+  if (props.data.processingNodeKind) {
+    actions?.deleteProcessingNode(props.data.entityId, props.data.label);
+    return;
+  }
   if (!props.data.systemName) return;
   actions?.deleteDevice(props.data.systemName, props.data.label);
 }
@@ -119,18 +262,28 @@ function onDelete() {
 // the effects work (see RoutingGraphNodeEffects.vue for the virtual/stream case).
 const displayVolume = computed(() => {
   if (!props.data.channelType) return 0;
-  return pendingVolumes.value[props.data.entityId] ?? props.data.volumePercent ?? 0;
+  return (
+    pendingVolumes.value[props.data.entityId] ?? props.data.volumePercent ?? 0
+  );
 });
 
 function onVolumeInput(event: Event) {
   if (!props.data.channelType) return;
   const percent = Number((event.target as HTMLInputElement).value);
-  scheduleChannelVolume(props.data.channelType, props.data.entityId, clampVolume(percent));
+  scheduleChannelVolume(
+    props.data.channelType,
+    props.data.entityId,
+    clampVolume(percent),
+  );
 }
 
 function onToggleMute() {
   if (!props.data.channelType) return;
-  void toggleChannelMute(props.data.channelType, props.data.entityId, Boolean(props.data.muted));
+  void toggleChannelMute(
+    props.data.channelType,
+    props.data.entityId,
+    Boolean(props.data.muted),
+  );
 }
 </script>
 
@@ -142,11 +295,17 @@ function onToggleMute() {
       {
         'routing-graph-node--has-effects': hasEffectStages,
         'routing-graph-node--effects-bypassed': effectsState === 'bypassed',
+        'routing-graph-node--highlighted': actions?.isNodeHighlighted(
+          data.entityId,
+        ),
       },
     ]"
     @contextmenu="onContextMenu"
   >
-    <div v-if="inHandles.length" class="routing-graph-node-ports routing-graph-node-ports--in">
+    <div
+      v-if="inHandles.length"
+      class="routing-graph-node-ports routing-graph-node-ports--in"
+    >
       <div
         v-for="handle in inHandles"
         :key="handle.id"
@@ -158,12 +317,13 @@ function onToggleMute() {
           :id="handle.id"
           type="target"
           :position="Position.Left"
+          :connectable="handle.connectable !== false"
           class="routing-graph-handle"
           :class="{ 'is-empty': handle.empty }"
           tabindex="0"
           role="button"
           :aria-label="handleAriaLabel(handle)"
-          @keydown="(event) => onHandleKeydown(event, handle)"
+          @keydown="(event: KeyboardEvent) => onHandleKeydown(event, handle)"
         />
       </div>
     </div>
@@ -175,13 +335,48 @@ function onToggleMute() {
           class="routing-graph-node-swatch"
           :style="{ background: data.accent }"
         />
-        <NodeTypeIcon :kind="data.nodeClass" class="routing-graph-node-icon" />
+        <NodeTypeIcon :kind="iconKind" class="routing-graph-node-icon" />
+        <button
+          v-if="data.processingNodeKind?.kind === 'group'"
+          type="button"
+          class="icon-btn routing-graph-node-group-expand-toggle"
+          :class="{
+            'routing-graph-node-group-expand-toggle--expanded':
+              actions?.isGroupExpanded(data.entityId),
+          }"
+          :title="
+            actions?.isGroupExpanded(data.entityId)
+              ? 'Hide members'
+              : 'Show members'
+          "
+          :aria-label="
+            actions?.isGroupExpanded(data.entityId)
+              ? 'Hide members'
+              : 'Show members'
+          "
+          @click="actions?.toggleGroupExpansion(data.entityId)"
+        >
+          ▸
+        </button>
         <span
           v-if="effectsState !== 'none'"
           class="routing-graph-node-effects-badge"
           :class="`routing-graph-node-effects-badge--${effectsState}`"
           :title="effectsBadgeTitle"
           :aria-label="effectsBadgeTitle"
+        />
+        <span
+          v-if="data.routeWarning"
+          class="routing-graph-node-warning-badge"
+          :class="`routing-graph-node-warning-badge--${data.routeWarning}`"
+          :title="data.routeWarningTitle"
+          :aria-label="data.routeWarningTitle"
+        />
+        <span
+          v-if="data.formatMismatch"
+          class="routing-graph-node-format-badge"
+          :title="data.formatMismatchTitle"
+          :aria-label="data.formatMismatchTitle"
         />
         <div class="routing-graph-node-copy">
           <NodeCardHeader
@@ -192,14 +387,173 @@ function onToggleMute() {
             layout="inline"
             @save="onRename"
             @delete="onDelete"
-          />
+          >
+            <template
+              v-if="dspInfoText || data.processingNodeKind?.kind === 'group'"
+              #toolbar-extra
+            >
+              <template v-if="dspInfoText">
+                <button
+                  type="button"
+                  class="icon-btn routing-graph-node-header-reset"
+                  title="Reset to defaults"
+                  aria-label="Reset to defaults"
+                  @click="onResetClick"
+                >
+                  ↺
+                </button>
+                <span
+                  class="icon-btn routing-graph-node-dsp-info"
+                  :title="dspInfoText"
+                  :aria-label="dspInfoText"
+                >
+                  ⓘ
+                </span>
+              </template>
+              <div
+                v-if="data.processingNodeKind?.kind === 'group'"
+                class="routing-graph-node-picker-anchor"
+              >
+                <button
+                  type="button"
+                  class="icon-btn routing-graph-node-header-add-member"
+                  title="Add output to group"
+                  aria-label="Add output to group"
+                  @click="addMemberPickerOpen = !addMemberPickerOpen"
+                >
+                  +
+                </button>
+                <div
+                  v-if="addMemberPickerOpen"
+                  class="routing-graph-node-picker"
+                >
+                  <button
+                    v-for="candidate in data.groupAvailableDevices ?? []"
+                    :key="candidate.id"
+                    type="button"
+                    @click="onAddMember(candidate.id)"
+                  >
+                    {{ candidate.label }}
+                  </button>
+                  <p
+                    v-if="(data.groupAvailableDevices ?? []).length === 0"
+                    class="routing-graph-context-menu-label"
+                  >
+                    No other outputs available
+                  </p>
+                </div>
+              </div>
+            </template>
+          </NodeCardHeader>
           <strong v-else>{{ data.label }}</strong>
           <span class="routing-graph-node-sub">{{ data.subtitle }}</span>
         </div>
       </div>
 
+      <!-- `handlesForProcessingNode` builds audio-in handles in the same
+           order as `ProcessingNode.inputs`, so filtered position === real
+           port index; see nodePorts.ts. -->
+      <RoutingGraphNodeMixer
+        v-if="data.processingNodeKind?.kind === 'mixer'"
+        :node-id="data.entityId"
+        :input-gains-percent="data.processingNodeKind.input_gains_percent"
+        :inputs="
+          inHandles
+            .filter((h) => !h.empty)
+            .map((h, i) => ({ index: i, connectedId: h.connectedId }))
+        "
+      />
+      <RoutingGraphNodeEq5Band
+        v-else-if="data.processingNodeKind?.kind === 'eq5band'"
+        ref="eq5bandRef"
+        :node-id="data.entityId"
+        :eq-sub="data.processingNodeKind.eq_sub"
+        :eq-bass="data.processingNodeKind.eq_bass"
+        :eq-mid="data.processingNodeKind.eq_mid"
+        :eq-treble="data.processingNodeKind.eq_treble"
+        :eq-air="data.processingNodeKind.eq_air"
+        :output-gain="data.processingNodeKind.output_gain"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeDelay
+        v-else-if="data.processingNodeKind?.kind === 'delay'"
+        ref="delayRef"
+        :node-id="data.entityId"
+        :delay-ms="data.processingNodeKind.delay_ms"
+        :feedback-percent="data.processingNodeKind.feedback_percent"
+        :feedforward-percent="data.processingNodeKind.feedforward_percent"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeLimiter
+        v-else-if="data.processingNodeKind?.kind === 'limiter'"
+        ref="limiterRef"
+        :node-id="data.entityId"
+        :ceiling-db="data.processingNodeKind.ceiling_db"
+        :floor-db="data.processingNodeKind.floor_db"
+        :symmetric="data.processingNodeKind.symmetric"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeHpf
+        v-else-if="data.processingNodeKind?.kind === 'hpf'"
+        ref="hpfRef"
+        :node-id="data.entityId"
+        :freq-hz="data.processingNodeKind.freq_hz"
+        :resonance-x10="data.processingNodeKind.resonance_x10"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeReverb
+        v-else-if="data.processingNodeKind?.kind === 'reverb'"
+        ref="reverbRef"
+        :node-id="data.entityId"
+        :mix-percent="data.processingNodeKind.mix_percent"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeWidener
+        v-else-if="data.processingNodeKind?.kind === 'widener'"
+        ref="widenerRef"
+        :node-id="data.entityId"
+        :width-percent="data.processingNodeKind.width_percent"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodePan
+        v-else-if="data.processingNodeKind?.kind === 'pan'"
+        ref="panRef"
+        :node-id="data.entityId"
+        :balance-percent="data.processingNodeKind.balance_percent"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeCompressor
+        v-else-if="data.processingNodeKind?.kind === 'compressor'"
+        ref="compressorRef"
+        :node-id="data.entityId"
+        :threshold-db="data.processingNodeKind.threshold_db"
+        :ratio-x10="data.processingNodeKind.ratio_x10"
+        :attack-ms="data.processingNodeKind.attack_ms"
+        :release-ms="data.processingNodeKind.release_ms"
+        :makeup-gain-db="data.processingNodeKind.makeup_gain_db"
+        :bypassed="data.processingNodeBypassed ?? false"
+      />
+      <RoutingGraphNodeFanOut
+        v-else-if="data.processingNodeKind?.kind === 'fan_out'"
+        :node-id="data.entityId"
+        :volume-percent="data.processingNodeKind.volume_percent"
+        :muted="data.processingNodeKind.muted"
+      />
+      <RoutingGraphNodeGroup
+        v-else-if="data.processingNodeKind?.kind === 'group'"
+        :node-id="data.entityId"
+        :volume-percent="data.processingNodeKind.volume_percent"
+        :muted="data.processingNodeKind.muted"
+        :members="data.groupMembers ?? []"
+      />
+      <p
+        v-else-if="data.processingNodeKind?.kind === 'stub'"
+        class="routing-graph-node-stub-label"
+      >
+        Not implemented yet
+      </p>
       <RoutingGraphNodeEffects
-        v-if="data.channelType && data.supportsEffects"
+        v-else-if="data.channelType && data.supportsEffects"
         :channel-type="data.channelType"
         :entity-id="data.entityId"
         :label="data.label"
@@ -226,11 +580,16 @@ function onToggleMute() {
           :aria-label="`${data.label} volume`"
           @input="onVolumeInput"
         />
-        <span class="routing-graph-node-volume-label">{{ displayVolume }}%</span>
+        <span class="routing-graph-node-volume-label"
+          >{{ displayVolume }}%</span
+        >
       </div>
     </div>
 
-    <div v-if="outHandles.length" class="routing-graph-node-ports routing-graph-node-ports--out">
+    <div
+      v-if="outHandles.length"
+      class="routing-graph-node-ports routing-graph-node-ports--out"
+    >
       <div
         v-for="handle in outHandles"
         :key="handle.id"
@@ -242,12 +601,16 @@ function onToggleMute() {
           :id="handle.id"
           type="source"
           :position="Position.Right"
+          :connectable="handle.connectable !== false"
           class="routing-graph-handle"
-          :class="{ 'is-empty': handle.empty }"
+          :class="{
+            'is-empty': handle.empty,
+            'is-monitor-anchor': handle.connectable === false,
+          }"
           tabindex="0"
           role="button"
           :aria-label="handleAriaLabel(handle)"
-          @keydown="(event) => onHandleKeydown(event, handle)"
+          @keydown="(event: KeyboardEvent) => onHandleKeydown(event, handle)"
         />
       </div>
     </div>

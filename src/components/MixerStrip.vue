@@ -6,7 +6,7 @@ import EffectStageList from "./EffectStageList.vue";
 import { useMixerControls } from "../composables/useMixerControls";
 import { useApplyResult } from "../stores/notices";
 import { useConfirm } from "../stores/confirm";
-import type { Device, MixSource, Stream } from "../types/graph";
+import type { Device, Stream } from "../types/graph";
 
 const props = withDefaults(
   defineProps<{
@@ -19,13 +19,7 @@ const props = withDefaults(
 );
 
 const { handleApplyResult } = useApplyResult();
-const {
-  applyChannelVolume,
-  toggleChannelMute,
-  toggleMixSourceMute,
-  scheduleMixSourceVolume,
-  pendingVolumes: pendingMixVolumes,
-} = useMixerControls();
+const { applyChannelVolume, toggleChannelMute } = useMixerControls();
 const { confirm } = useConfirm();
 const pendingVolumes = ref<Record<string, number>>({});
 const expandedEffectsIds = ref<Set<string>>(new Set());
@@ -46,14 +40,7 @@ function toggleEffectsPanel(channel: MixerChannel) {
 const editingVolumeId = ref<string | null>(null);
 const volumeDraft = ref("");
 const volumeInputRef = ref<HTMLInputElement | null>(null);
-let debounceTimers: Record<string, number> = {};
-
-interface MixSourceChannel {
-  deviceId: string;
-  label: string;
-  level: number;
-  muted: boolean;
-}
+const debounceTimers: Record<string, number> = {};
 
 interface MixerChannel {
   id: string;
@@ -64,18 +51,6 @@ interface MixerChannel {
   channelType: "device" | "stream";
   level: number;
   muted: boolean;
-  mixSources: MixSourceChannel[];
-}
-
-function toMixSourceChannel(deviceId: string, mixSource: MixSource): MixSourceChannel {
-  const source = props.devices.find((device) => device.id === mixSource.device_id);
-  const key = `${deviceId}:${mixSource.device_id}`;
-  return {
-    deviceId: mixSource.device_id,
-    label: source?.label ?? mixSource.device_id,
-    level: pendingMixVolumes.value[key] ?? mixSource.volume_percent,
-    muted: mixSource.muted,
-  };
 }
 
 function toDeviceChannel(device: Device): MixerChannel | null {
@@ -92,7 +67,6 @@ function toDeviceChannel(device: Device): MixerChannel | null {
     channelType: "device",
     level: pendingVolumes.value[device.id] ?? device.volume_percent,
     muted: device.muted ?? false,
-    mixSources: (device.mix_sources ?? []).map((mixSource) => toMixSourceChannel(device.id, mixSource)),
   };
 }
 
@@ -110,7 +84,6 @@ function toStreamChannel(stream: Stream): MixerChannel | null {
     channelType: "stream",
     level: pendingVolumes.value[stream.id] ?? stream.volume_percent,
     muted: stream.muted ?? false,
-    mixSources: [],
   };
 }
 
@@ -143,7 +116,9 @@ const hasChannels = computed(
 
 function channelAccentClass(channel: MixerChannel): string {
   if (channel.channelType === "stream") {
-    return channel.direction === "capture" ? "channel-capture" : "channel-playback";
+    return channel.direction === "capture"
+      ? "channel-capture"
+      : "channel-playback";
   }
   if (channel.kind === "virtual") {
     return "channel-virtual";
@@ -209,14 +184,6 @@ async function toggleMute(channel: MixerChannel) {
   await toggleChannelMute(channel.channelType, channel.id, channel.muted);
 }
 
-function scheduleMixSource(channel: MixerChannel, mixSource: MixSourceChannel, percent: number) {
-  scheduleMixSourceVolume(channel.id, mixSource.deviceId, clampVolume(percent));
-}
-
-async function toggleMixSourceMuteFor(channel: MixerChannel, mixSource: MixSourceChannel) {
-  await toggleMixSourceMute(channel.id, mixSource.deviceId, mixSource.muted);
-}
-
 async function saveRename(channel: MixerChannel, alias: string) {
   if (!channel.systemName) {
     return;
@@ -226,7 +193,10 @@ async function saveRename(channel: MixerChannel, alias: string) {
     handleApplyResult({ success: true }, "Device renamed");
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   }
@@ -250,7 +220,10 @@ async function removeVirtual(channel: MixerChannel) {
     handleApplyResult({ success: true }, "Virtual device removed");
   } catch (error) {
     handleApplyResult(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
       "",
     );
   }
@@ -287,12 +260,17 @@ async function removeVirtual(channel: MixerChannel) {
                     @save="(name) => saveRename(channel, name)"
                     @delete="removeVirtual(channel)"
                   />
-                  <p v-else class="stream-channel-label" :title="channel.label">{{ channel.label }}</p>
+                  <p v-else class="stream-channel-label" :title="channel.label">
+                    {{ channel.label }}
+                  </p>
                 </div>
 
                 <div class="channel-fader">
                   <div class="channel-meter" aria-hidden="true">
-                    <span class="channel-meter-fill" :style="{ width: `${channel.level}%` }" />
+                    <span
+                      class="channel-meter-fill"
+                      :style="{ width: `${channel.level}%` }"
+                    />
                   </div>
                   <input
                     type="range"
@@ -301,7 +279,12 @@ async function removeVirtual(channel: MixerChannel) {
                     max="100"
                     :value="channel.level"
                     :aria-label="`${channel.label} volume`"
-                    @input="scheduleVolume(channel, Number(($event.target as HTMLInputElement).value))"
+                    @input="
+                      scheduleVolume(
+                        channel,
+                        Number(($event.target as HTMLInputElement).value),
+                      )
+                    "
                   />
                 </div>
 
@@ -353,39 +336,12 @@ async function removeVirtual(channel: MixerChannel) {
                 </button>
               </div>
 
-              <div v-if="channel.mixSources.length > 0" class="mix-sources">
-                <p class="mix-sources-label">Mixed in</p>
-                <div
-                  v-for="mixSource in channel.mixSources"
-                  :key="mixSource.deviceId"
-                  class="mix-source-row"
-                  :class="{ muted: mixSource.muted }"
-                >
-                  <span class="mix-source-name" :title="mixSource.label">{{ mixSource.label }}</span>
-                  <input
-                    type="range"
-                    class="mix-source-slider"
-                    min="0"
-                    max="100"
-                    :value="mixSource.level"
-                    :aria-label="`${mixSource.label} contribution to ${channel.label}`"
-                    @input="scheduleMixSource(channel, mixSource, Number(($event.target as HTMLInputElement).value))"
-                  />
-                  <span class="mix-source-level">{{ mixSource.level }}%</span>
-                  <button
-                    type="button"
-                    class="mix-source-mute"
-                    :class="{ active: mixSource.muted }"
-                    :aria-label="mixSource.muted ? `Unmute ${mixSource.label}` : `Mute ${mixSource.label}`"
-                    :title="mixSource.muted ? 'Unmute — link stays connected while muted' : 'Mute — link stays connected'"
-                    @click="toggleMixSourceMuteFor(channel, mixSource)"
-                  >
-                    {{ mixSource.muted ? "🔇" : "🔊" }}
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="supportsEffects(channel) && expandedEffectsIds.has(channel.id)" class="channel-effects">
+              <div
+                v-if="
+                  supportsEffects(channel) && expandedEffectsIds.has(channel.id)
+                "
+                class="channel-effects"
+              >
                 <EffectStageList :device-id="channel.id" />
               </div>
             </article>

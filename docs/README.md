@@ -32,25 +32,25 @@ Pipe Deck is **PipeWire-first** and does not replace PipeWire or WirePlumber —
 
 ## Get started
 
-- **Run it from source:** [Getting Started](project/Getting_Started.md) — prerequisites, clone, first run
+- **Install and start routing:** [Getting Started for Users](product/Getting_Started_Users.md) — install, first launch, and your first route in a few minutes
+- **Run it from source:** [Getting Started](developers/Getting_Started.md) — prerequisites, clone, first run
 - **Source & builds:** [github.com/LunarVagabond/Pipe-Deck](https://github.com/LunarVagabond/Pipe-Deck)
 - **Why this exists:** [About](product/About.md)
 - **Contributing:** [`.github/CONTRIBUTING.md`](../.github/CONTRIBUTING.md)
-- **Codebase layout:** [Development](project/Development.md)
-- **Packaging:** [Packaging](project/Packaging.md)
-- **Plugins:** [Plugins](project/Plugins.md)
-- **Releasing:** [Release](project/Release.md)
+- **Codebase layout:** [Development](developers/Development.md)
+- **Packaging:** [Packaging](developers/Packaging.md)
+- **Uninstalling / resetting:** [Uninstall](developers/Uninstall.md)
+- **Plugins:** [Plugins](developers/Plugins.md)
+- **Releasing:** [Release](developers/Release.md)
+- **Project organization:** [Project Management](project-management/README.md)
 
 ## Documentation map
 
 ### Product
+- [Getting Started (Users)](product/Getting_Started_Users.md)
 - [Product Requirements](product/Product_Requirements.md)
 - [Roadmap](product/Roadmap.md)
 - [Decisions](architecture/Decisions.md)
-
-### Getting Started
-- [Getting Started](project/Getting_Started.md)
-- [Development](project/Development.md)
 
 ### Architecture
 - [System Architecture](architecture/System_Architecture.md)
@@ -62,18 +62,30 @@ Pipe Deck is **PipeWire-first** and does not replace PipeWire or WirePlumber —
 - [Plugin API](specs/Plugin_API.md)
 - [Config Spec](specs/Config_Spec.md)
 - [Rule Engine Spec](specs/Rule_Engine_Spec.md)
+- [Demo Scenario Spec](specs/Demo_Scenario_Spec.md)
 - [Audio Terminology](specs/Audio_Terminology.md)
 
-### Project
-- [Packaging](project/Packaging.md)
-- [Release process](project/Release.md)
-- [Plugins](project/Plugins.md)
+### Developer
+- [Getting Started (from source)](developers/Getting_Started.md)
+- [Development](developers/Development.md)
+- [Adding a PipeWire Effect](developers/Adding_PipeWire_Effects.md)
+- [Packaging](developers/Packaging.md)
+- [Uninstall](developers/Uninstall.md)
+- [Release process](developers/Release.md)
+- [Plugins](developers/Plugins.md)
 - [Plugin Review Checklist](specs/Plugin_Review_Checklist.md)
+
+### Project Management
+- [Overview](project-management/README.md)
+- [Issue Workflow](project-management/issue-workflow.md)
+- [Milestones & Releases](project-management/milestones-and-releases.md)
+- [Release Strategy & Cadence](project-management/release-strategy.md)
+- [Contributing Workflow](project-management/contributing-workflow.md)
 
 ## Feature acceptance filter
 
 Every proposed feature must answer **yes** to:
 
-> Does this make Linux audio easier to understand and manage?
+> Does this help users better understand and manage their audio, or help the community build and maintain the tools that make that possible?
 
 If not, refine or drop the idea before building it.

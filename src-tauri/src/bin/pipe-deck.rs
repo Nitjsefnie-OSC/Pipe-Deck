@@ -26,11 +26,18 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // Deliberately handled before the generic engine setup below: cleanup
+    // must still tear down what it can even if `refresh_graph()` would fail
+    // (e.g. PipeWire already partway through being removed alongside the
+    // package) — nothing it does depends on a fresh graph.
+    if args[0] == "cleanup" {
+        return handle_cleanup(&args[1..]);
+    }
+
     let mut engine = CoreEngine::new();
     ConfigStore::new()
         .ensure_layout()
         .map_err(|error| error.to_string())?;
-    let _ = pipe_deck_lib::core::rules::ensure_rules_migrated();
     engine.initialize_plugins();
     engine.refresh_graph().map_err(|error| error.to_string())?;
 
@@ -49,6 +56,56 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Tears down everything Pipe Deck can leave behind past a package removal
+/// (issue #169): live `pipe-deck-*` pactl modules, the background-restore
+/// systemd unit, and stray effects drop-ins — always. With `--purge-config`,
+/// also deletes the config directory and daemon state directory. Intended
+/// to be run once before/instead of removing the package itself (see
+/// `docs/developers/Uninstall.md`), not wired to a package-manager hook
+/// automatically — Tauri's bundler has no postrm/prerm hook mechanism today.
+fn handle_cleanup(args: &[String]) -> Result<(), String> {
+    let purge_config = args.iter().any(|arg| arg == "--purge-config");
+
+    let engine = CoreEngine::new();
+    let (removed_devices, device_errors) = engine.remove_all_virtual_devices();
+
+    let removed_unit = pipe_deck_lib::daemon::uninstall_user_service_unit()?;
+
+    let mut errors = device_errors;
+    if let Err(error) = pipe_deck_lib::pipewire::filter_chain::cleanup_effects_conf_files() {
+        errors.push(format!("failed to remove effects drop-ins: {error}"));
+    }
+
+    let mut purged_dirs = Vec::new();
+    if purge_config {
+        let config_dir = ConfigStore::new().config_dir().clone();
+        for dir in [config_dir, pipe_deck_lib::daemon::state_dir()] {
+            if !dir.exists() {
+                continue;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => purged_dirs.push(dir.display().to_string()),
+                Err(error) => errors.push(format!("failed to remove {}: {error}", dir.display())),
+            }
+        }
+    }
+
+    print_json(&json!({
+        "removed_virtual_devices": removed_devices,
+        "removed_daemon_unit": removed_unit.map(|path| path.display().to_string()),
+        "purged_directories": purged_dirs,
+        "errors": errors,
+    }))?;
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "{} cleanup step(s) failed — see errors above",
+            errors.len()
+        ));
+    }
+    Ok(())
+}
+
 fn handle_route(engine: &mut CoreEngine, args: &[String]) -> Result<(), String> {
     if args.len() < 2 || args[0] != "set" {
         return Err("usage: pipe-deck route set --stream <id> --targets a,b".into());
@@ -64,7 +121,12 @@ fn handle_route(engine: &mut CoreEngine, args: &[String]) -> Result<(), String> 
             }
             "--targets" | "--target" => {
                 let value = args.get(index + 1).cloned().ok_or("missing targets")?;
-                targets = value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+                targets = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 index += 2;
             }
             _ => index += 1,
@@ -127,7 +189,7 @@ fn handle_rules(engine: &mut CoreEngine, args: &[String]) -> Result<(), String> 
             print_json(&config.rules)?;
         }
         "simulate" => {
-            let results = engine.simulate_rules();
+            let results = engine.simulate_rules(&std::collections::HashMap::new());
             print_json(&results)?;
         }
         "apply" => {
@@ -169,6 +231,130 @@ graph                 Print runtime graph as JSON\n  \
 route set --stream ID --targets a,b\n  \
 profile list|swap <id>|save [--name NAME]\n  \
 rules list|simulate|apply\n  \
-plugins list|status\n"
+plugins list|status\n  \
+cleanup [--purge-config]   Unload virtual devices + remove the daemon unit;\n                             \
+                           --purge-config also deletes config/state dirs\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes tests that mutate process-wide env vars — same rationale
+    /// as `config::store::lock_config_dir_env` (this bin is a separate crate
+    /// from the lib, so it can't reuse that lock directly and needs its own).
+    fn lock_cli_test_env() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn unique_suffix() -> u64 {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    struct CleanupTestEnv {
+        temp_dir: std::path::PathBuf,
+        previous_config_dir: Option<String>,
+        previous_config_home: Option<String>,
+        previous_state_home: Option<String>,
+        previous_use_mock: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for CleanupTestEnv {
+        fn drop(&mut self) {
+            match &self.previous_config_dir {
+                Some(value) => std::env::set_var("PIPE_DECK_CONFIG_DIR", value),
+                None => std::env::remove_var("PIPE_DECK_CONFIG_DIR"),
+            }
+            match &self.previous_config_home {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.previous_state_home {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match &self.previous_use_mock {
+                Some(value) => std::env::set_var("PIPE_DECK_USE_MOCK", value),
+                None => std::env::remove_var("PIPE_DECK_USE_MOCK"),
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
+    }
+
+    /// Sandboxes every directory `handle_cleanup` can touch (`--purge-config`
+    /// removes `ConfigStore::config_dir()` and `daemon::state_dir()`
+    /// wholesale) so this test can never reach a real `~/.config/pipe-deck`
+    /// or `~/.local/state/pipe-deck` — `XDG_STATE_HOME` in particular is easy
+    /// to forget since `state_dir()` falls back to a real `$HOME` path
+    /// without it.
+    fn setup_cleanup_test_env() -> (CleanupTestEnv, std::path::PathBuf) {
+        let lock = lock_cli_test_env();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-cli-cleanup-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let config_dir = temp_dir.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let previous_config_dir = std::env::var("PIPE_DECK_CONFIG_DIR").ok();
+        std::env::set_var("PIPE_DECK_CONFIG_DIR", &config_dir);
+
+        // ConfigStore reads PIPE_DECK_CONFIG_DIR, but user_systemd_dir() only
+        // ever reads XDG_CONFIG_HOME — both must point into the sandbox.
+        let previous_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &config_dir);
+
+        let state_dir = temp_dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let previous_state_home = std::env::var("XDG_STATE_HOME").ok();
+        std::env::set_var("XDG_STATE_HOME", &state_dir);
+
+        let previous_use_mock = std::env::var("PIPE_DECK_USE_MOCK").ok();
+        std::env::set_var("PIPE_DECK_USE_MOCK", "1");
+
+        (
+            CleanupTestEnv {
+                temp_dir,
+                previous_config_dir,
+                previous_config_home,
+                previous_state_home,
+                previous_use_mock,
+                _lock: lock,
+            },
+            config_dir,
+        )
+    }
+
+    #[test]
+    #[ignore]
+    // `#[ignore]`d (#425): `handle_cleanup` calls `daemon::uninstall_user_service_unit()`,
+    // which now issues a real `zbus` `StopUnit`/`DisableUnitFiles` call against
+    // the literal `pipe-deck-daemon.service` unit name over the real session
+    // D-Bus — there's no PATH to fake anymore (see `daemon::mod::tests`' own
+    // comment for the retired `FakeSystemctl` and its PR #256 rationale, which
+    // applies identically here). Unlike the file/config-dir assertions below,
+    // that call is not sandboxed by `PIPE_DECK_CONFIG_DIR`/`XDG_CONFIG_HOME` —
+    // running this on a machine with the real background-restore service
+    // actually enabled would disable/stop it for real. Run manually only.
+    fn handle_cleanup_removes_daemon_unit_and_purges_config_when_requested() {
+        let (_env, config_dir) = setup_cleanup_test_env();
+        let unit_dir = config_dir.join("systemd/user");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(unit_dir.join("pipe-deck-daemon.service"), "[Service]\n").unwrap();
+
+        let result = handle_cleanup(&["--purge-config".to_string()]);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!unit_dir.join("pipe-deck-daemon.service").exists());
+        assert!(!config_dir.exists(), "config dir should be purged");
+    }
 }

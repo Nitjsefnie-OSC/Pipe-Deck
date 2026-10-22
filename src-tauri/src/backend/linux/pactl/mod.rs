@@ -5,14 +5,14 @@ mod r#virtual;
 
 pub use mixer::*;
 pub use parse::*;
-pub use routing::*;
 pub use r#virtual::*;
+pub use routing::*;
 
 use crate::backend::BackendError;
-use std::process::Command;
+use crate::sysproc;
 
 pub(crate) fn run_pactl(args: &[&str]) -> Result<String, BackendError> {
-    let output = Command::new("pactl")
+    let output = sysproc::command("pactl")
         .args(args)
         .output()
         .map_err(|error| BackendError::Message(format!("failed to run pactl: {error}")))?;

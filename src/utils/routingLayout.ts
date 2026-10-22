@@ -10,6 +10,13 @@ export interface MatrixNode {
   accent?: string;
 }
 
+// PipeWire/WirePlumber name every node coming off the bluez5 backend
+// "bluez_output.…"/"bluez_input.…" — there's no dedicated field on Device for
+// this, so the naming convention is the only signal available (see #3).
+export function isBluetoothDevice(device: Device): boolean {
+  return device.system_name.startsWith("bluez_");
+}
+
 const ACCENT_PALETTE = [
   "#7c5cff",
   "#26c3a3",
@@ -52,7 +59,10 @@ export function columnRank(column: NodeColumn): number {
 }
 
 export function deviceColumn(device: Device): NodeColumn | null {
-  if (device.system_name.startsWith("pipe-deck-feed-")) {
+  if (
+    device.system_name.startsWith("pipe-deck-feed-") ||
+    device.system_name.startsWith("pipe-deck-proc-")
+  ) {
     return null;
   }
   if (device.direction === "output" || device.direction === "duplex") {
@@ -125,7 +135,10 @@ function titleCaseFromBinary(executable: string): string {
  * correctly. `application.process.binary` (the actual executable) is more
  * reliable when present, so it takes precedence; `app_name` is the fallback
  * for streams with no executable reported. */
-export function streamDisplayLabel(stream: { app_name: string; executable?: string }): string {
+export function streamDisplayLabel(stream: {
+  app_name: string;
+  executable?: string;
+}): string {
   if (stream.executable) {
     return titleCaseFromBinary(stream.executable);
   }
@@ -139,13 +152,13 @@ export function targetLabel(device: Device): string {
   return device.label;
 }
 
-// Every virtual output supports fanning out to multiple targets today — there
-// is no PipeWire-level difference between a "multi output" and a plain output
-// sink, both are the same null-sink under the hood. `sink_mode` is kept on
-// the model only for backward-compat deserialization of older persisted
-// devices/profiles; it no longer drives any behavioral distinction here.
-export function isMultiSink(device: Device): boolean {
-  return device.kind === "virtual" && (device.direction === "output" || device.direction === "duplex");
+// Multi-target fan-out from a plain virtual device was retired alongside
+// VirtualRole::Bus (#293) — the dedicated Fan-Out processing node is the
+// only way to fan a signal out to multiple destinations now. `sink_mode` is
+// kept on the model only for backward-compat deserialization of older
+// persisted devices/profiles; it no longer drives any behavior here.
+export function isMultiSink(_device: Device): boolean {
+  return false;
 }
 
 export function deviceTargetIds(device: Device): string[] {
@@ -160,7 +173,10 @@ export function deviceSubtitle(device: Device): string {
     return "Split fan-out sink";
   }
   if (device.direction === "output" || device.direction === "duplex") {
-    return device.kind === "virtual" ? "Virtual Sink" : "Hardware Output";
+    if (device.kind === "virtual") {
+      return "Virtual Output";
+    }
+    return "Hardware Output";
   }
   return device.kind === "virtual" ? "Virtual Source" : "Hardware Input";
 }
@@ -208,17 +224,3 @@ export function sinksForStream(devices: Device[], stream: Stream): Device[] {
     return device.direction === "input" || device.direction === "duplex";
   });
 }
-
-export function targetsForVirtualSink(devices: Device[], device: Device): Device[] {
-  return devices.filter((candidate) => {
-    if (candidate.id === device.id) return false;
-    if (candidate.kind === "physical" && candidate.direction === "output") {
-      return true;
-    }
-    if (candidate.kind === "virtual" && candidate.direction === "input") {
-      return true;
-    }
-    return candidate.kind === "virtual" && candidate.direction === "output";
-  });
-}
-

@@ -1,11 +1,14 @@
+#[cfg(test)]
+use crate::backend::linux::{pactl, pw_link};
 use crate::config::ConfigStore;
-use crate::core::models::{ApplyResult, DeviceDirection, DeviceKind, EffectChainConfig, EffectStage};
-use crate::pipewire::fx_capability::{self, FxCapabilities};
-use crate::pipewire::fx_validate::{self, PreflightResult};
-use crate::pipewire::{filter_chain, pipewire_restart, pw_cli};
-use crate::backend::linux::{pactl, pw_link, virtual_mic_mix};
+use crate::core::models::{
+    effect_input_name_for_device, is_pipe_deck_device, ApplyResult, DeviceDirection, DeviceKind,
+    EffectChainConfig, EffectStage,
+};
+use crate::pipewire::fx_capability::FxCapabilities;
+use crate::pipewire::fx_validate::PreflightResult;
 use std::collections::HashMap;
-use std::fs;
+#[cfg(test)]
 use std::time::Duration;
 
 use super::{CoreEngine, EngineError};
@@ -22,7 +25,7 @@ impl CoreEngine {
     /// configure a stage that would silently fail (or worse, get force-fit
     /// through an unvalidated path) at apply time.
     pub fn get_effect_capabilities(&self) -> FxCapabilities {
-        fx_capability::probe_capabilities()
+        self.adapter.effect_capabilities()
     }
 
     /// Validates a candidate chain against the v1 safety contract without
@@ -30,8 +33,7 @@ impl CoreEngine {
     /// change so the UI can show blocking reasons before the user ever hits
     /// Apply.
     pub fn preflight_effect_chain(&self, config: &EffectChainConfig) -> PreflightResult {
-        let capabilities = fx_capability::probe_capabilities();
-        fx_validate::preflight(config, &capabilities)
+        self.adapter.preflight_effect_chain(config)
     }
 
     /// Whether a device currently has a live effects chain loaded (i.e. a
@@ -40,11 +42,15 @@ impl CoreEngine {
     /// and "push live params in real time" without re-deriving that from
     /// scratch on every keystroke.
     pub fn is_effect_chain_live(&self, device_id: &str) -> bool {
-        let Some(device) = self.graph.devices.iter().find(|device| device.id == device_id) else {
+        let Some(device) = self
+            .graph
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+        else {
             return false;
         };
-        filter_chain::conf_path_for_device(&device.system_name)
-            .is_some_and(|path| path.is_file())
+        self.adapter.is_effect_chain_loaded(&device.system_name)
     }
 
     pub fn set_device_effects(
@@ -59,7 +65,7 @@ impl CoreEngine {
             .find(|device| device.id == device_id)
             .ok_or_else(|| EngineError::Adapter(format!("device not found: {device_id}")))?;
 
-        if !filter_chain::is_pipe_deck_device(&device.system_name) {
+        if !is_pipe_deck_device(&device.system_name) {
             return Err(EngineError::Adapter(
                 "effects may only be applied to pipe-deck virtual devices".into(),
             ));
@@ -67,34 +73,26 @@ impl CoreEngine {
 
         let store = ConfigStore::new();
         if config.is_active() {
+            // This is the persist-only path (bypass toggle before any stage
+            // is live, dynamics-stage persist) — it never itself applies or
+            // reverts live processing, so it must not clobber an existing
+            // `live: true` set by a real apply just because the frontend's
+            // `config` doesn't know about this Rust-only bookkeeping field.
+            let mut persisted_config = config;
+            let previously_live = store
+                .effect_chains()
+                .ok()
+                .and_then(|chains| chains.get(device_id).map(|existing| existing.live))
+                .unwrap_or(false);
+            persisted_config.live = previously_live;
             store
-                .set_effect_chain(device_id, &config)
+                .set_effect_chain(device_id, &persisted_config)
                 .map_err(|error| EngineError::Config(error.to_string()))?;
         } else {
             store
                 .remove_effect_chain(device_id)
                 .map_err(|error| EngineError::Config(error.to_string()))?;
         }
-
-        if self.graph.data_source == "mock" {
-            return Ok(ApplyResult {
-                success: true,
-                message: None,
-            });
-        }
-
-        let chains = store
-            .effect_chains()
-            .map_err(|error| EngineError::Config(error.to_string()))?;
-        let active = self.active_effect_chains(&chains);
-        let deactivated = if config.is_active() {
-            Vec::new()
-        } else {
-            vec![device.system_name.clone()]
-        };
-
-        filter_chain::sync_all_effects(&active, &deactivated)
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
 
         Ok(ApplyResult {
             success: true,
@@ -107,7 +105,11 @@ impl CoreEngine {
     /// "enable live effects" step anymore; the deliberate act of adding a
     /// stage via the Routing graph/Mixer/Effects-page UI *is* the explicit
     /// action PD-017 requires before a restart-carrying apply.
-    pub fn add_effect_stage(&mut self, device_id: &str, stage: EffectStage) -> Result<ApplyResult, EngineError> {
+    pub fn add_effect_stage(
+        &mut self,
+        device_id: &str,
+        stage: EffectStage,
+    ) -> Result<ApplyResult, EngineError> {
         let mut config = self.effect_chain_for(device_id)?;
         config.stages.push(stage);
         self.apply_effect_chain_structural(device_id, &config)
@@ -116,7 +118,11 @@ impl CoreEngine {
     /// Removes the stage matching `stage_id`. If no stages remain (and no
     /// dynamics stage is enabled), fully reverts the device via
     /// `remove_effect_chain_structural` rather than applying an empty chain.
-    pub fn remove_effect_stage(&mut self, device_id: &str, stage_id: &str) -> Result<ApplyResult, EngineError> {
+    pub fn remove_effect_stage(
+        &mut self,
+        device_id: &str,
+        stage_id: &str,
+    ) -> Result<ApplyResult, EngineError> {
         let mut config = self.effect_chain_for(device_id)?;
         config.stages.retain(|stage| stage.id() != stage_id);
         if config.is_active() {
@@ -157,14 +163,15 @@ impl CoreEngine {
         Ok(chains.get(device_id).cloned().unwrap_or_default())
     }
 
-    /// Structural Apply: the rare, explicit, restart-carrying path — writes a
-    /// namespaced filter-chain conf.d drop-in, restarts *only*
-    /// `filter-chain.service` (a dedicated daemon, never the main PipeWire
-    /// graph — see `pipewire::pipewire_restart`), verifies the effects
-    /// sink/source actually reappeared, and re-links whatever the device was
-    /// already routed to (outputs) or fed by (inputs). Any failure
-    /// automatically rolls back to the plain sink/source so the device is
-    /// never left missing or broken.
+    /// Structural Apply: the rare, explicit path that actually loads or tears
+    /// down live DSP — loads `libpipewire-module-filter-chain` directly into
+    /// the running PipeWire session via `pipewire::native_host` (PD-029; no
+    /// restart of anything, the pre-#149 conf.d-drop-in-plus-service-restart
+    /// mechanism this used to describe no longer exists), verifies the
+    /// effects sink/source actually reappeared, and re-links whatever the
+    /// device was already routed to (outputs) or fed by (inputs). Any
+    /// failure automatically rolls back to the plain sink/source so the
+    /// device is never left missing or broken.
     ///
     /// Scope for this pass: EQ + master gain only, on `pipe-deck-*` virtual
     /// **output or input** devices not currently carrying audio (PD-024
@@ -181,13 +188,6 @@ impl CoreEngine {
         device_id: &str,
         config: &EffectChainConfig,
     ) -> Result<ApplyResult, EngineError> {
-        if self.graph.data_source == "mock" {
-            return Ok(ApplyResult {
-                success: true,
-                message: Some("effects applied (mock)".to_string()),
-            });
-        }
-
         let device = self
             .graph
             .devices
@@ -196,150 +196,95 @@ impl CoreEngine {
             .cloned()
             .ok_or_else(|| EngineError::NotFound(format!("device not found: {device_id}")))?;
 
-        if !filter_chain::is_pipe_deck_device(&device.system_name) {
+        if !is_pipe_deck_device(&device.system_name) {
             return Err(EngineError::InvalidInput(
                 "effects may only be applied to pipe-deck virtual devices".to_string(),
             ));
         }
-        if device.kind != DeviceKind::Virtual
-            || !matches!(device.direction, DeviceDirection::Output | DeviceDirection::Input)
-        {
+        // Device-attached output effects (the old Bus mechanism, #287) were
+        // retired alongside VirtualRole::Bus — a virtual output device can
+        // no longer host effects directly. The dedicated EQ5Band processing
+        // node (PD-032) is the replacement. Virtual input (mic) devices are
+        // unaffected; that path never depended on Bus.
+        if device.kind != DeviceKind::Virtual || device.direction != DeviceDirection::Input {
             return Err(EngineError::InvalidInput(
-                "live effects currently only support virtual output and input devices".to_string(),
+                "live effects currently only support virtual input (mic) devices - use a dedicated EQ node for output effects".to_string(),
             ));
         }
 
-        let capabilities = fx_capability::probe_capabilities();
-        let preflight = fx_validate::preflight(config, &capabilities);
+        let preflight = self.adapter.preflight_effect_chain(config);
         if !preflight.ok {
-            return Err(EngineError::InvalidInput(preflight.blocking_reasons.join("; ")));
+            return Err(EngineError::InvalidInput(
+                preflight.blocking_reasons.join("; "),
+            ));
         }
 
         let is_input = device.direction == DeviceDirection::Input;
 
-        let conf_path = filter_chain::conf_path_for_device(&device.system_name)
-            .ok_or_else(|| EngineError::Adapter("could not resolve HOME for effects config".to_string()))?;
-        let rendered = if is_input {
-            fx_validate::render_conf_capture(&device.system_name, config)
-        } else {
-            fx_validate::render_conf(&device.system_name, config)
-        };
-
-        if conf_path.is_file() {
-            if let Ok(existing) = fs::read_to_string(&conf_path) {
-                if existing == rendered {
-                    return Ok(ApplyResult {
-                        success: true,
-                        message: Some("no change".to_string()),
-                    });
-                }
-            }
-        }
-
-        // Output-direction-only concepts: what the device currently routes
-        // to downstream, and any sink-inputs (apps actively playing into it)
-        // that need to briefly hold on a scratch sink for the swap. Neither
-        // applies to a virtual input/mic device — it has no downstream
-        // routing targets of its own, and "in use" for a source means
-        // source-outputs (apps currently recording from it), which this pass
-        // doesn't attempt to hold/restore (see PD-024 for scope).
-        let downstream_target_ids = if is_input {
-            Vec::new()
-        } else if device.current_targets.is_empty() {
-            device.current_target.clone().into_iter().collect::<Vec<_>>()
-        } else {
-            device.current_targets.clone()
-        };
+        // Only virtual input (mic) devices reach this point (see the gate
+        // above) — `downstream_and_upstream_routes` always returns an empty
+        // upstream list for `is_input`, since device-attached output effects
+        // (the only case that ever populated it) are retired.
+        let (downstream_target_ids, _upstream_sources) =
+            self.downstream_and_upstream_routes(&device, is_input);
         let downstream_targets: Vec<_> = downstream_target_ids
             .iter()
             .filter_map(|id| self.graph.devices.iter().find(|d| &d.id == id).cloned())
             .collect();
 
-        // Output-direction-only: any OTHER virtual output currently chained
-        // into this one (PD-026 — virtual outputs can route into another
-        // virtual output as a submix/bus) must be re-linked after the module
-        // swap too, same as this device's own downstream targets. The swap
-        // destroys and recreates this device's sink node, which silently
-        // severs any raw pw-link an upstream device's monitor already held
-        // into it; nothing about `try_apply_structural` below knows to
-        // restore an *incoming* device-level route on its own, only this
-        // device's own outgoing ones (`downstream_targets`) and its stream
-        // sink-inputs (`held_sink_inputs`).
-        let upstream_sources: Vec<(String, Vec<String>)> = if is_input {
-            Vec::new()
-        } else {
-            self.graph
-                .devices
-                .iter()
-                .filter(|other| other.id != device.id)
-                .filter_map(|other| {
-                    let targets = other.resolved_targets();
-                    targets.contains(&device.id).then(|| (other.id.clone(), targets))
-                })
-                .collect()
-        };
-
         // Input-direction-only: whatever's currently monitor-linked into this
         // device's `input_*` ports (mic-mix feed sinks, or the single feed
         // sink generic routing uses) must be captured *before* the module
-        // swap below — once the device's module is unloaded, `input_*` ports
+        // load below — once the device's module is unloaded, `input_*` ports
         // on this name no longer exist to discover them from.
-        let mic_feeders = if is_input { virtual_mic_mix::list_feeds(&device.system_name, true) } else { Vec::new() };
-
-        // The device may currently be carrying audio (apps actively playing
-        // into it). Rather than refusing to apply effects at all, briefly
-        // hold those streams on a scratch sink for the swap and move them
-        // back once the effects-hosted sink is confirmed up — a short
-        // glitch on the affected streams instead of a hard block.
-        let held_sink_inputs = if is_input {
-            Vec::new()
+        let mic_feeders = if is_input {
+            self.adapter.list_mic_feeds(&device.system_name, true)
         } else {
-            pactl::sink_input_indices_on(&device.system_name)
+            Vec::new()
         };
-        if !held_sink_inputs.is_empty() {
-            pactl::ensure_holding_sink().map_err(|error| EngineError::Adapter(error.to_string()))?;
-            for index in &held_sink_inputs {
-                let _ = pactl::move_sink_input_to_sink_name(*index, pactl::HOLDING_SINK_NAME);
-            }
-        }
 
-        let apply_result =
-            self.try_apply_structural(&device, &conf_path, &rendered, &downstream_targets, &mic_feeders);
+        let held_sink_inputs = self.hold_sink_inputs_for_swap_if_output(&device, is_input)?;
+
+        let apply_result = self
+            .adapter
+            .load_effect_chain(&device, config, &downstream_targets, &mic_feeders)
+            .map(|_playback_name| ());
 
         if let Err(error) = apply_result {
-            let _ = fs::remove_file(&conf_path);
-            let _ = pipewire_restart::restart_filter_chain_service();
-            if is_input {
-                let _ = pactl::create_virtual_source(&device.system_name, &device.label);
-                let _ = virtual_mic_mix::relink_feeds_to(&mic_feeders, &device.system_name, &device.system_name, true);
-            } else {
-                let _ = pactl::create_null_sink(&device.system_name, &device.label);
-                let _ = crate::core::routing::apply_sink_targets(&self.graph, &device.id, &downstream_target_ids);
-                for (upstream_id, upstream_targets) in &upstream_sources {
-                    let _ = crate::core::routing::apply_sink_targets(&self.graph, upstream_id, upstream_targets);
-                }
-            }
-            for index in &held_sink_inputs {
-                let _ = pactl::move_sink_input_to_sink_name(*index, &device.system_name);
-            }
-            let _ = pactl::remove_holding_sink();
+            let _ = self.adapter.unload_effect_chain(&device.system_name);
+            // Only virtual input (mic) devices reach this point — device-
+            // attached output effects were retired with VirtualRole::Bus
+            // (see the gate above), so `downstream_target_ids`/
+            // `upstream_sources` are always empty here and this is always
+            // the input branch.
+            debug_assert!(is_input);
+            let _ = self.adapter.revert_to_plain_device(&device, false);
+            let _ = self.adapter.relink_mic_feeds(
+                &mic_feeders,
+                &device.system_name,
+                &device.system_name,
+                true,
+            );
+            let _ = self
+                .adapter
+                .release_held_sink_inputs(&held_sink_inputs, &device.system_name);
             let _ = self.refresh_graph();
             return Err(EngineError::Adapter(format!(
                 "effects apply failed and was rolled back to no effects: {error}"
             )));
         }
 
-        for (upstream_id, upstream_targets) in &upstream_sources {
-            let _ = crate::core::routing::apply_sink_targets(&self.graph, upstream_id, upstream_targets);
-        }
+        let _ = self
+            .adapter
+            .release_held_sink_inputs(&held_sink_inputs, &device.system_name);
 
-        for index in &held_sink_inputs {
-            let _ = pactl::move_sink_input_to_sink_name(*index, &device.system_name);
-        }
-        let _ = pactl::remove_holding_sink();
-
+        // Persist `live: true` — PD-017 §1's signal that this chain was
+        // explicitly confirmed live (see the field doc on
+        // `EffectChainConfig::live`), not just configured.
+        let mut persisted_config = config.clone();
+        persisted_config.live = true;
         ConfigStore::new()
-            .set_effect_chain(device_id, config)
+            .set_effect_chain(device_id, &persisted_config)
             .map_err(|error| EngineError::Config(error.to_string()))?;
 
         self.refresh_graph()?;
@@ -377,8 +322,7 @@ impl CoreEngine {
             .cloned()
             .ok_or_else(|| EngineError::NotFound(format!("device not found: {device_id}")))?;
 
-        let capabilities = fx_capability::probe_capabilities();
-        let preflight = fx_validate::preflight(config, &capabilities);
+        let preflight = self.adapter.preflight_effect_chain(config);
         if !preflight.ok {
             return Ok(ApplyResult {
                 success: false,
@@ -386,7 +330,9 @@ impl CoreEngine {
             });
         }
 
-        let Some(node_id) = pw_cli::find_node_id_by_name(&device.system_name)
+        let Some(node_id) = self
+            .adapter
+            .find_live_node_id(&device.system_name)
             .map_err(|error| EngineError::Adapter(error.to_string()))?
         else {
             return Ok(ApplyResult {
@@ -395,11 +341,18 @@ impl CoreEngine {
             });
         };
 
-        pw_cli::set_params(node_id, &fx_validate::live_params(config))
+        self.adapter
+            .push_effect_chain_live_params(&device.system_name, node_id, config)
             .map_err(|error| EngineError::Adapter(error.to_string()))?;
 
+        // A node was already resolvable above, so this chain is already
+        // live — preserve that regardless of what the caller's `config`
+        // says (the frontend doesn't track this Rust-only bookkeeping flag,
+        // so a naive persist here would silently reset it to `false`).
+        let mut persisted_config = config.clone();
+        persisted_config.live = true;
         ConfigStore::new()
-            .set_effect_chain(device_id, config)
+            .set_effect_chain(device_id, &persisted_config)
             .map_err(|error| EngineError::Config(error.to_string()))?;
 
         Ok(ApplyResult {
@@ -411,14 +364,10 @@ impl CoreEngine {
     /// Reverts a device from an effects-hosted sink back to the plain
     /// pactl null-sink, re-linking whatever it was routed to. Used both for
     /// "remove effects" and as the rollback path when a Structural Apply fails.
-    pub fn remove_effect_chain_structural(&mut self, device_id: &str) -> Result<ApplyResult, EngineError> {
-        if self.graph.data_source == "mock" {
-            return Ok(ApplyResult {
-                success: true,
-                message: Some("effects removed (mock)".to_string()),
-            });
-        }
-
+    pub fn remove_effect_chain_structural(
+        &mut self,
+        device_id: &str,
+    ) -> Result<ApplyResult, EngineError> {
         let device = self
             .graph
             .devices
@@ -427,10 +376,7 @@ impl CoreEngine {
             .cloned()
             .ok_or_else(|| EngineError::NotFound(format!("device not found: {device_id}")))?;
 
-        let conf_path = filter_chain::conf_path_for_device(&device.system_name)
-            .ok_or_else(|| EngineError::Adapter("could not resolve HOME for effects config".to_string()))?;
-
-        if !conf_path.is_file() {
+        if !self.adapter.is_effect_chain_loaded(&device.system_name) {
             return Ok(ApplyResult {
                 success: true,
                 message: Some("no live effects to remove".to_string()),
@@ -439,79 +385,68 @@ impl CoreEngine {
 
         let is_input = device.direction == DeviceDirection::Input;
 
-        let downstream_target_ids = if is_input {
-            Vec::new()
-        } else if device.current_targets.is_empty() {
-            device.current_target.clone().into_iter().collect::<Vec<_>>()
-        } else {
-            device.current_targets.clone()
-        };
+        let (downstream_target_ids, upstream_sources) =
+            self.downstream_and_upstream_routes(&device, is_input);
 
-        let held_sink_inputs = if is_input {
-            Vec::new()
-        } else {
-            pactl::sink_input_indices_on(&device.system_name)
-        };
-        if !held_sink_inputs.is_empty() {
-            pactl::ensure_holding_sink().map_err(|error| EngineError::Adapter(error.to_string()))?;
-            for index in &held_sink_inputs {
-                let _ = pactl::move_sink_input_to_sink_name(*index, pactl::HOLDING_SINK_NAME);
-            }
-        }
+        let held_sink_inputs = self.hold_sink_inputs_for_swap_if_output(&device, is_input)?;
 
         // Capture whatever's currently feeding the live effects inlet before
         // tearing it down (input-direction only) — same "must discover
         // before the swap" reasoning as `apply_effect_chain_structural`.
         let mic_feeders = if is_input {
-            virtual_mic_mix::list_feeds(&filter_chain::effect_input_name_for_device(&device.system_name), false)
+            self.adapter
+                .list_mic_feeds(&effect_input_name_for_device(&device.system_name), false)
         } else {
             Vec::new()
         };
 
-        fs::remove_file(&conf_path)
-            .map_err(|error| EngineError::Adapter(format!("failed to remove effects config: {error}")))?;
-        pipewire_restart::restart_filter_chain_service()
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
-
-        if is_input {
-            pactl::create_virtual_source(&device.system_name, &device.label)
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
-            // The recreated source isn't necessarily queryable the instant
-            // `pactl load-module` returns — without this wait, the mic-feed
-            // relink below could silently fail against a not-yet-registered
-            // node (no error surfaced, since relinking uses port discovery
-            // that just finds nothing yet), leaving the mic mix broken.
-            filter_chain::wait_for_source(&device.system_name, Duration::from_secs(5))
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
-        } else {
-            pactl::create_null_sink(&device.system_name, &device.label)
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
-            // Same reasoning as above, for the sink-input move-back: without
-            // waiting for the recreated sink to actually register, moving
-            // held streams off the holding sink can silently fail, leaving
-            // audio stuck there indefinitely with no error surfaced.
-            filter_chain::wait_for_sink(&device.system_name, Duration::from_secs(5))
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
+        // Both of these can fail (an unreachable native-effects daemon, a
+        // slow-to-reappear plain sink) — unlike `apply_effect_chain_structural`'s
+        // matching rollback branch, an early `?` return here would skip
+        // `release_held_sink_inputs` entirely, permanently stranding whatever
+        // was playing into this device on the `Pipe Deck (temporary hold)`
+        // sink with no visible downstream connection. Always release before
+        // propagating either error, exactly like apply's failure path does.
+        if let Err(error) = self.discard_effect_chain_conf(&device.system_name) {
+            let _ = self
+                .adapter
+                .release_held_sink_inputs(&held_sink_inputs, &device.system_name);
+            return Err(error);
+        }
+        if let Err(error) = self.adapter.revert_to_plain_device(&device, true) {
+            let _ = self
+                .adapter
+                .release_held_sink_inputs(&held_sink_inputs, &device.system_name);
+            return Err(EngineError::Adapter(error.to_string()));
         }
 
-        for index in &held_sink_inputs {
-            let _ = pactl::move_sink_input_to_sink_name(*index, &device.system_name);
-        }
-        let _ = pactl::remove_holding_sink();
+        let _ = self
+            .adapter
+            .release_held_sink_inputs(&held_sink_inputs, &device.system_name);
 
         self.refresh_graph()?;
         if is_input {
-            virtual_mic_mix::relink_feeds_to(
-                &mic_feeders,
-                &filter_chain::effect_input_name_for_device(&device.system_name),
-                &device.system_name,
-                true,
-            )
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
-        } else {
-            crate::core::routing::apply_sink_targets(&self.graph, &device.id, &downstream_target_ids)
-                .map_err(|error| EngineError::Routing(error.to_string()))?;
+            self.adapter
+                .relink_mic_feeds(
+                    &mic_feeders,
+                    &effect_input_name_for_device(&device.system_name),
+                    &device.system_name,
+                    true,
+                )
+                .map_err(|error| EngineError::Adapter(error.to_string()))?;
         }
+        // The output-direction branch that used to re-link
+        // `downstream_target_ids`/`upstream_sources` via
+        // `core::routing::apply_sink_targets` is gone along with
+        // device-attached output effects (VirtualRole::Bus retirement) — a
+        // pre-existing output device with a live legacy effect chain still
+        // has its effects removed above (`revert_to_plain_device`), it just
+        // won't be automatically re-linked to whatever it used to route to.
+        // New effect chains can only ever be attached to virtual input
+        // devices (see the gate in `apply_effect_chain_structural`), so
+        // `downstream_target_ids`/`upstream_sources` are always empty for
+        // any chain created after this change.
+        let _ = (&downstream_target_ids, &upstream_sources);
 
         ConfigStore::new()
             .remove_effect_chain(device_id)
@@ -524,80 +459,93 @@ impl CoreEngine {
         })
     }
 
-    fn try_apply_structural(
+    /// Output-direction-only routing state a structural swap (apply or
+    /// remove) needs captured *before* touching the device's module, shared
+    /// verbatim by `apply_effect_chain_structural` and
+    /// `remove_effect_chain_structural`:
+    ///
+    /// - `downstream_target_ids`: what the device currently routes to.
+    /// - `upstream_sources`: any OTHER virtual output currently chained into
+    ///   this one (PD-026 — bus-into-bus). The module load/revert destroys
+    ///   and recreates this device's sink node, which silently severs any
+    ///   raw pw-link an upstream device's monitor already held into it —
+    ///   nothing about the swap itself knows to restore an *incoming*
+    ///   device-level route, only this device's own outgoing one, so it has
+    ///   to be discovered up front and re-applied after.
+    ///
+    /// Neither concept applies to a virtual input/mic device — it has no
+    /// downstream routing targets of its own, and nothing else can be
+    /// "chained into" a mic — so both come back empty for `is_input`.
+    fn downstream_and_upstream_routes(
         &self,
         device: &crate::core::models::Device,
-        conf_path: &std::path::Path,
-        rendered: &str,
-        downstream_targets: &[crate::core::models::Device],
-        mic_feeders: &[String],
-    ) -> Result<(), EngineError> {
-        if let Some(dir) = filter_chain::filter_chain_conf_dir() {
-            fs::create_dir_all(&dir)
-                .map_err(|error| EngineError::Adapter(format!("failed to create effects config dir: {error}")))?;
+        is_input: bool,
+    ) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+        let downstream_target_ids = if is_input {
+            Vec::new()
+        } else if device.current_targets.is_empty() {
+            device
+                .current_target
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            device.current_targets.clone()
+        };
+
+        let upstream_sources: Vec<(String, Vec<String>)> = if is_input {
+            Vec::new()
+        } else {
+            self.graph
+                .devices
+                .iter()
+                .filter(|other| other.id != device.id)
+                .filter_map(|other| {
+                    let targets = other.resolved_targets();
+                    targets
+                        .contains(&device.id)
+                        .then(|| (other.id.clone(), targets))
+                })
+                .collect()
+        };
+
+        (downstream_target_ids, upstream_sources)
+    }
+
+    /// The device may currently be carrying audio (apps actively playing
+    /// into it, output-direction only — a source's "in use" means
+    /// source-outputs, which a structural swap doesn't attempt to
+    /// hold/restore, see PD-024 for scope). Rather than refusing to swap at
+    /// all, briefly hold those streams on a scratch sink so the caller can
+    /// move them back once the swapped-to sink is confirmed up. Shared by
+    /// `apply_effect_chain_structural` and `remove_effect_chain_structural`.
+    fn hold_sink_inputs_for_swap_if_output(
+        &self,
+        device: &crate::core::models::Device,
+        is_input: bool,
+    ) -> Result<Vec<String>, EngineError> {
+        if is_input {
+            return Ok(Vec::new());
         }
+        self.adapter
+            .hold_sink_inputs_for_swap(&device.system_name)
+            .map_err(|error| EngineError::Adapter(error.to_string()))
+    }
 
-        if let Some(module_id) = pactl::find_module_id_by_sink_name(&device.system_name)
-            .map_err(|error| EngineError::Adapter(error.to_string()))?
-        {
-            pactl::unload_module(&module_id).map_err(|error| EngineError::Adapter(error.to_string()))?;
-        }
-
-        fs::write(conf_path, rendered)
-            .map_err(|error| EngineError::Adapter(format!("failed to write effects config: {error}")))?;
-
-        pipewire_restart::restart_filter_chain_service()
+    /// Unloads `system_name`'s live effects chain, if one is loaded.
+    /// Best-effort/no-op if nothing is loaded. Shared by
+    /// `remove_effect_chain_structural` (primary operation, propagates
+    /// failures via `?`) and `virtual_ops::remove_virtual_device`
+    /// (best-effort cleanup ahead of destroying the device outright, which
+    /// swallows this call's `Err` — the device being deleted regardless is
+    /// not itself a reason to abort). Returns whether a chain was actually
+    /// live.
+    pub(super) fn discard_effect_chain_conf(&self, system_name: &str) -> Result<bool, EngineError> {
+        let was_live = self.adapter.is_effect_chain_loaded(system_name);
+        self.adapter
+            .unload_effect_chain(system_name)
             .map_err(|error| EngineError::Adapter(error.to_string()))?;
-
-        if device.direction == DeviceDirection::Input {
-            filter_chain::wait_for_source(&device.system_name, Duration::from_secs(5))
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
-            filter_chain::wait_for_effect_input_ports(&device.system_name, Duration::from_secs(5))
-                .map_err(|error| EngineError::Adapter(error.to_string()))?;
-
-            let effect_input_name = filter_chain::effect_input_name_for_device(&device.system_name);
-            virtual_mic_mix::relink_feeds_to(mic_feeders, &device.system_name, &effect_input_name, false).map_err(
-                |error| {
-                    EngineError::Adapter(format!(
-                        "effects source came up but its mic-mix feeds could not be re-linked: {error}"
-                    ))
-                },
-            )?;
-
-            return Ok(());
-        }
-
-        filter_chain::wait_for_sink(&device.system_name, Duration::from_secs(5))
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
-        filter_chain::wait_for_effect_output_ports(&device.system_name, Duration::from_secs(5))
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
-
-        let effect_output_name = filter_chain::effect_output_name_for_device(&device.system_name);
-        let mut allowed_targets = std::collections::HashSet::new();
-        for target in downstream_targets {
-            let is_virtual_input = target.kind == DeviceKind::Virtual && target.direction == DeviceDirection::Input;
-            let result = if is_virtual_input {
-                pw_link::link_capture_source_to_virtual_input(&effect_output_name, &target.system_name)
-            } else {
-                pw_link::link_capture_source_to_sink(&effect_output_name, &target.system_name)
-            };
-            result.map_err(|error| EngineError::Adapter(format!(
-                "effects sink came up but could not be re-linked to {}: {error}",
-                target.label
-            )))?;
-            allowed_targets.insert(target.system_name.clone());
-        }
-        // A prior Structural Apply's downstream targets may no longer match
-        // this one (a target was removed from the bus, or was only ever
-        // there because of the mis-tracked-device bug this device may be
-        // recovering from — see the registry backfill in
-        // `virtual_devices.rs::discover_from_pactl`) — without this, a link
-        // to a target that's no longer wanted stays live forever, since
-        // node identity persisting across a Structural Apply (PD-020) means
-        // nothing else ever tears it down.
-        let _ = crate::backend::linux::split_sink::prune_stale_fan_out_links(&effect_output_name, &allowed_targets);
-
-        Ok(())
+        Ok(was_live)
     }
 
     pub fn restore_effect_chains(&mut self) -> Result<(), EngineError> {
@@ -611,28 +559,27 @@ impl CoreEngine {
             .map_err(|error| EngineError::Config(error.to_string()))?;
         let active = self.active_effect_chains(&chains);
         self.reapply_previously_live_effect_chains(&active);
-        let _ = filter_chain::sync_all_effects(&active, &[])
-            .map_err(|error| EngineError::Adapter(error.to_string()))?;
 
         Ok(())
     }
 
-    /// Re-establishes live processing (Structural Apply) for any device that
-    /// already has a live conf file on disk from before — that file is the
-    /// signal the user had previously confirmed "Enable live effects" for
-    /// this device, so silently restoring it on app-boot/profile-swap restore
-    /// isn't turning on live processing that was never explicitly approved
-    /// (PD-017 §1). A chain that's configured but was never applied stays
-    /// persist-only, same as before this existed. `apply_effect_chain_structural`
-    /// is already idempotent (no-ops without a restart if the rendered conf
-    /// is unchanged), so this is safe to call on every restore/swap. Each
+    /// Re-establishes live processing (Structural Apply) for any device
+    /// whose persisted chain has `live: true` — the signal the user had
+    /// previously confirmed live processing for this device, so silently
+    /// restoring it on app-boot/profile-swap restore isn't turning on live
+    /// processing that was never explicitly approved (PD-017 §1). A chain
+    /// that's configured but was never applied stays persist-only, same as
+    /// before this existed. Skips anything the daemon already reports as
+    /// loaded (e.g. `daemon::reconcile_live_effects_state` already reloaded
+    /// it after a crash/restart) rather than reloading it redundantly. Each
     /// device is independent — one failing must not block the rest of
     /// restore, per #20's acceptance criteria.
-    pub(super) fn reapply_previously_live_effect_chains(&mut self, active: &[(String, EffectChainConfig)]) {
+    pub(super) fn reapply_previously_live_effect_chains(
+        &mut self,
+        active: &[(String, EffectChainConfig)],
+    ) {
         for (system_name, config) in active {
-            let was_live = filter_chain::conf_path_for_device(system_name)
-                .is_some_and(|path| path.is_file());
-            if !was_live {
+            if !config.live || self.adapter.is_effect_chain_loaded(system_name) {
                 continue;
             }
             let Some(device_id) = self
@@ -646,6 +593,92 @@ impl CoreEngine {
             };
             let _ = self.apply_effect_chain_structural(&device_id, config);
         }
+    }
+
+    /// Repairs the routing gap left by `daemon::reconcile_live_effects_state`
+    /// (issue #206): after a native-effects daemon crash/restart, that
+    /// function reloads persisted-active chains and restores audio
+    /// processing immediately, but deliberately leaves downstream routing
+    /// (fan-out targets) for it to re-derive elsewhere. There's no
+    /// daemon->GUI push channel to react to that reload directly (the IPC
+    /// socket is request/response only) — so instead this diffs "was each
+    /// active chain's node live as of the last graph refresh" against "is
+    /// it live now", using the GUI's own independent live PipeWire
+    /// subscription, and re-applies the last-known targets the moment a
+    /// chain flips from absent to live again. Called on every graph
+    /// refresh; a no-op whenever nothing has actually transitioned.
+    pub(super) fn reconcile_effect_chain_liveness_after_refresh(&mut self) {
+        if self.graph.data_source == "mock" {
+            return;
+        }
+        let Ok(chains) = ConfigStore::new().effect_chains() else {
+            return;
+        };
+        let active = self.active_effect_chains(&chains);
+
+        for (system_name, _config) in &active {
+            let is_live = self.adapter.is_effect_chain_loaded(system_name);
+            self.reconcile_one_effect_chain_liveness(system_name, is_live);
+        }
+
+        // Drop bookkeeping for chains no longer active, so it doesn't grow
+        // unbounded and doesn't resurrect stale targets if a system_name is
+        // ever reused by a different device later.
+        let active_names: std::collections::HashSet<&String> =
+            active.iter().map(|(name, _)| name).collect();
+        self.effect_chain_liveness
+            .retain(|name, _| active_names.contains(name));
+        let active_ids: std::collections::HashSet<String> = self
+            .graph
+            .devices
+            .iter()
+            .filter(|device| active_names.contains(&device.system_name))
+            .map(|device| device.id.clone())
+            .collect();
+        self.effect_chain_last_targets
+            .retain(|id, _| active_ids.contains(id));
+    }
+
+    /// Split out from `reconcile_effect_chain_liveness_after_refresh` so the
+    /// transition logic is unit-testable with an explicit `is_live` instead
+    /// of requiring a real native-effects PipeWire session.
+    fn reconcile_one_effect_chain_liveness(&mut self, system_name: &str, is_live: bool) {
+        let Some(device) = self
+            .graph
+            .devices
+            .iter()
+            .find(|device| device.system_name == system_name)
+            .cloned()
+        else {
+            return;
+        };
+        // v1 scope: output fan-out only. Mic-mix feeder recovery for input
+        // devices is a real gap too, but needs its own capture-before-swap
+        // treatment (see `apply_effect_chain_structural`'s `mic_feeders`)
+        // rather than reusing this output-shaped diff — left for follow-up.
+        if device.direction != DeviceDirection::Output {
+            return;
+        }
+
+        let current_targets: Vec<String> = if !device.current_targets.is_empty() {
+            device.current_targets.clone()
+        } else {
+            device.current_target.clone().into_iter().collect()
+        };
+        if is_live && !current_targets.is_empty() {
+            self.effect_chain_last_targets
+                .insert(device.id.clone(), current_targets);
+        }
+
+        // Re-linking a reappeared chain's last-known downstream targets used
+        // `core::routing::apply_sink_targets`, retired along with
+        // device-attached output effects (VirtualRole::Bus). Only a
+        // pre-existing legacy output effect chain can still reach this
+        // method at all (see the `direction != Output` early return above);
+        // it no longer gets automatically re-linked on reappear.
+
+        self.effect_chain_liveness
+            .insert(system_name.to_string(), is_live);
     }
 
     pub(super) fn active_effect_chains(
@@ -664,7 +697,7 @@ impl CoreEngine {
                     .iter()
                     .find(|device| device.id == *device_id)
                     .map(|device| device.system_name.clone())?;
-                if !filter_chain::is_pipe_deck_device(&system_name) {
+                if !is_pipe_deck_device(&system_name) {
                     return None;
                 }
                 Some((system_name, config.clone()))
@@ -731,142 +764,14 @@ mod live_tests {
         remove_result.expect("remove_effect_chain_structural should revert cleanly");
     }
 
-    /// Regression for the exact live-session bug report behind PD-026's
-    /// follow-up fixes: bus A fans out to a physical output directly *and*
-    /// to bus B; bus B carries a live effect chain and routes to a second
-    /// physical output. Adjusting/reapplying B's effects must never make A's
-    /// direct physical-output leg carry the processed signal (the old
-    /// `try_apply_structural` downstream-relink bug), and B's own fan-out
-    /// must go out through `effect_output.*`, never B's raw monitor in
-    /// addition to it (the old `split_sink` effects-unaware fan-out bug) —
-    /// otherwise the physical target ends up hearing raw+processed audio
-    /// mixed together, or the effect audibly "leaks" onto an unrelated leg.
-    #[test]
-    #[ignore]
-    fn effects_on_a_chained_bus_do_not_leak_onto_an_unrelated_fan_out_leg() {
-        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
-
-        let mut engine = CoreEngine::new();
-        engine.refresh_graph().expect("initial graph refresh");
-
-        let physical_outputs: Vec<_> = engine
-            .runtime_graph()
-            .devices
-            .iter()
-            .filter(|d| d.kind == DeviceKind::Physical && d.direction == DeviceDirection::Output)
-            .map(|d| (d.id.clone(), d.system_name.clone()))
-            .collect();
-        assert!(
-            physical_outputs.len() >= 2,
-            "this live test needs at least two real physical outputs to exercise the chained fan-out; found {}",
-            physical_outputs.len()
-        );
-        let (leg_a_target_id, leg_a_target_name) = physical_outputs[0].clone();
-        let (leg_b_target_id, leg_b_target_name) = physical_outputs[1].clone();
-
-        let bus_a = engine.create_virtual_output("Pipe Deck Live Chain Test A").expect("create bus A");
-        let bus_b = engine.create_virtual_output("Pipe Deck Live Chain Test B").expect("create bus B");
-
-        let cleanup = |engine: &mut CoreEngine| {
-            let _ = engine.remove_virtual_device(&bus_a.system_name);
-            let _ = engine.remove_virtual_device(&bus_b.system_name);
-        };
-
-        // A fans out directly to physical leg A *and* into bus B.
-        match engine.set_device_targets(&bus_a.device_id, &[leg_a_target_id.clone(), bus_b.device_id.clone()]) {
-            Ok(result) if result.success => {}
-            other => {
-                cleanup(&mut engine);
-                panic!("failed to fan bus A out to leg A + bus B: {other:?}");
-            }
-        }
-        // B routes onward to physical leg B.
-        match engine.set_device_route(&bus_b.device_id, &leg_b_target_id) {
-            Ok(result) if result.success => {}
-            other => {
-                cleanup(&mut engine);
-                panic!("failed to route bus B to leg B: {other:?}");
-            }
-        }
-
-        let config = EffectChainConfig {
-            stages: vec![crate::core::models::EffectStage::Eq5Band {
-                id: "eq".to_string(),
-                eq_bass: 6,
-                eq_sub: 0,
-                eq_mid: 0,
-                eq_treble: 0,
-                eq_air: 0,
-                output_gain: 0,
-            }],
-            ..Default::default()
-        };
-        if let Err(error) = engine.apply_effect_chain_structural(&bus_b.device_id, &config) {
-            cleanup(&mut engine);
-            panic!("structural apply on bus B failed: {error}");
-        }
-
-        // Regression for the Routing graph's "no arrow drawn to an
-        // effects-active node's target, even though the audio is genuinely
-        // connected" bug: current_target/current_targets is what the
-        // frontend draws edges from, and it used to get rediscovered purely
-        // from bus B's own raw monitor on every live refresh — which,
-        // correctly, carries nothing once effects are live — silently
-        // wiping the field back to empty on every single refresh even
-        // though bus B was still really routed via effect_output.*. Refresh
-        // several times in a row and confirm it stays populated instead of
-        // flickering/collapsing to None.
-        for _ in 0..3 {
-            engine.refresh_graph().expect("repeated refresh should succeed");
-            let current_target = engine
-                .runtime_graph()
-                .devices
-                .iter()
-                .find(|d| d.id == bus_b.device_id)
-                .expect("bus B should still be present in the graph")
-                .current_target
-                .clone();
-            if current_target.as_deref() != Some(leg_b_target_id.as_str()) {
-                cleanup(&mut engine);
-                panic!(
-                    "bus B's current_target should survive a live refresh while effects are active; got {current_target:?}"
-                );
-            }
-        }
-
-        let effect_output_name = filter_chain::effect_output_name_for_device(&bus_b.system_name);
-        let effect_output_targets: std::collections::HashSet<_> =
-            pw_link::list_all_monitor_routes_for_source(&effect_output_name).into_iter().collect();
-        let bus_b_raw_targets: std::collections::HashSet<_> =
-            pw_link::list_all_monitor_routes_for_source(&bus_b.system_name).into_iter().collect();
-        let bus_a_targets: std::collections::HashSet<_> =
-            pw_link::list_all_monitor_routes_for_source(&bus_a.system_name).into_iter().collect();
-
-        cleanup(&mut engine);
-
-        assert!(
-            effect_output_targets.contains(&leg_b_target_name),
-            "bus B's processed output should feed leg B; got {effect_output_targets:?}"
-        );
-        assert!(
-            bus_b_raw_targets.is_empty(),
-            "bus B's raw (pre-effect) monitor must not be linked to anything once effects are live \
-             — the target would hear the unprocessed signal mixed in with the processed one; \
-             found {bus_b_raw_targets:?}"
-        );
-        assert!(
-            !bus_a_targets.contains(&effect_output_name) && !effect_output_targets.contains(&leg_a_target_name),
-            "bus A's own direct fan-out leg to leg A must never end up carrying bus B's processed \
-             signal — bus A targets: {bus_a_targets:?}, effect_output targets: {effect_output_targets:?}"
-        );
-    }
-
     /// PD-024: the same round trip as
     /// `apply_effect_chain_structural_round_trips_on_a_real_pipewire_session`,
     /// but for a virtual **input** (mic) device — confirms the capture-
     /// direction template actually swaps in, that the device still reports
     /// as `Audio/Source/Virtual` (not silently reverted to a plain sink),
-    /// and that its mic-mix feed survives both the apply and the removal.
+    /// and that its Mixer Node feed (PD-032's replacement for the old
+    /// mic-mix mechanism this test used to set up directly) survives both
+    /// the apply and the removal.
     #[test]
     #[ignore]
     fn apply_effect_chain_structural_round_trips_on_a_virtual_input() {
@@ -882,20 +787,40 @@ mod live_tests {
             .create_virtual_output("Pipe Deck Live Input Test Source")
             .expect("create disposable test mix source");
 
-        let cleanup = |engine: &mut CoreEngine| {
+        let cleanup = |engine: &mut CoreEngine, mixer_id: Option<&str>| {
+            if let Some(id) = mixer_id {
+                let _ = engine.remove_processing_node(id);
+            }
             let _ = engine.remove_virtual_device(&mic.system_name);
             let _ = engine.remove_virtual_device(&source.system_name);
         };
 
         let device_id = mic.device_id.clone();
-        let mix_sources = vec![crate::core::models::MixSource {
-            device_id: source.device_id.clone(),
-            volume_percent: 100,
-            muted: false,
-        }];
-        if let Err(error) = engine.set_virtual_mic_mix(&device_id, &mix_sources) {
-            cleanup(&mut engine);
-            panic!("failed to set up mic mix before testing effects: {error}");
+        let mixer = match engine.create_processing_node(
+            "Pipe Deck Live Input Test Mixer",
+            crate::core::models::ProcessingNodeSpecKind::Mixer,
+        ) {
+            Ok(node) => node,
+            Err(error) => {
+                cleanup(&mut engine, None);
+                panic!("failed to create mixer node before testing effects: {error}");
+            }
+        };
+        if let Err(error) = engine.connect_processing_node_port(
+            &mixer.id,
+            crate::core::models::PortDirection::Input,
+            &source.device_id,
+        ) {
+            cleanup(&mut engine, Some(&mixer.id));
+            panic!("failed to connect mixer input before testing effects: {error}");
+        }
+        if let Err(error) = engine.connect_processing_node_port(
+            &mixer.id,
+            crate::core::models::PortDirection::Output,
+            &device_id,
+        ) {
+            cleanup(&mut engine, Some(&mixer.id));
+            panic!("failed to connect mixer output before testing effects: {error}");
         }
 
         let config = EffectChainConfig {
@@ -913,8 +838,90 @@ mod live_tests {
 
         let apply_result = engine.apply_effect_chain_structural(&device_id, &config);
         if let Err(error) = &apply_result {
-            cleanup(&mut engine);
+            cleanup(&mut engine, Some(&mixer.id));
             panic!("structural apply failed: {error}");
+        }
+
+        let source_live = pactl::source_exists(&mic.system_name).unwrap_or(false);
+        if !source_live {
+            cleanup(&mut engine, Some(&mixer.id));
+            panic!("effects source did not appear as Audio/Source/Virtual after structural apply");
+        }
+
+        let feeders_after_apply =
+            pw_link::list_capture_sources_for_sink(&effect_input_name_for_device(&mic.system_name));
+        if !feeders_after_apply
+            .iter()
+            .any(|name| name == &mixer.system_name)
+        {
+            cleanup(&mut engine, Some(&mixer.id));
+            panic!("mixer feed did not survive the structural apply: {feeders_after_apply:?}");
+        }
+
+        let remove_result = engine.remove_effect_chain_structural(&device_id);
+        if let Err(error) = &remove_result {
+            cleanup(&mut engine, Some(&mixer.id));
+            panic!("remove_effect_chain_structural failed: {error}");
+        }
+
+        let feeders_after_remove =
+            pw_link::list_capture_sources_for_virtual_input(&mic.system_name);
+        cleanup(&mut engine, Some(&mixer.id));
+        assert!(
+            feeders_after_remove
+                .iter()
+                .any(|name| name == &mixer.system_name),
+            "mixer feed did not survive removal: {feeders_after_remove:?}"
+        );
+    }
+
+    /// Isolates issue #74's portable-DSP dispatch (`backend::linux::live`'s
+    /// `native_dsp_host::supports(config)` branch, wired through
+    /// `daemon::ipc`) from the *pre-existing, unrelated* mic-feeder-relink
+    /// bug that `apply_effect_chain_structural_round_trips_on_a_virtual_input`
+    /// also hits (confirmed: it fails identically with the portable dispatch
+    /// forced off, i.e. on the original builtin-module path too — not
+    /// something this issue introduced, not fixed here, out of scope for
+    /// #74). No mixer/feeders are connected here, so
+    /// `apply_effect_chain_structural`'s `relink_mic_feeds` call has nothing
+    /// to relink and that bug never triggers — this test exercises
+    /// everything else end to end: real `CoreEngine` → `effects_ops` →
+    /// `AudioBackend::load_effect_chain` → real daemon IPC →
+    /// `native_dsp_host`, confirming the device still reports as
+    /// `Audio/Source/Virtual` after apply and reverts cleanly on remove.
+    #[test]
+    #[ignore]
+    fn portable_dsp_dispatch_round_trips_an_eq5band_chain_with_no_mic_feeders() {
+        assert_ne!(std::env::var("PIPE_DECK_USE_MOCK").as_deref(), Ok("1"));
+
+        let mut engine = CoreEngine::new();
+        engine.refresh_graph().expect("initial graph refresh");
+
+        let mic = engine
+            .create_virtual_input("Pipe Deck Portable DSP Dispatch Test")
+            .expect("create disposable test mic");
+        let cleanup = |engine: &mut CoreEngine| {
+            let _ = engine.remove_virtual_device(&mic.system_name);
+        };
+
+        let device_id = mic.device_id.clone();
+        let config = EffectChainConfig {
+            stages: vec![crate::core::models::EffectStage::Eq5Band {
+                id: "eq".to_string(),
+                eq_bass: 6,
+                eq_sub: 0,
+                eq_mid: 0,
+                eq_treble: 0,
+                eq_air: 0,
+                output_gain: 0,
+            }],
+            ..Default::default()
+        };
+
+        let apply_result = engine.apply_effect_chain_structural(&device_id, &config);
+        if let Err(error) = &apply_result {
+            cleanup(&mut engine);
+            panic!("structural apply via the portable-DSP dispatch failed: {error}");
         }
 
         let source_live = pactl::source_exists(&mic.system_name).unwrap_or(false);
@@ -922,27 +929,14 @@ mod live_tests {
             cleanup(&mut engine);
             panic!("effects source did not appear as Audio/Source/Virtual after structural apply");
         }
-
-        let feeders_after_apply = pw_link::list_capture_sources_for_sink(&filter_chain::effect_input_name_for_device(
-            &mic.system_name,
-        ));
-        if !feeders_after_apply.iter().any(|name| name == &source.system_name) {
+        if !engine.is_effect_chain_live(&device_id) {
             cleanup(&mut engine);
-            panic!("mic-mix feed did not survive the structural apply: {feeders_after_apply:?}");
+            panic!("device does not report as having a live effect chain after apply");
         }
 
         let remove_result = engine.remove_effect_chain_structural(&device_id);
-        if let Err(error) = &remove_result {
-            cleanup(&mut engine);
-            panic!("remove_effect_chain_structural failed: {error}");
-        }
-
-        let feeders_after_remove = pw_link::list_capture_sources_for_virtual_input(&mic.system_name);
         cleanup(&mut engine);
-        assert!(
-            feeders_after_remove.iter().any(|name| name == &source.system_name),
-            "mic-mix feed did not survive removal: {feeders_after_remove:?}"
-        );
+        remove_result.expect("remove_effect_chain_structural should revert cleanly");
     }
 
     #[test]
@@ -1028,7 +1022,9 @@ mod live_tests {
             panic!("live param update failed: {error}");
         }
 
-        let node_id = pw_cli::find_node_id_by_name(&created.system_name).ok().flatten();
+        let node_id = crate::pipewire::pw_cli::find_node_id_by_name(&created.system_name)
+            .ok()
+            .flatten();
         let live_value = node_id.and_then(|id| {
             let output = std::process::Command::new("pw-cli")
                 .args(["enum-params", &id.to_string(), "Props"])

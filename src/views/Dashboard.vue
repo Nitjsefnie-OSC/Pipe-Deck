@@ -7,8 +7,12 @@ import { navigateKey } from "../composables/navigation";
 import { useAppConfig, useRuntimeGraph } from "../stores/runtimeGraph";
 import { useRuleDraft } from "../stores/ruleDraft";
 import { filterRuntimeGraph } from "../utils/filterGraph";
-import { deviceColumn } from "../utils/routingLayout";
-import { filterRecentlySeen, recentEntryAgo, recentEntryLabel } from "../utils/recentStreams";
+import { deviceColumn, isBluetoothDevice } from "../utils/routingLayout";
+import {
+  filterRecentlySeen,
+  recentEntryAgo,
+  recentEntryLabel,
+} from "../utils/recentStreams";
 import type { Device, RecentStreamIdentity } from "../types/graph";
 
 const { graph, loading, error, refresh } = useRuntimeGraph();
@@ -16,7 +20,9 @@ const { config } = useAppConfig();
 const { requestRuleForIdentity } = useRuleDraft();
 const navigate = inject(navigateKey);
 
-const recentlySeenEntries = computed(() => filterRecentlySeen(graph.value.recent_stream_identities));
+const recentlySeenEntries = computed(() =>
+  filterRecentlySeen(graph.value.recent_stream_identities),
+);
 
 function createRuleForIdentity(entry: RecentStreamIdentity) {
   requestRuleForIdentity(entry);
@@ -46,7 +52,9 @@ const profileName = computed(() => {
 const isMockData = computed(() => graph.value.data_source === "mock");
 
 const playbackStreams = computed(() =>
-  displayGraph.value.streams.filter((stream) => stream.direction === "playback"),
+  displayGraph.value.streams.filter(
+    (stream) => stream.direction === "playback",
+  ),
 );
 
 const captureStreams = computed(() =>
@@ -54,7 +62,9 @@ const captureStreams = computed(() =>
 );
 
 const virtualDeviceCount = computed(
-  () => displayGraph.value.devices.filter((device) => device.kind === "virtual").length,
+  () =>
+    displayGraph.value.devices.filter((device) => device.kind === "virtual")
+      .length,
 );
 
 const outputsInUse = computed(() => {
@@ -92,13 +102,6 @@ async function onToggleSystemStreams(next: boolean) {
 
 function openRoutingGraph() {
   navigate?.("routing");
-}
-
-// PipeWire/WirePlumber name every node coming off the bluez5 backend
-// "bluez_output.…"/"bluez_input.…" — there's no dedicated field on Device for
-// this, so the naming convention is the only signal available (see #3).
-function isBluetoothDevice(device: Device): boolean {
-  return device.system_name.startsWith("bluez_");
 }
 
 function deviceIconKind(device: Device): string {
@@ -181,14 +184,19 @@ function deviceCategoryLabel(device: Device): string {
           </button>
         </div>
         <p class="dashboard-section-hint">
-          Apps that briefly appeared in the last hour but aren't active right now.
+          Apps that briefly appeared in the last hour but aren't active right
+          now.
         </p>
         <ul class="recently-seen-list">
-          <li v-for="(entry, index) in recentlySeenEntries" :key="`${entry.app_name}-${index}`">
+          <li
+            v-for="(entry, index) in recentlySeenEntries"
+            :key="`${entry.app_name}-${index}`"
+          >
             <div class="recently-seen-info">
               <strong>{{ recentEntryLabel(entry) }}</strong>
               <span class="recently-seen-meta">
-                {{ entry.direction === "capture" ? "Capture" : "Playback" }} · {{ recentEntryAgo(entry) }}
+                {{ entry.direction === "capture" ? "Capture" : "Playback" }} ·
+                {{ recentEntryAgo(entry) }}
               </span>
             </div>
             <button
@@ -211,15 +219,22 @@ function deviceCategoryLabel(device: Device): string {
         </div>
         <div class="dashboard-device-summary">
           <article
-            v-for="device in displayGraph.devices.filter((d) => deviceColumn(d))"
+            v-for="device in displayGraph.devices.filter((d) =>
+              deviceColumn(d),
+            )"
             :key="device.id"
             class="stat-card device-summary-card"
           >
             <div class="device-summary-header">
-              <NodeTypeIcon :kind="deviceIconKind(device)" class="device-summary-icon" />
+              <NodeTypeIcon
+                :kind="deviceIconKind(device)"
+                class="device-summary-icon"
+              />
               <span class="stat-label">{{ device.label }}</span>
             </div>
-            <span class="device-category-badge">{{ deviceCategoryLabel(device) }}</span>
+            <span class="device-category-badge">{{
+              deviceCategoryLabel(device)
+            }}</span>
           </article>
         </div>
       </section>

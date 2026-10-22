@@ -41,15 +41,15 @@ A reference glossary for the audio-engineering and PipeWire concepts Pipe Deck's
 
 **Peak vs. RMS** — Two different ways to measure "how loud": peak is the single highest instantaneous sample value (what tells you if you're about to clip); RMS (root-mean-square) is a windowed average that tracks perceived loudness better. A meter showing only peak can look quiet while still sounding loud, and vice versa.
 
-**Pan / balance** — Positioning a signal across the stereo field. *Pan* usually implies starting from mono and placing it somewhere in the stereo image; *balance* usually implies adjusting the relative left/right level of an already-stereo signal. Tracked as issue #16 (Phase 7) for per-channel control in Pipe Deck's effect chains.
+**Pan / balance** — Positioning a signal across the stereo field. *Pan* usually implies starting from mono and placing it somewhere in the stereo image; *balance* usually implies adjusting the relative left/right level of an already-stereo signal. Tracked as issue #16 (part of [Epic #182](https://github.com/LunarVagabond/Pipe-Deck/issues/182)) for per-channel control in Pipe Deck's effect chains.
 
 **Mute vs. bypass** — Mute silences a channel entirely. Bypass (used for effects) skips a specific processing stage while leaving the signal otherwise flowing — the chain keeps passing audio through unprocessed rather than stopping it. Pipe Deck's per-device chain editor (#15) supports bypassing individual effects without removing them from the saved chain.
 
 ## Busses, sends, and mixing structure
 
-**Bus** — A shared signal path that more than one source feeds into and that itself can be treated as a single thing to route, monitor, or process — the mixing-desk equivalent of a shared destination rather than a point-to-point cable. In Pipe Deck terms, a bus is a virtual device multiple sources route or send into.
+**Bus** — A shared signal path that more than one source feeds into and that itself can be treated as a single thing to route, monitor, or process — the mixing-desk equivalent of a shared destination rather than a point-to-point cable. In Pipe Deck terms this is what the **Mixer Node** (PD-032/PD-033, issue #293) implements — a plain virtual device is not itself a bus; it can't combine or route onward on its own.
 
-**Submix** — A bus that groups a subset of sources (e.g. "all my game audio") before that group joins a larger master mix — useful for controlling a whole category's level with one fader instead of adjusting each source individually. Pipe Deck's chainable mixer nodes (issue #77 — per-source volume + one mixer feeding another) implement this pattern.
+**Submix** — A bus that groups a subset of sources (e.g. "all my game audio") before that group joins a larger master mix — useful for controlling a whole category's level with one fader instead of adjusting each source individually. Pipe Deck's **Mixer Node** (PD-032, issue #293 — a dedicated processing node with N growable inputs, each with its own independent gain, summed into one output) implements this pattern directly; a chain of Mixer Nodes feeding another Mixer Node reproduces the "submix into a master mix" structure.
 
 **Send / return** — A *send* takes a copy of a source's signal (usually at an independently adjustable level, separate from the source's main/"dry" output) and feeds it to a bus, typically one carrying a shared effect (reverb, compression). The *return* is that bus's processed output coming back into the main mix. The point of a send is that the source keeps going to its normal destination *and* contributes to the shared effect, rather than being rerouted through it exclusively — see issue #113 (effect bus with per-source send levels), not yet implemented.
 
@@ -57,15 +57,19 @@ A reference glossary for the audio-engineering and PipeWire concepts Pipe Deck's
 
 **Routing matrix** — A grid representation of "which sources connect to which destinations," used in Pipe Deck's Routing view as the visual/interaction model for what's ultimately a set of PipeWire links.
 
+**Fan-out** — Duplicating one source's signal out to multiple destinations at once, as opposed to a plain 1:1 route. Pipe Deck's dedicated **Fan-out Node** (PD-032/PD-033, issue #293) is the only way to do this — an explicit, independently-wired graph node rather than a property of an existing device.
+
+**Processing node** — A dedicated, independently-wired graph node that takes audio in and produces audio out — as opposed to a property attached to an existing device or stream. Mixer, Fan-out, and per-effect nodes (several effect kinds now real DSP, with the remainder shipping as visibly-labeled "Not implemented yet" pass-through stubs ahead of their own real DSP) are all processing nodes (PD-032, issue #293). See "Processing Nodes" in `UI_Spec.md` for the current kind-by-kind status.
+
 ## Automation and dynamics
 
 **Ducking** — Automatically lowering one source's level while another is active, then restoring it afterward — classically "music gets quieter while someone's talking," triggered by the second source's presence/level rather than a manual fader move. This is dynamics processing *driven by a different source's signal* (a sidechain, see below), not a static rule. Pipe Deck doesn't implement ducking today; it would need a live level-triggered volume adjustment on one device driven by activity on another, distinct from the rule engine's static app-identity matching (`core/rules/`).
 
 **Sidechain** — Feeding a *second* signal into a dynamics processor (compressor/gate) to control how it acts on the *first* signal, instead of the processor reacting only to the signal it's processing. Ducking is the classic sidechain-compression use case: the compressor sits on the music bus, but its trigger input is the voice-chat stream.
 
-**Compressor / limiter** — Dynamics processors that reduce a signal's level once it crosses a *threshold*, at a set *ratio* (compressor: gentler, proportional reduction; limiter: a compressor with a very high ratio acting as a hard ceiling that a signal effectively can't cross). Governed by *attack* (how fast it starts reducing once the threshold is crossed) and *release* (how fast it stops once the signal drops back below). Tracked for Pipe Deck as issue #86 (Phase 7), currently blocked on finding a compliant backing plugin per `docs/Decisions.md`.
+**Compressor / limiter** — Dynamics processors that reduce a signal's level once it crosses a *threshold*, at a set *ratio* (compressor: gentler, proportional reduction; limiter: a compressor with a very high ratio acting as a hard ceiling that a signal effectively can't cross). Governed by *attack* (how fast it starts reducing once the threshold is crossed) and *release* (how fast it stops once the signal drops back below). Tracked for Pipe Deck as issue #86 (part of [Epic #182](https://github.com/LunarVagabond/Pipe-Deck/issues/182)), currently blocked on finding a compliant backing plugin per `docs/architecture/Decisions.md`.
 
-**Noise gate** — The inverse shape of a compressor: instead of reducing loud signal, it mutes/reduces signal *below* a threshold — used to silence a mic between words instead of letting background noise bleed through continuously. Tracked as issue #18 (Phase 7), implemented via a chained filter-chain module per `PipeWire Design`.
+**Noise gate** — The inverse shape of a compressor: instead of reducing loud signal, it mutes/reduces signal *below* a threshold — used to silence a mic between words instead of letting background noise bleed through continuously. Tracked as issue #18 (part of [Epic #182](https://github.com/LunarVagabond/Pipe-Deck/issues/182)), implemented via a chained filter-chain module per `PipeWire Design`.
 
 **Threshold / ratio / attack / release** — The four core dynamics-processor parameters: threshold sets the level where processing kicks in, ratio sets how strongly it reacts once triggered, attack/release set how fast it engages/disengages. The same four concepts apply to gates and compressors, just acting in opposite directions.
 
@@ -81,7 +85,7 @@ A reference glossary for the audio-engineering and PipeWire concepts Pipe Deck's
 
 **Builtin (PipeWire) processing** — A small set of effects PipeWire itself ships without needing an external LADSPA/LV2 plugin installed — currently the only path Pipe Deck trusts for its "always works, no extra install" live-processing guarantee, per the safety contract in issue #64.
 
-**Preflight / validation** — Checking a proposed effect-chain configuration for safety/compatibility *before* committing it to a live PipeWire config change and restart — Pipe Deck's `fx_validate.rs`, required after a past incident where an unvalidated filter-chain config crashed the PipeWire session (see PD-017 in `docs/Decisions.md`).
+**Preflight / validation** — Checking a proposed effect-chain configuration for safety/compatibility *before* committing it to a live PipeWire config change and restart — Pipe Deck's `fx_validate.rs`, required after a past incident where an unvalidated filter-chain config crashed the PipeWire session (see PD-017 in `docs/architecture/Decisions.md`).
 
 ## Session/device management (PipeWire-specific)
 
@@ -93,7 +97,7 @@ A reference glossary for the audio-engineering and PipeWire concepts Pipe Deck's
 
 **Latency / buffer / xrun** — Latency is the delay between a sound being generated and it reaching the output. Buffer size is the main lever controlling that trade-off (smaller buffer = lower latency, higher risk of glitches). An xrun (buffer under/overrun) is an audible glitch/dropout from the system failing to keep up with the buffer schedule in time — the thing you're trading against when pushing latency lower.
 
-**Profile (Pipe Deck-specific)** — A saved snapshot of routing/device/effect-chain state as YAML (`config/store.rs`, `docs/Config_Spec.md`) that can be restored later — not a PipeWire/WirePlumber concept, but Pipe Deck's own persistence unit layered on top of everything above.
+**Profile (Pipe Deck-specific)** — A saved snapshot of routing/device/effect-chain state as YAML (`config/store.rs`, `docs/specs/Config_Spec.md`) that can be restored later — not a PipeWire/WirePlumber concept, but Pipe Deck's own persistence unit layered on top of everything above.
 
 ## See also
 

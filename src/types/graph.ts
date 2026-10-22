@@ -2,7 +2,8 @@ export type DeviceKind = "physical" | "virtual";
 export type DeviceDirection = "input" | "output" | "duplex";
 export type StreamDirection = "playback" | "capture";
 
-export type RouteSource = "manual_override" | "persisted_rule" | "authored_rule" | "no_rule";
+export type RouteSource =
+  "manual_override" | "persisted_rule" | "authored_rule" | "no_rule";
 export type ActionStatus =
   | "applied"
   | "blocked"
@@ -11,9 +12,14 @@ export type ActionStatus =
   | "simulated"
   | "no_action";
 
+export type SkipReason =
+  "lower_priority" | "manual_override" | "missing_metadata";
+
 export interface SkippedCandidate {
   rule_key: string;
   reason: string;
+  rule_id?: string;
+  kind: SkipReason;
 }
 
 export interface RouteExplanation {
@@ -48,9 +54,13 @@ export interface Device {
   sink_mode?: SinkMode;
   volume_percent?: number;
   muted?: boolean;
+  /** Not legacy: just current_targets[0], kept for single-target UI. */
   current_target?: string;
+  /** Source of truth: every live target this output fans out to (can be more than one). */
   current_targets?: string[];
   mix_sources?: MixSource[];
+  sample_rate?: number;
+  channels?: number;
 }
 
 export interface Stream {
@@ -61,18 +71,20 @@ export interface Stream {
   system_name?: string;
   direction: StreamDirection;
   current_target?: string;
-  current_targets?: string[];
   media_name?: string;
   is_system?: boolean;
   volume_percent?: number;
   muted?: boolean;
   route_explanation?: RouteExplanation;
+  sample_rate?: number;
+  channels?: number;
 }
 
 export interface Link {
   id: string;
   source_id: string;
   target_id: string;
+  is_monitor: boolean;
 }
 
 export interface RecentStreamIdentity {
@@ -87,6 +99,123 @@ export interface RecentStreamIdentity {
   is_live?: boolean;
 }
 
+/** One addressable input/output port on a `ProcessingNode`. `index` is the
+ * stable address a kind's own per-port config (e.g. Mixer's per-input gain)
+ * is keyed by — never re-derived from array position. */
+export interface ProcessingNodePort {
+  index: number;
+  connected_id?: string;
+  /** Mixer input only: the original stream id that named this port's feed
+   * sink at connect time, kept stable even after `connected_id` is
+   * reconciled onto a same-app replacement stream instance (issue #304). */
+  feed_key?: string;
+}
+
+/** issue #293's non-DSP effect kinds — addable to the graph, wired like any
+ * other node, pure pass-through (never backed by a PipeWire object),
+ * rendered with a visible "Not implemented yet" label. Originally eleven;
+ * `reverb_delay`, `limiter`, `hpf`, `stereo_widener`, and `compressor`
+ * graduated to real `delay`/`limiter`/`hpf`/`widener`/`compressor`
+ * processing nodes (issues #313/#311/#312/#314/#86), the same way `eq5band`
+ * graduated out of this list previously. */
+export type StubEffectKind =
+  | "noise_gate"
+  | "denoise"
+  | "de_esser"
+  | "auto_gain_leveler"
+  | "pitch_shift"
+  | "loudness_normalizer"
+  | "saturation";
+
+export type ProcessingNodeKind =
+  | {
+      kind: "mixer";
+      /** Per-input gain, indexed by `ProcessingNodePort.index` — see PD-032:
+       * this lives once, on the node, never re-synthesized per edge. */
+      input_gains_percent: number[];
+    }
+  | {
+      kind: "fan_out";
+      /** Plain output volume on the node's own backing sink — not a
+       * shaping gain (Fan-Out has no DSP), same meaning as a device's
+       * volume_percent. */
+      volume_percent: number;
+      muted: boolean;
+    }
+  | {
+      kind: "group";
+      /** Created in one atomic gesture from a multi-select of existing
+       * output devices (issue #80) rather than wired connection-by-
+       * connection like Fan-Out — functionally identical shape/mechanism
+       * otherwise (PD-035), including this same plain output volume. */
+      volume_percent: number;
+      muted: boolean;
+    }
+  | {
+      kind: "eq5band";
+      eq_sub: number;
+      eq_bass: number;
+      eq_mid: number;
+      eq_treble: number;
+      eq_air: number;
+      output_gain: number;
+    }
+  | {
+      kind: "delay";
+      delay_ms: number;
+      feedback_percent: number;
+      feedforward_percent: number;
+    }
+  | {
+      kind: "limiter";
+      ceiling_db: number;
+      floor_db: number;
+      symmetric: boolean;
+    }
+  | {
+      kind: "hpf";
+      freq_hz: number;
+      resonance_x10: number;
+    }
+  | {
+      kind: "reverb";
+      mix_percent: number;
+    }
+  | {
+      kind: "widener";
+      width_percent: number;
+    }
+  | {
+      kind: "pan";
+      balance_percent: number;
+    }
+  | {
+      kind: "compressor";
+      threshold_db: number;
+      ratio_x10: number;
+      attack_ms: number;
+      release_ms: number;
+      makeup_gain_db: number;
+    }
+  | { kind: "stub"; stub_kind: StubEffectKind };
+
+/** A first-class routable processing node — Mixer, Fan-out, or a single
+ * effect DSP stage (PD-032). Distinct from `Device`/`Stream`: has explicit,
+ * independently-addressable input/output ports rather than at most one
+ * implicit stream of audio in and out. */
+export interface ProcessingNode {
+  id: string;
+  label: string;
+  kind: ProcessingNodeKind;
+  system_name: string;
+  bypassed: boolean;
+  /** Whether a real PipeWire object currently backs this node. Always
+   * `false` for `stub` kinds, which are never backed by one. */
+  live: boolean;
+  inputs?: ProcessingNodePort[];
+  outputs?: ProcessingNodePort[];
+}
+
 export interface RuntimeGraph {
   devices: Device[];
   streams: Stream[];
@@ -94,6 +223,11 @@ export interface RuntimeGraph {
   data_source?: string;
   notice?: string;
   recent_stream_identities?: RecentStreamIdentity[];
+  processing_nodes?: ProcessingNode[];
+  /** `system_name` of the current default output device, if PipeWire has
+   * one configured. Used by the first-run onboarding checklist to check
+   * "default output set" without new detection plumbing. */
+  default_output_system_name?: string;
 }
 
 export interface DeviceAliasEntry {
@@ -115,6 +249,36 @@ export interface Preferences {
   theme_mode?: string;
   dark_scheme?: string;
   light_scheme?: string;
+  notice_duration_ms?: number;
+  soundboard_boards?: SoundboardBoard[];
+  /** "minimize" | "quit"; absent/null means the user hasn't been asked yet. */
+  close_behavior?: string;
+  update_channel?: string;
+  /** Whether the first-run onboarding checklist has been dismissed. Never
+   * re-shown once true — no per-step tracking. */
+  onboarding_dismissed?: boolean;
+}
+
+export interface SoundboardBoard {
+  id: string;
+  name: string;
+  folder: string;
+  /** Board-wide playback destinations — every clip in this tab plays through these. */
+  target_system_name: string | null;
+  target_volume_percent: number;
+  monitor_system_name: string | null;
+  monitor_volume_percent: number;
+  /** Stop the current clip before a new clip starts when true (legacy default). */
+  exclusive_playback: boolean;
+}
+
+export interface SoundboardClip {
+  id: string;
+  file_name: string;
+  label: string;
+  path: string;
+  /** Probed from the file's own header/metadata; null if it couldn't be read. */
+  duration_seconds: number | null;
 }
 
 export interface StreamRouteRule {
@@ -125,16 +289,8 @@ export interface StreamRouteRule {
   target_system_names?: string[];
 }
 
-export interface DeviceRouteRule {
-  source_system_name: string;
-  target_system_name?: string;
-  target_system_names?: string[];
-  safeguards: RuleSafeguards;
-}
-
 export interface RoutingRulesConfig {
   stream_rules: StreamRouteRule[];
-  device_rules: DeviceRouteRule[];
 }
 
 export type RuleCondition =
@@ -154,6 +310,30 @@ export interface RuleAction {
 
 export interface RuleSafeguards {
   fallback_policy?: "keep_current" | "safe_default";
+}
+
+/** One node along a path submitted for latency-ping measurement (issue
+ * #223). `system_name` is only needed as a resolution fallback for
+ * processing nodes; device/stream ids resolve for free on the Rust side. */
+export interface LatencyPathNode {
+  id: string;
+  system_name?: string;
+}
+
+/** Theoretical/buffering latency contribution of one hop, from `pw-top`'s
+ * QUANT/RATE. `latency_ms` (and `quantum`/`rate`) are absent when the node
+ * has no current reading — distinct from a real zero-latency reading. */
+export interface LatencyHop {
+  id: string;
+  node_id?: number;
+  quantum?: number;
+  rate?: number;
+  latency_ms?: number;
+}
+
+export interface LatencyPingResult {
+  hops: LatencyHop[];
+  total_latency_ms?: number;
 }
 
 export interface Rule {
@@ -248,7 +428,13 @@ export interface DynamicsStage {
 }
 
 export function emptyDynamicsStage(): DynamicsStage {
-  return { enabled: false, threshold_db: 0, ratio_x10: 0, attack_ms: 0, release_ms: 0 };
+  return {
+    enabled: false,
+    threshold_db: 0,
+    ratio_x10: 0,
+    attack_ms: 0,
+    release_ms: 0,
+  };
 }
 
 /**
@@ -372,6 +558,86 @@ export interface VirtualDeviceSpec {
   mix_sources?: MixSourceSpec[];
 }
 
+export interface ProcessingNodePortSpec {
+  source_system_name: string;
+  /** Only meaningful for `mixer` — other kinds ignore this. */
+  gain_percent: number;
+  muted: boolean;
+  /** Captured only for a stream peer, so a later refresh can re-resolve
+   * this port onto a same-app replacement stream instance (issue #304). */
+  source_stream_identity?: {
+    app_name: string;
+    executable?: string;
+    media_name?: string;
+  };
+}
+
+export type ProcessingNodeSpecKind =
+  | { kind: "mixer" }
+  | { kind: "fan_out"; volume_percent: number; muted: boolean }
+  | { kind: "group"; volume_percent: number; muted: boolean }
+  | {
+      kind: "eq5band";
+      eq_sub: number;
+      eq_bass: number;
+      eq_mid: number;
+      eq_treble: number;
+      eq_air: number;
+      output_gain: number;
+    }
+  | {
+      kind: "delay";
+      delay_ms: number;
+      feedback_percent: number;
+      feedforward_percent: number;
+    }
+  | {
+      kind: "limiter";
+      ceiling_db: number;
+      floor_db: number;
+      symmetric: boolean;
+    }
+  | {
+      kind: "hpf";
+      freq_hz: number;
+      resonance_x10: number;
+    }
+  | {
+      kind: "reverb";
+      mix_percent: number;
+    }
+  | {
+      kind: "widener";
+      width_percent: number;
+    }
+  | {
+      kind: "pan";
+      balance_percent: number;
+    }
+  | {
+      kind: "compressor";
+      threshold_db: number;
+      ratio_x10: number;
+      attack_ms: number;
+      release_ms: number;
+      makeup_gain_db: number;
+    }
+  | { kind: "stub"; stub_kind: StubEffectKind };
+
+/** Persisted counterpart to `ProcessingNode` (PD-032) — config.yaml storage,
+ * analogous to `VirtualDeviceSpec`. Wiring lives directly on the spec (like
+ * `VirtualDeviceSpec.mix_sources` already does), not per-profile. */
+export interface ProcessingNodeSpec {
+  id: string;
+  slug: string;
+  label: string;
+  created_at: string;
+  kind: ProcessingNodeSpecKind;
+  input_sources?: ProcessingNodePortSpec[];
+  output_targets?: string[];
+  bypassed?: boolean;
+}
+
 export type AppView =
   | "dashboard"
   | "profiles"
@@ -379,5 +645,6 @@ export type AppView =
   | "routing"
   | "mixer"
   | "sources"
+  | "soundboard"
   | "effects"
   | "settings";

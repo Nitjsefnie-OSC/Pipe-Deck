@@ -1,7 +1,9 @@
-use crate::config::ConfigStore;
-use crate::core::models::{Device, DeviceDirection, DeviceKind, SinkMode, VirtualDeviceInfo, VirtualDeviceResult};
-use crate::backend::BackendError;
 use crate::backend::linux::pactl;
+use crate::backend::BackendError;
+use crate::config::ConfigStore;
+use crate::core::models::{
+    Device, DeviceDirection, DeviceKind, SinkMode, VirtualDeviceInfo, VirtualDeviceResult,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +76,19 @@ impl VirtualDeviceRegistry {
             if devices.contains_key(&system_name) {
                 continue;
             }
+            // A leftover legacy `virtual_devices:` config entry can share a
+            // slug with a dedicated processing node's `pipe-deck-proc-*`
+            // sink (e.g. prototyped as a plain Bus device before PD-032
+            // introduced the separate `processing_nodes:` config section).
+            // Without this guard such an entry gets backfilled here as a
+            // second, misclassified `Device` alongside the correctly
+            // classified `ProcessingNode` with the same system name — this
+            // predicate is the same one `list_pipe_deck_modules` uses above
+            // and is exactly what PD-032's naming allowlist exists to keep
+            // processing nodes out of the plain device registry.
+            if !pactl::belongs_in_virtual_device_registry(&system_name) {
+                continue;
+            }
             if !pactl::pipe_deck_device_is_live(&system_name, spec.direction.clone()) {
                 continue;
             }
@@ -135,14 +150,24 @@ impl VirtualDeviceRegistry {
         Ok(())
     }
 
-    pub fn create_output(self: &Arc<Self>, name: &str) -> Result<VirtualDeviceResult, BackendError> {
+    pub fn create_output(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<VirtualDeviceResult, BackendError> {
         let system_name = format!("pipe-deck-{}", slugify(name));
-        Ok(self.create_output_for(&system_name, name, false)?.into_result())
+        Ok(self
+            .create_output_for(&system_name, name, false)?
+            .into_result())
     }
 
-    pub fn create_multi_output(self: &Arc<Self>, name: &str) -> Result<VirtualDeviceResult, BackendError> {
+    pub fn create_multi_output(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<VirtualDeviceResult, BackendError> {
         let system_name = format!("pipe-deck-{}", slugify(name));
-        Ok(self.create_output_for(&system_name, name, true)?.into_result())
+        Ok(self
+            .create_output_for(&system_name, name, true)?
+            .into_result())
     }
 
     /// `system_name` is taken as given, not re-slugified from `label` — used
@@ -173,7 +198,11 @@ impl VirtualDeviceRegistry {
         Ok(self.create_input_for(&system_name, name)?.into_result())
     }
 
-    pub fn create_input_for(self: &Arc<Self>, system_name: &str, label: &str) -> Result<VirtualDeviceEntry, BackendError> {
+    pub fn create_input_for(
+        self: &Arc<Self>,
+        system_name: &str,
+        label: &str,
+    ) -> Result<VirtualDeviceEntry, BackendError> {
         let module_id = pactl::create_virtual_source(system_name, label)?;
         let entry = VirtualDeviceEntry {
             module_id,
@@ -278,6 +307,8 @@ impl VirtualDeviceEntry {
             current_target: None,
             current_targets: Vec::new(),
             mix_sources: Vec::new(),
+            sample_rate: None,
+            channels: None,
         }
     }
 }

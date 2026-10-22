@@ -1,4 +1,4 @@
-use crate::core::models::{DeviceRouteIntent, Profile, RoutingIntent, RuntimeGraph};
+use crate::core::models::{Profile, RoutingIntent, RuntimeGraph};
 use crate::core::routing::RoutingSnapshot;
 
 use super::EngineError;
@@ -23,7 +23,6 @@ pub(super) fn apply_mock_routing(
         )));
     }
     stream.current_target = Some(target_id.clone());
-    stream.current_targets.clear();
     Ok(())
 }
 
@@ -33,7 +32,6 @@ pub(super) fn apply_mock_snapshot(
 ) -> Result<(), EngineError> {
     for stream in &mut graph.streams {
         stream.current_target = None;
-        stream.current_targets.clear();
     }
     for device in &mut graph.devices {
         device.current_target = None;
@@ -42,49 +40,15 @@ pub(super) fn apply_mock_snapshot(
     for intent in &snapshot.stream_intents {
         apply_mock_routing(graph, intent)?;
     }
-    for intent in &snapshot.device_intents {
-        apply_mock_device_route(graph, intent)?;
-    }
     Ok(())
 }
 
-pub(super) fn apply_mock_device_route(
+pub(super) fn apply_mock_profile(
     graph: &mut RuntimeGraph,
-    intent: &DeviceRouteIntent,
+    profile: &Profile,
 ) -> Result<(), EngineError> {
-    let targets = intent.target_ids();
-    if !graph
-        .devices
-        .iter()
-        .any(|device| device.id == intent.source_device_id)
-    {
-        return Err(EngineError::Routing(format!(
-            "source device not found: {}",
-            intent.source_device_id
-        )));
-    }
-    for target_id in &targets {
-        if !graph.devices.iter().any(|device| device.id == *target_id) {
-            return Err(EngineError::Routing(format!(
-                "target device not found: {target_id}"
-            )));
-        }
-    }
-
-    let device = graph
-        .devices
-        .iter_mut()
-        .find(|device| device.id == intent.source_device_id)
-        .expect("source device exists");
-    device.current_targets = targets.clone();
-    device.current_target = targets.first().cloned();
-    Ok(())
-}
-
-pub(super) fn apply_mock_profile(graph: &mut RuntimeGraph, profile: &Profile) -> Result<(), EngineError> {
     for stream in &mut graph.streams {
         stream.current_target = None;
-        stream.current_targets.clear();
     }
     for intent in &profile.routing_intents {
         apply_mock_routing(graph, intent)?;
@@ -94,7 +58,11 @@ pub(super) fn apply_mock_profile(graph: &mut RuntimeGraph, profile: &Profile) ->
 
 pub(super) fn apply_mock_profile_volumes(graph: &mut RuntimeGraph, profile: &Profile) {
     for (device_id, state) in &profile.volume_state {
-        if let Some(device) = graph.devices.iter_mut().find(|device| device.id == *device_id) {
+        if let Some(device) = graph
+            .devices
+            .iter_mut()
+            .find(|device| device.id == *device_id)
+        {
             device.volume_percent = Some(state.volume_percent);
             device.muted = Some(state.muted);
         }

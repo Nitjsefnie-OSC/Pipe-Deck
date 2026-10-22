@@ -8,52 +8,6 @@
   min-height: 0;
 }
 
-.routing-graph-legend {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.65rem 1.25rem;
-  padding: 0.55rem 0.85rem;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-1);
-}
-
-.routing-graph-legend-title {
-  font-size: 0.72rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
-
-.routing-graph-legend-items {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.55rem 1rem;
-}
-
-.routing-graph-legend-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.78rem;
-  color: var(--text);
-}
-
-.routing-graph-legend-swatch {
-  width: 0.65rem;
-  height: 0.65rem;
-  border-radius: 999px;
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12);
-}
-
-.routing-graph-legend-hint {
-  font-size: 0.72rem;
-  color: var(--text-muted);
-}
-
 .routing-graph-context-menu {
   position: fixed;
   z-index: 1000;
@@ -90,7 +44,8 @@
     text-align: left;
     cursor: pointer;
 
-    &:hover {
+    &:hover,
+    &.is-highlighted {
       background: rgba(255, 255, 255, 0.06);
     }
 
@@ -100,6 +55,99 @@
       &:hover {
         background: rgba(255, 107, 107, 0.12);
       }
+    }
+  }
+
+  // Free-text filter for the pane "Add node" menu (issue: context menu
+  // search) — auto-focused on open so a keyboard-first user can start
+  // typing immediately instead of clicking through category flyouts.
+  .routing-graph-context-menu-search {
+    display: block;
+    width: 100%;
+    margin-bottom: 0.35rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 0.8rem;
+
+    &:focus {
+      outline: none;
+      border-color: var(--accent-purple, #7c5cff);
+    }
+  }
+}
+
+.routing-graph-node-picker-anchor {
+  position: relative;
+}
+
+.routing-graph-node-picker {
+  position: absolute;
+  top: 130%;
+  left: 0;
+  z-index: 10;
+  min-width: 12rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: 0.35rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 0.8rem;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.06);
+    }
+  }
+}
+
+/** A top-level "Add node" category's submenu (General/Input/Output) — opens
+ * beside its trigger button (`left: 100%`) rather than below it
+ * (`.routing-graph-node-picker`'s `top: 130%`), so it reads as a submenu
+ * flyout, not a dropdown. Otherwise identical styling/behavior. */
+.routing-graph-node-category-flyout {
+  position: absolute;
+  top: 0;
+  left: 100%;
+  margin-left: 0.3rem;
+  z-index: 10;
+  min-width: 12rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: 0.35rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 0.8rem;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.06);
     }
   }
 }
@@ -115,6 +163,31 @@
 
   .vue-flow__node {
     overflow: visible;
+  }
+}
+
+.routing-graph-help-btn {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: vars.translucent(--surface-2, 90);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--text);
+    border-color: rgba(124, 92, 255, 0.45);
   }
 }
 
@@ -243,6 +316,30 @@
   flex: 1;
 }
 
+// vue-flow only ships `.selected` styling for its own built-in node type
+// names ("default"/"input"/"output" — see theme-default.css), none of which
+// this app uses (every node registers as the one custom "routingNode" type,
+// see buildGraph.ts). Without this rule, vue-flow's selection state is
+// tracked correctly (multi-select, drag-together, and issue #80's group
+// gesture all work off it) but was never visible — a real usability gap,
+// not just cosmetic, once #80 made "select some nodes, then look at what's
+// selected before right-clicking" an actual required step rather than an
+// instant select-then-act gesture.
+.vue-flow__node.selected .routing-graph-node {
+  border-color: var(--accent-purple, #7c5cff);
+  box-shadow: 0 0 0 2px vars.translucent(--accent-purple, 45);
+}
+
+// Distinct from `.selected` (deliberate multi-select for grouping) — this
+// is a transient "here it is" pointer when hovering a member row in a Group
+// node's expanded list (issue #80, PD-035 revision), an amber glow rather
+// than the purple selection color so the two states never read as the same
+// thing even if a node happens to be both selected and highlighted at once.
+.routing-graph-node--highlighted {
+  border-color: var(--accent-amber, #ffb020) !important;
+  box-shadow: 0 0 0 2px vars.translucent(--accent-amber, 45);
+}
+
 .routing-graph-node {
   min-width: 210px;
   max-width: 260px;
@@ -271,6 +368,17 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   position: relative;
   overflow: visible;
+
+  // Issue #227: nothing routed yet reads as "idle", not "frozen" — a soft
+  // glow layered on top of the base shadow (carried forward at both
+  // keyframe stops so the base shadow itself doesn't visibly pop in/out).
+  // Scoped by the canvas-level `--idle` modifier so it disengages the
+  // instant any link exists, and every node shares one un-delayed keyframe
+  // (no per-node animation-delay) so an occasional node remount desyncs as
+  // little as possible instead of jumping to a mid-cycle phase.
+  .routing-graph-canvas--idle & {
+    animation: routing-graph-idle-pulse 2.4s ease-in-out infinite;
+  }
 
   &.playback {
     border-color: rgba(124, 92, 255, 0.55);
@@ -307,6 +415,26 @@
   }
 }
 
+@keyframes routing-graph-idle-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 8px 24px rgba(0, 0, 0, 0.25),
+      0 0 0 0 vars.translucent(--accent-purple, 0);
+  }
+  50% {
+    box-shadow:
+      0 8px 24px rgba(0, 0, 0, 0.25),
+      0 0 16px 2px vars.translucent(--accent-purple, 35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .routing-graph-canvas--idle .routing-graph-node {
+    animation: none;
+  }
+}
+
 .routing-graph-node-main {
   flex: 1;
   min-width: 0;
@@ -322,6 +450,24 @@
   flex-shrink: 0;
   margin-top: 0.15rem;
   color: var(--text-muted);
+}
+
+.routing-graph-node-group-expand-toggle {
+  flex-shrink: 0;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--text-muted);
+  transition: transform 0.12s ease;
+
+  &--expanded {
+    transform: rotate(90deg);
+  }
 }
 
 .routing-graph-node-body {
@@ -373,6 +519,41 @@
       width: 0.62rem;
       height: 0.62rem;
     }
+  }
+
+  // Reset (a DSP-backed processing node's header action) reuses the same
+  // compact icon-btn sizing as Edit/Delete just above, but with a plain text
+  // glyph instead of an svg — font-size stands in for the svg width/height
+  // override.
+  .node-card-actions .routing-graph-node-header-reset {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+
+    &:hover {
+      color: var(--text);
+    }
+  }
+
+  // "+ add member" (a Group node's header action) — same compact sizing as
+  // Reset above.
+  .node-card-actions .routing-graph-node-header-add-member {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-muted);
+
+    &:hover {
+      color: var(--text);
+    }
+  }
+
+  // The DSP info icon sits in the header row (next to Reset/Delete) for
+  // any DSP-backed processing node — same compact `icon-btn` sizing as
+  // Edit/Delete/Reset above (the `.node-card-actions .icon-btn` rule just
+  // above already covers width/height/border-radius/svg sizing; this only
+  // overrides the font-size for its plain-text glyph, same pattern as
+  // Reset's own override).
+  .node-card-actions .routing-graph-node-dsp-info {
+    font-size: 0.7rem;
   }
 }
 
@@ -434,7 +615,9 @@
   background: var(--handle-color, #3fd0c9);
   border: 2px solid rgba(255, 255, 255, 0.92);
   box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
-  transition: box-shadow 0.12s ease, opacity 0.12s ease;
+  transition:
+    box-shadow 0.12s ease,
+    opacity 0.12s ease;
 
   &::after {
     content: "";
@@ -451,6 +634,21 @@
   &.is-empty {
     background: transparent;
     border-color: var(--handle-color, #3fd0c9);
+  }
+
+  // A "terminal" virtual output device's non-draggable anchor for its own
+  // existing monitor fan-out (#391) — real enough for its edge to land on,
+  // but visually reads as a fixed tap point, not an editable connection:
+  // dimmed, no hover glow, no pointer cursor.
+  &.is-monitor-anchor {
+    opacity: 0.55;
+    cursor: default;
+    pointer-events: none;
+
+    &:hover,
+    &:focus-visible {
+      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+    }
   }
 
   &:focus-visible {
@@ -495,6 +693,740 @@
   border-top: 1px dashed rgba(255, 255, 255, 0.1);
 }
 
+// PD-032 Mixer processing node — one gain row per connected input,
+// deliberately compact since a node card has no room for a full mixer strip.
+.routing-graph-node-mixer-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
+.routing-graph-node-mixer-inputs-empty {
+  margin: 0;
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+
+.routing-graph-node-mixer-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-mixer-input-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+}
+
+.routing-graph-node-mixer-input-gain {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-mixer-input-gain-label {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+// PD-032 5-Band EQ processing node — reuses the same compact-row shape as
+// the Mixer's gain rows above, one row per band plus output trim.
+.routing-graph-node-eq5band {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-eq5band-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-eq5band-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-eq5band-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+/** Shared by any DSP-backed processing node whose builtin-only backing has
+ * a known audible sharp edge (brick-wall clamp, boost-then-clip at the
+ * output, ...) — a small hover tooltip explaining why, rather than silence
+ * that reads as "this node is broken." Styled as a plain `icon-btn` (same
+ * bordered-square sizing as Edit/Delete/Reset next to it) in blue, a
+ * neutral informational color, not a warning triangle — none of these
+ * describe something currently wrong with the user's config, and an amber
+ * triangle read as an "almost error" even though it's purely informational.
+ * See issue #86 (real dynamics processing, tracked separately from the
+ * current builtin-only MVPs). */
+.routing-graph-node-dsp-info {
+  margin-left: 0.2rem;
+  font-size: 0.75rem;
+  line-height: 1;
+  cursor: help;
+  color: var(--accent-blue, #4d9fff);
+
+  &:hover {
+    color: var(--accent-blue, #4d9fff);
+    border-color: rgba(77, 159, 255, 0.55);
+  }
+}
+
+.routing-graph-node-eq5band-reset {
+  margin-left: auto;
+  padding: 0.05rem 0.3rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    border-color: var(--border, rgba(255, 255, 255, 0.2));
+  }
+}
+
+.routing-graph-node-eq5band-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-eq5band-label {
+  flex: 0 0 3rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-eq5band-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-eq5band-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-delay {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-delay-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-delay-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-delay-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-delay-reset {
+  margin-left: auto;
+  padding: 0.05rem 0.3rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    border-color: var(--border, rgba(255, 255, 255, 0.2));
+  }
+}
+
+.routing-graph-node-delay-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-delay-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-delay-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-delay-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-limiter {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-limiter-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-limiter-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-limiter-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-limiter-symmetric {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-purple, #8b7bff);
+    color: var(--accent-purple, #8b7bff);
+  }
+}
+
+.routing-graph-node-limiter-reset {
+  margin-left: auto;
+  padding: 0.05rem 0.3rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    border-color: var(--border, rgba(255, 255, 255, 0.2));
+  }
+}
+
+.routing-graph-node-limiter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-limiter-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-limiter-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-limiter-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-hpf {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-hpf-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-hpf-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-hpf-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-hpf-reset {
+  margin-left: auto;
+  padding: 0.05rem 0.3rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  opacity: 0.65;
+  cursor: pointer;
+
+  &:hover {
+    opacity: 1;
+    border-color: var(--border, rgba(255, 255, 255, 0.2));
+  }
+}
+
+.routing-graph-node-hpf-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-hpf-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-hpf-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-hpf-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-reverb {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-reverb-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-reverb-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-reverb-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-reverb-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-reverb-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-reverb-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-reverb-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-widener {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-widener-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-widener-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-widener-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-widener-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-widener-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-widener-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-widener-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-pan {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-pan-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-pan-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-pan-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-pan-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-pan-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-pan-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-pan-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+.routing-graph-node-compressor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+
+  &.is-bypassed {
+    opacity: 0.6;
+  }
+}
+
+.routing-graph-node-compressor-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+
+.routing-graph-node-compressor-bypass {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-amber, #e0a030);
+    color: var(--accent-amber, #e0a030);
+  }
+}
+
+.routing-graph-node-compressor-isolate {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.2));
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+
+  &.active {
+    border-color: var(--accent-teal, #3ddbd9);
+    color: var(--accent-teal, #3ddbd9);
+  }
+}
+
+.routing-graph-node-compressor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.routing-graph-node-compressor-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.7rem;
+}
+
+.routing-graph-node-compressor-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routing-graph-node-compressor-value {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
+// PD-032 stub effect nodes (issue #293's 11 non-DSP kinds) — a plain
+// pass-through with nothing to configure, visibly labeled so it's never
+// mistaken for a working effect.
+.routing-graph-node-stub-label {
+  margin: 0;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  font-size: 0.75rem;
+  font-style: italic;
+  opacity: 0.7;
+}
+
 // A node's effects list — grows vertically as rows are added, one row per
 // attached effect (v1 ships with just "volume", but the list/row shape is
 // built to hold more later). No fixed height anywhere here or on the node
@@ -534,24 +1466,29 @@
   }
 }
 
-// Bypass toggle — same icon-button language as .routing-graph-node-mute so
-// the two read as siblings, but its own accent (amber, not red) so "bypassed"
-// never gets mistaken for "muted" at a glance.
+// Bypass toggle — an "SFX" badge rather than a play/pause icon, since
+// play/pause reads as "start/stop audio" instead of "bypass the effect
+// chain". Filled teal (matches .routing-graph-node-effects-badge--live) when
+// the chain is active; hollow amber-ringed (matches --bypassed) when
+// bypassed, so this button and the adjacent state dot read as one language.
 .routing-graph-node-bypass {
   flex-shrink: 0;
-  width: 1.3rem;
+  width: 1.9rem;
   height: 1.3rem;
   padding: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  font-size: 0.65rem;
+  border: 1.5px solid transparent;
+  border-radius: 999px;
+  background: rgba(63, 208, 201, 0.18);
+  font-size: 0.5rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   line-height: 1;
   cursor: pointer;
-  color: var(--text-muted);
+  color: #3fd0c9;
 
-  &.active {
-    background: rgba(255, 176, 32, 0.15);
+  &.bypassed {
+    background: transparent;
+    border-color: #ffb020;
     color: #ffb020;
   }
 
@@ -581,6 +1518,31 @@
   }
 }
 
+.routing-graph-node-warning-badge {
+  flex-shrink: 0;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  margin-left: -0.15rem;
+
+  &--blocked {
+    background: var(--status-warning);
+  }
+
+  &--unavailable {
+    background: var(--status-danger);
+  }
+}
+
+.routing-graph-node-format-badge {
+  flex-shrink: 0;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  margin-left: -0.15rem;
+  background: var(--accent-teal);
+}
+
 .routing-graph-node-volume {
   flex: 1;
   min-width: 0;
@@ -596,10 +1558,68 @@
   color: var(--text-muted);
 }
 
-.routing-view .routing-lead {
+// A Group node's inline member list (issue #80, PD-035 revision) — shown
+// only when expanded via the chevron toggle. Deliberately not graph edges:
+// the real device nodes stay fully clean elsewhere on the canvas, and
+// hovering a row highlights that member instead (see
+// .routing-graph-node--highlighted).
+.routing-graph-group-members {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
   margin: 0.35rem 0 0;
-  font-size: 0.85rem;
+  padding: 0;
+  list-style: none;
+}
+
+.routing-graph-group-member {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.2rem 0.35rem;
+  border-radius: 6px;
+
+  &:hover {
+    background: rgba(255, 176, 32, 0.12);
+  }
+
+  &--empty {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    font-style: italic;
+
+    &:hover {
+      background: transparent;
+    }
+  }
+}
+
+.routing-graph-group-member-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+}
+
+.routing-graph-group-member-remove {
+  flex-shrink: 0;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 0.65rem;
+  line-height: 1;
   color: var(--text-muted);
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(255, 107, 107, 0.15);
+    color: #ff6b6b;
+  }
 }
 
 .vue-flow__edge-path {
@@ -615,7 +1635,9 @@
 .routing-graph-canvas .vue-flow__edgeupdater {
   cursor: grab;
   opacity: 0;
-  transition: opacity 0.12s ease, fill 0.12s ease;
+  transition:
+    opacity 0.12s ease,
+    fill 0.12s ease;
 }
 
 .routing-graph-canvas .vue-flow__edge:hover .vue-flow__edgeupdater,

@@ -88,7 +88,11 @@ impl ProfileStore {
         self.load_profile(entry)
     }
 
-    pub fn save_profile(&self, entry: &ProfileIndexEntry, profile: &Profile) -> Result<(), ProfileError> {
+    pub fn save_profile(
+        &self,
+        entry: &ProfileIndexEntry,
+        profile: &Profile,
+    ) -> Result<(), ProfileError> {
         validate_profile(profile)?;
         let path = self.profile_path(&entry.file);
         self.save_profile_at(&path, profile)
@@ -136,6 +140,15 @@ impl ProfileStore {
         })
     }
 
+    pub fn delete_profile_file(&self, entry: &ProfileIndexEntry) -> Result<(), ProfileError> {
+        let path = self.profile_path(&entry.file);
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| ProfileError::Write(format!("{path:?}: {error}")))?;
+        }
+        Ok(())
+    }
+
     pub fn export_profile_archive(
         &self,
         entry: &ProfileIndexEntry,
@@ -179,8 +192,7 @@ impl ProfileStore {
 
         let contents = serde_yaml::to_string(profile)
             .map_err(|error| ProfileError::Write(error.to_string()))?;
-        fs::write(path, contents)
-            .map_err(|error| ProfileError::Write(format!("{path:?}: {error}")))
+        fs::write(path, contents).map_err(|error| ProfileError::Write(format!("{path:?}: {error}")))
     }
 }
 
@@ -222,7 +234,8 @@ fn append_tar_entry<W: Write>(
     data: &[u8],
 ) -> Result<(), ProfileError> {
     let mut header = Header::new_gnu();
-    header.set_path(name)
+    header
+        .set_path(name)
         .map_err(|error| ProfileError::Write(error.to_string()))?;
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
@@ -232,9 +245,12 @@ fn append_tar_entry<W: Write>(
         .map_err(|error| ProfileError::Write(error.to_string()))
 }
 
-pub fn import_profile_archive(source: &Path, profiles_dir: &Path) -> Result<ProfileIndexEntry, ProfileError> {
-    let file = File::open(source)
-        .map_err(|error| ProfileError::Read(format!("{source:?}: {error}")))?;
+pub fn import_profile_archive(
+    source: &Path,
+    profiles_dir: &Path,
+) -> Result<ProfileIndexEntry, ProfileError> {
+    let file =
+        File::open(source).map_err(|error| ProfileError::Read(format!("{source:?}: {error}")))?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
@@ -263,8 +279,7 @@ pub fn import_profile_archive(source: &Path, profiles_dir: &Path) -> Result<Prof
         .map_err(|error| ProfileError::Read(error.to_string()))?;
     validate_profile(&profile)?;
 
-    fs::create_dir_all(profiles_dir)
-        .map_err(|error| ProfileError::Write(error.to_string()))?;
+    fs::create_dir_all(profiles_dir).map_err(|error| ProfileError::Write(error.to_string()))?;
 
     let file = format!("profiles/{}.yaml", profile.id);
     let dest = profiles_dir.join(format!("{}.yaml", profile.id));
@@ -284,6 +299,30 @@ mod tests {
     use crate::core::models::{RoutingIntent, VolumeStateEntry};
 
     #[test]
+    fn delete_profile_file_removes_the_yaml_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pipe-deck-profile-store-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let store = ProfileStore::new(temp_dir.clone());
+        let entry = store
+            .save_profile_as("gaming", "Gaming", &base_profile())
+            .expect("save profile");
+        assert!(store.profile_path(&entry.file).exists());
+
+        store.delete_profile_file(&entry).expect("delete profile");
+        assert!(!store.profile_path(&entry.file).exists());
+
+        // Deleting an already-missing file is a no-op, not an error.
+        store
+            .delete_profile_file(&entry)
+            .expect("idempotent delete");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn validates_profile_shape() {
         let profile = Profile {
             version: 1,
@@ -295,12 +334,14 @@ mod tests {
                 stream_id: "node-1".into(),
                 target_device_id: Some("node-2".into()),
                 target_device_ids: vec!["node-2".into()],
+                target_system_name: None,
             }],
             volume_state: [(
                 "node-2".into(),
                 VolumeStateEntry {
                     volume_percent: 80,
                     muted: false,
+                    system_name: None,
                 },
             )]
             .into_iter()
@@ -326,6 +367,7 @@ mod tests {
                 VolumeStateEntry {
                     volume_percent: 150,
                     muted: false,
+                    system_name: None,
                 },
             )]
             .into_iter()
@@ -385,10 +427,10 @@ mod tests {
             stream_id: "".into(),
             target_device_id: Some("node-2".into()),
             target_device_ids: vec!["node-2".into()],
+            target_system_name: None,
         }];
 
-        let error =
-            validate_profile(&profile).expect_err("empty stream_id should be rejected");
+        let error = validate_profile(&profile).expect_err("empty stream_id should be rejected");
         assert!(matches!(error, ProfileError::Validation(_)));
     }
 
@@ -399,6 +441,7 @@ mod tests {
             stream_id: "node-1".into(),
             target_device_id: None,
             target_device_ids: vec![],
+            target_system_name: None,
         }];
 
         let error = validate_profile(&profile).expect_err("missing targets should be rejected");
@@ -413,6 +456,7 @@ mod tests {
             VolumeStateEntry {
                 volume_percent: 50,
                 muted: false,
+                system_name: None,
             },
         )]
         .into_iter()

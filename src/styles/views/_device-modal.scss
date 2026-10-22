@@ -112,8 +112,8 @@
 
   .new-device-type-cards {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.6rem;
+    grid-template-columns: 1fr;
+    gap: 0.5rem;
   }
 
   .new-device-type-card {
@@ -128,7 +128,9 @@
     color: var(--text);
     cursor: pointer;
     text-align: left;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition:
+      border-color 0.12s ease,
+      background 0.12s ease;
 
     svg {
       width: 1.15rem;

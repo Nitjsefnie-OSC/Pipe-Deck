@@ -5,7 +5,8 @@ import { makeDevice, makeGraph, makeStream } from "../../test/graphFixtures";
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-const { applyEdgeDisconnect, applyRoutingConnection } = await import("./applyConnection");
+const { applyEdgeDisconnect, applyRoutingConnection } =
+  await import("./applyConnection");
 
 function connection(overrides: Partial<Connection>): Connection {
   return {
@@ -26,12 +27,19 @@ describe("applyRoutingConnection", () => {
     const graph = makeGraph();
     const onResult = vi.fn();
 
-    const applied = await applyRoutingConnection(graph, connection({}), onResult);
+    const applied = await applyRoutingConnection(
+      graph,
+      connection({}),
+      onResult,
+    );
 
     expect(applied).toBe(false);
     expect(invokeMock).not.toHaveBeenCalled();
     expect(onResult).toHaveBeenCalledWith(
-      { success: false, message: "Drag needs both a source and a target port." },
+      {
+        success: false,
+        message: "Drag needs both a source and a target port.",
+      },
       "",
     );
   });
@@ -62,35 +70,38 @@ describe("applyRoutingConnection", () => {
     expect(onResult).toHaveBeenCalledWith({ success: true }, "Routing updated");
   });
 
-  it("invokes set_device_targets for a multi-sink fan-out add", async () => {
+  it("reports an error, without invoking anything, for a device-to-device drag — #293", async () => {
     const sink = makeDevice({
       id: "sink1",
       kind: "virtual",
       direction: "output",
-      current_targets: ["out1"],
     });
     const out1 = makeDevice({ id: "out1", direction: "output" });
-    const out2 = makeDevice({ id: "out2", direction: "output" });
-    const graph = makeGraph([sink, out1, out2]);
-    invokeMock.mockResolvedValue({ success: true });
+    const graph = makeGraph([sink, out1]);
     const onResult = vi.fn();
 
-    await applyRoutingConnection(
+    const applied = await applyRoutingConnection(
       graph,
       connection({
         source: "device:sink1",
-        target: "device:out2",
+        target: "device:out1",
         sourceHandle: "audio-out:empty",
         targetHandle: "audio-in:empty",
       }),
       onResult,
     );
 
-    expect(invokeMock).toHaveBeenCalledWith("set_device_targets", {
-      sourceDeviceId: "sink1",
-      targetDeviceIds: ["out1", "out2"],
-    });
-    expect(onResult).toHaveBeenCalledWith({ success: true }, "Sink routing updated");
+    expect(applied).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(onResult).toHaveBeenCalledWith(
+      {
+        success: false,
+        message: expect.stringContaining(
+          "plain devices no longer route onward",
+        ),
+      },
+      "",
+    );
   });
 
   it("wraps a thrown invoke error with context instead of showing it raw", async () => {
@@ -136,7 +147,10 @@ describe("applyRoutingConnection", () => {
       onResult,
     );
 
-    expect(onResult).toHaveBeenCalledWith({ success: false, message: "device is busy" }, "Routing updated");
+    expect(onResult).toHaveBeenCalledWith(
+      { success: false, message: "device is busy" },
+      "Routing updated",
+    );
   });
 });
 
@@ -148,7 +162,11 @@ describe("applyEdgeDisconnect", () => {
     invokeMock.mockResolvedValue({ success: true });
     const onResult = vi.fn();
 
-    await applyEdgeDisconnect(graph, { source: "stream:s1", target: "device:d1" }, onResult);
+    await applyEdgeDisconnect(
+      graph,
+      { source: "stream:s1", target: "device:d1" },
+      onResult,
+    );
 
     expect(invokeMock).toHaveBeenCalledWith("clear_stream_target", {
       streamId: "s1",

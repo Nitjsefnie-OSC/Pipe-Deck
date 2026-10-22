@@ -3,8 +3,10 @@ pub mod commands;
 pub mod config;
 pub mod core;
 pub mod daemon;
+pub mod dsp;
 pub mod pipewire;
 pub mod plugins;
+pub mod sysproc;
 pub mod tray;
 
 use core::engine::CoreEngine;
@@ -29,11 +31,14 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::app_info::get_app_info,
+            commands::app_info::get_diagnostics_bundle,
             commands::app_info::open_url,
             commands::graph::get_runtime_graph,
+            commands::latency::measure_latency_ping,
             commands::config::get_config,
             commands::config::get_config_paths,
             commands::config::list_profiles,
@@ -41,13 +46,18 @@ pub fn run() {
             commands::config::set_show_system_streams,
             commands::config::set_auto_apply_rules,
             commands::config::set_sidebar_collapsed,
+            commands::config::set_onboarding_dismissed,
             commands::config::list_themes,
             commands::config::set_theme_mode,
             commands::config::set_dark_scheme,
             commands::config::set_light_scheme,
+            commands::config::set_notice_duration_ms,
+            commands::config::set_close_behavior,
+            commands::config::set_update_channel,
             commands::profile::get_profile,
             commands::profile::save_profile,
             commands::profile::save_profile_as,
+            commands::profile::delete_profile,
             commands::profile::import_profile,
             commands::profile::import_profile_archive,
             commands::profile::export_profile,
@@ -56,8 +66,6 @@ pub fn run() {
             commands::profile::swap_profile,
             commands::routing::set_stream_target,
             commands::routing::set_stream_targets,
-            commands::routing::set_device_route,
-            commands::routing::set_device_targets,
             commands::routing::clear_stream_target,
             commands::routing::undo_last_routing,
             commands::routing::can_undo_routing,
@@ -83,15 +91,26 @@ pub fn run() {
             commands::effects::add_effect_stage,
             commands::effects::remove_effect_stage,
             commands::effects::reorder_effect_stages,
+            commands::processing_node::create_processing_node,
+            commands::processing_node::create_output_group,
+            commands::processing_node::remove_processing_node,
+            commands::processing_node::connect_processing_node_port,
+            commands::processing_node::disconnect_processing_node_port,
+            commands::processing_node::update_processing_node_input_gain,
+            commands::processing_node::update_processing_node_volume,
+            commands::processing_node::update_processing_node_eq_params,
+            commands::processing_node::update_processing_node_delay_params,
+            commands::processing_node::update_processing_node_limiter_params,
+            commands::processing_node::update_processing_node_hpf_params,
+            commands::processing_node::update_processing_node_reverb_params,
+            commands::processing_node::update_processing_node_widener_params,
+            commands::processing_node::update_processing_node_pan_params,
+            commands::processing_node::update_processing_node_compressor_params,
+            commands::processing_node::set_processing_node_bypassed,
             commands::virtual_device::create_virtual_output,
             commands::virtual_device::create_virtual_multi_output,
             commands::virtual_device::create_virtual_input,
             commands::virtual_device::remove_virtual_device,
-            commands::virtual_device::set_virtual_mic_mix,
-            commands::virtual_device::add_mix_source,
-            commands::virtual_device::remove_mix_source,
-            commands::virtual_device::set_mix_source_volume,
-            commands::virtual_device::set_mix_source_mute,
             commands::virtual_device::enable_stream_mic_passthrough,
             commands::daemon::get_daemon_status,
             commands::daemon::enable_background_restore,
@@ -105,10 +124,20 @@ pub fn run() {
             commands::plugins::list_plugin_discovery_errors,
             commands::plugins::list_plugin_capability_metadata,
             commands::plugins::list_plugin_routing_suggestions,
+            commands::soundboard::list_soundboard_boards,
+            commands::soundboard::save_soundboard_board,
+            commands::soundboard::delete_soundboard_board,
+            commands::soundboard::list_soundboard_sounds,
+            commands::soundboard::play_soundboard_clip,
+            commands::soundboard::stop_soundboard_clip,
         ])
         .setup(|app| {
             tray::setup_tray(app)?;
-            tray::attach_close_to_tray(&app.handle());
+            tray::attach_close_to_tray(app.handle());
+
+            app.manage(daemon::EphemeralDaemonHandle(std::sync::Mutex::new(
+                daemon::ensure_ephemeral_daemon(),
+            )));
 
             let handle = app.handle().clone();
             let engine_arc = app.state::<AppState>().engine.clone();
@@ -123,6 +152,19 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(handle_run_event);
+}
+
+/// Only real teardown work today is the ephemeral daemon (issue #148) — a
+/// clean-quit-path complement to `PR_SET_PDEATHSIG`'s kernel-level guarantee
+/// for the crash case (see `daemon::ensure_ephemeral_daemon`). A no-op for
+/// anything other than `RunEvent::Exit`.
+fn handle_run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::Exit = event {
+        if let Some(state) = app_handle.try_state::<daemon::EphemeralDaemonHandle>() {
+            daemon::kill_ephemeral_daemon(&state);
+        }
+    }
 }

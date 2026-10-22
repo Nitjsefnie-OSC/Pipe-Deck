@@ -154,7 +154,9 @@
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.15s ease, visibility 0.15s ease;
+  transition:
+    opacity 0.15s ease,
+    visibility 0.15s ease;
   z-index: 5;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
@@ -255,6 +257,12 @@
   font-weight: 600;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .topbar-btn {
   border: 1px solid var(--border);
   background: var(--surface-2);
@@ -262,6 +270,29 @@
   border-radius: 8px;
   padding: 0.35rem 0.75rem;
   cursor: pointer;
+}
+
+.topbar-theme-toggle,
+.topbar-help-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+
+  &:hover {
+    color: var(--text);
+    border-color: rgba(124, 92, 255, 0.45);
+  }
 }
 
 .content {
